@@ -199,35 +199,48 @@ Select Boot Mode:\r\n\
             let _ = stdout.output_string(cstr16!(" seconds... [Press 1-3 to select]      "));
         });
 
-        // Check for key press - use wait_for_key_event for better responsiveness
+        // Check for key press with timeout
         let key_pressed = uefi::system::with_stdin(|stdin| {
             let _ = stdin.reset(false);
 
-            // Try to read a key with better event handling
-            match stdin.read_key() {
-                Ok(Some(key)) => {
-                    // Check if it's a printable key
-                    match key {
-                        uefi::proto::console::text::Key::Printable(c) => {
-                            // Convert Char16 to u32 for comparison
-                            let c_val = u16::from(c) as u32;
-                            if c_val == '1' as u32 {
-                                selection = BootMode::Desktop;
-                                true
-                            } else if c_val == '2' as u32 {
-                                selection = BootMode::Install;
-                                true
-                            } else if c_val == '3' as u32 {
-                                selection = BootMode::CommandLine;
-                                true
-                            } else {
-                                false
+            // Get the key event for waiting
+            if let Some(key_event) = stdin.wait_for_key_event() {
+                // Try to wait for event with timeout
+                let mut events = [key_event];
+                let wait_result = uefi::boot::wait_for_event(&mut events);
+
+                if wait_result.is_ok() {
+                    // Key event triggered, read the key
+                    match stdin.read_key() {
+                        Ok(Some(key)) => {
+                            // Check if it's a printable key
+                            match key {
+                                uefi::proto::console::text::Key::Printable(c) => {
+                                    // Convert Char16 to u32 for comparison
+                                    let c_val = u16::from(c) as u32;
+                                    if c_val == '1' as u32 {
+                                        selection = BootMode::Desktop;
+                                        true
+                                    } else if c_val == '2' as u32 {
+                                        selection = BootMode::Install;
+                                        true
+                                    } else if c_val == '3' as u32 {
+                                        selection = BootMode::CommandLine;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false
                             }
                         }
                         _ => false
                     }
+                } else {
+                    false // Timeout or error
                 }
-                _ => false
+            } else {
+                false // No event available
             }
         });
 
@@ -235,6 +248,7 @@ Select Boot Mode:\r\n\
             break;
         }
 
+        // Small delay between polls
         uefi::boot::stall(Duration::from_millis(MENU_DELAY_MS));
     }
 
@@ -296,29 +310,43 @@ Select installation type:\r\n\
             let _ = stdout.output_string(cstr16!(" seconds... [Press 1-2]       "));
         });
 
-        // Check for key press
+        // Check for key press with timeout
         let key_pressed = uefi::system::with_stdin(|stdin| {
             let _ = stdin.reset(false);
 
-            match stdin.read_key() {
-                Ok(Some(key)) => {
-                    match key {
-                        uefi::proto::console::text::Key::Printable(c) => {
-                            let c_val = u16::from(c) as u32;
-                            if c_val == '1' as u32 {
-                                selection = InstallMode::Desktop;
-                                true
-                            } else if c_val == '2' as u32 {
-                                selection = InstallMode::Server;
-                                true
-                            } else {
-                                false
+            // Get the key event for waiting
+            if let Some(key_event) = stdin.wait_for_key_event() {
+                // Try to wait for event with timeout
+                let mut events = [key_event];
+                let wait_result = uefi::boot::wait_for_event(&mut events);
+
+                if wait_result.is_ok() {
+                    // Key event triggered, read the key
+                    match stdin.read_key() {
+                        Ok(Some(key)) => {
+                            match key {
+                                uefi::proto::console::text::Key::Printable(c) => {
+                                    let c_val = u16::from(c) as u32;
+                                    if c_val == '1' as u32 {
+                                        selection = InstallMode::Desktop;
+                                        true
+                                    } else if c_val == '2' as u32 {
+                                        selection = InstallMode::Server;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false
                             }
                         }
                         _ => false
                     }
+                } else {
+                    false // Timeout or error
                 }
-                _ => false
+            } else {
+                false // No event available
             }
         });
 
@@ -326,6 +354,7 @@ Select installation type:\r\n\
             break;
         }
 
+        // Small delay between polls
         uefi::boot::stall(Duration::from_millis(MENU_DELAY_MS));
     }
 

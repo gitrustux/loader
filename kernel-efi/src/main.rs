@@ -129,9 +129,15 @@ Initializing shell...\r\n\
         }
     });
 
-    // Continue to OS initialization
-    // TODO: Transition to main OS loop based on boot mode
-    // For now, keep system running in a loop
+    // Continue to OS initialization - run interactive CLI
+    run_cli_loop(boot_mode, install_mode);
+
+    // Should not reach here
+    Status::ABORTED
+}
+
+/// Run the interactive command-line loop
+fn run_cli_loop(boot_mode: BootMode, install_mode: Option<InstallMode>) -> ! {
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.set_color(uefi::proto::console::text::Color::Green,
                                  uefi::proto::console::text::Color::Blue);
@@ -141,6 +147,230 @@ Rustux OS is running. Type 'help' for available commands.\r\n\
 \r\n\
 "));
     });
+
+    // Command input buffer
+    let mut input_buffer: [u16; 256] = [0; 256];
+
+    loop {
+        // Show prompt
+        uefi::system::with_stdout(|stdout| {
+            let _ = stdout.set_color(uefi::proto::console::text::Color::Cyan,
+                                     uefi::proto::console::text::Color::Blue);
+            let _ = stdout.output_string(cstr16!("rustux> "));
+        });
+
+        // Read a line of input
+        let input_len = read_line(&mut input_buffer);
+
+        // Process the command
+        if input_len > 0 {
+            process_command(&input_buffer[..input_len], boot_mode, install_mode);
+        }
+    }
+}
+
+/// Read a line of input from stdin
+fn read_line(buffer: &mut [u16]) -> usize {
+    let mut pos = 0;
+
+    loop {
+        if pos >= buffer.len() - 1 {
+            break;
+        }
+
+        // Wait for key press
+        let key = uefi::system::with_stdin(|stdin| {
+            if let Some(key_event) = stdin.wait_for_key_event() {
+                let mut events = [key_event];
+                let _ = uefi::boot::wait_for_event(&mut events);
+                stdin.read_key().ok().flatten()
+            } else {
+                None
+            }
+        });
+
+        if let Some(key) = key {
+            match key {
+                uefi::proto::console::text::Key::Printable(c) => {
+                    let c_val = u16::from(c);
+
+                    // Handle Enter key
+                    if c_val == 13 {  // Carriage Return
+                        uefi::system::with_stdout(|stdout| {
+                            let _ = stdout.output_string(cstr16!("\r\n"));
+                        });
+                        break;
+                    }
+                    // Handle Backspace
+                    else if c_val == 8 || c_val == 127 {
+                        if pos > 0 {
+                            pos -= 1;
+                            buffer[pos] = 0;
+                            uefi::system::with_stdout(|stdout| {
+                                let _ = stdout.output_string(cstr16!("\x08 \x08"));
+                            });
+                        }
+                    }
+                    // Handle regular characters - just collect, no echo for now
+                    else if c_val >= 32 && c_val < 127 {
+                        buffer[pos] = c_val;
+                        pos += 1;
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            uefi::boot::stall(Duration::from_millis(10));
+        }
+    }
+
+    buffer[pos] = 0;
+    pos
+}
+
+/// Process a command
+fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<InstallMode>) {
+    // Simple command matching
+    if cmd_eq_ignore_case(cmd, "help") || cmd_eq_ignore_case(cmd, "?") {
+        show_help();
+    } else if cmd_eq_ignore_case(cmd, "clear") || cmd_eq_ignore_case(cmd, "cls") {
+        uefi::system::with_stdout(|stdout| {
+            let _ = stdout.clear();
+        });
+    } else if cmd_eq_ignore_case(cmd, "info") || cmd_eq_ignore_case(cmd, "status") {
+        show_system_info(boot_mode, install_mode);
+    } else if cmd_eq_ignore_case(cmd, "reboot") || cmd_eq_ignore_case(cmd, "restart") {
+        reboot_system();
+    } else if cmd_eq_ignore_case(cmd, "version") || cmd_eq_ignore_case(cmd, "ver") {
+        show_version();
+    } else {
+        uefi::system::with_stdout(|stdout| {
+            let _ = stdout.set_color(uefi::proto::console::text::Color::Red,
+                                     uefi::proto::console::text::Color::Blue);
+            let _ = stdout.output_string(cstr16!("Unknown command. Type 'help' for available commands.\r\n\r\n"));
+        });
+    }
+}
+
+/// Compare command string (case-insensitive)
+fn cmd_eq_ignore_case(cmd: &[u16], target: &str) -> bool {
+    if cmd.len() != target.len() {
+        return false;
+    }
+
+    for (i, &c) in cmd.iter().enumerate() {
+        let target_c = target.as_bytes()[i] as u16;
+        let cmd_lower = if c >= 'A' as u16 && c <= 'Z' as u16 {
+            c + 32
+        } else {
+            c
+        };
+        let target_lower = if target_c >= 'A' as u16 && target_c <= 'Z' as u16 {
+            target_c + 32
+        } else {
+            target_c
+        };
+        if cmd_lower != target_lower {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Show help message
+fn show_help() {
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
+                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.output_string(cstr16!(
+"\r\n\
+Available Commands:\r\n\
+\r\n\
+  help, ?        - Show this help message\r\n\
+  clear, cls     - Clear the screen\r\n\
+  info, status   - Show system information\r\n\
+  version, ver   - Show version information\r\n\
+  reboot         - Restart the system\r\n\
+\r\n\
+"));
+    });
+}
+
+/// Show system information
+fn show_system_info(boot_mode: BootMode, install_mode: Option<InstallMode>) {
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
+                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.output_string(cstr16!("\r\n\
+System Information:\r\n\
+\r\n\
+  Boot Mode: "));
+        match boot_mode {
+            BootMode::Desktop => {
+                let _ = stdout.output_string(cstr16!("Desktop (GUI)\r\n"));
+            }
+            BootMode::Install => {
+                let _ = stdout.output_string(cstr16!("Install\r\n"));
+                match install_mode {
+                    Some(InstallMode::Desktop) => {
+                        let _ = stdout.output_string(cstr16!("  Mode: Desktop\r\n"));
+                    }
+                    Some(InstallMode::Server) => {
+                        let _ = stdout.output_string(cstr16!("  Mode: Server\r\n"));
+                    }
+                    None => {}
+                }
+            }
+            BootMode::CommandLine => {
+                let _ = stdout.output_string(cstr16!("Command Line (CLI)\r\n"));
+            }
+        }
+        let _ = stdout.output_string(cstr16!("  Platform: UEFI\r\n\
+  Arch: x86_64\r\n\
+\r\n\
+"));
+    });
+}
+
+/// Show version information
+fn show_version() {
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
+                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.output_string(cstr16!("\r\n\
+Rustux OS\r\n\
+Version: 0.1.0\r\n\
+Kernel: rustux-kernel-efi\r\n\
+Platform: UEFI\r\n\
+\r\n\
+"));
+    });
+}
+
+/// Reboot the system
+fn reboot_system() -> ! {
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
+                                 uefi::proto::console::text::Color::Red);
+        let _ = stdout.output_string(cstr16!("\r\n\
+Rebooting system...\r\n\
+"));
+    });
+
+    unsafe {
+        if let Some(st) = uefi::table::system_table_raw() {
+            let system_table = st.as_ref();
+            let runtime_services = system_table.runtime_services;
+            let reset = (*runtime_services).reset_system;
+            reset(
+                uefi_raw::table::runtime::ResetType::COLD,
+                uefi_raw::Status::SUCCESS,
+                0,
+                core::ptr::null_mut(),
+            );
+        }
+    }
 
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }

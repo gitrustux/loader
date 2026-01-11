@@ -129,8 +129,29 @@ Initializing shell...\r\n\
         }
     });
 
-    // Continue to OS initialization - run interactive CLI
-    run_cli_loop(boot_mode, install_mode);
+    // Continue to OS initialization - route to correct mode
+    match boot_mode {
+        BootMode::Desktop => {
+            // Desktop mode - show GUI message then run CLI until GUI is implemented
+            uefi::system::with_stdout(|stdout| {
+                let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
+                                         uefi::proto::console::text::Color::Blue);
+                let _ = stdout.output_string(cstr16!("\r\n\
+[GUI MODE]\r\n\
+Desktop environment (GNOME-like) will be implemented soon.\r\n\
+Currently running in CLI mode. Type 'help' for commands.\r\n\
+\r\n\
+"));
+            });
+            run_cli_loop(boot_mode, install_mode);
+        }
+        BootMode::CommandLine => {
+            run_cli_loop(boot_mode, install_mode);
+        }
+        BootMode::Install => {
+            run_cli_loop(boot_mode, install_mode);
+        }
+    }
 
     // Should not reach here
     Status::ABORTED
@@ -143,7 +164,7 @@ fn run_cli_loop(boot_mode: BootMode, install_mode: Option<InstallMode>) -> ! {
                                  uefi::proto::console::text::Color::Blue);
         let _ = stdout.output_string(cstr16!("\r\n\
 [SYSTEM READY]\r\n\
-Rustux OS is running. Type 'help' for available commands.\r\n\
+Rustica OS is running. Type 'help' for available commands.\r\n\
 \r\n\
 "));
     });
@@ -152,14 +173,14 @@ Rustux OS is running. Type 'help' for available commands.\r\n\
     let mut input_buffer: [u16; 256] = [0; 256];
 
     loop {
-        // Show prompt
+        // Show prompt - Yellow for visibility, "rustica" not "rustux"
         uefi::system::with_stdout(|stdout| {
-            let _ = stdout.set_color(uefi::proto::console::text::Color::Cyan,
+            let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
                                      uefi::proto::console::text::Color::Blue);
-            let _ = stdout.output_string(cstr16!("rustux> "));
+            let _ = stdout.output_string(cstr16!("rustica> "));
         });
 
-        // Read a line of input
+        // Read a line of input with echo
         let input_len = read_line(&mut input_buffer);
 
         // Process the command
@@ -211,10 +232,13 @@ fn read_line(buffer: &mut [u16]) -> usize {
                             });
                         }
                     }
-                    // Handle regular characters - just collect, no echo for now
+                    // Handle regular characters - echo them in white for visibility
                     else if c_val >= 32 && c_val < 127 {
                         buffer[pos] = c_val;
                         pos += 1;
+
+                        // Echo character in white to contrast with blue background
+                        echo_char(c_val);
                     }
                 }
                 _ => {}
@@ -226,6 +250,40 @@ fn read_line(buffer: &mut [u16]) -> usize {
 
     buffer[pos] = 0;
     pos
+}
+
+/// Echo a single character to stdout in white
+fn echo_char(c: u16) {
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
+                                 uefi::proto::console::text::Color::Blue);
+
+        // Match on character value
+        let ch = match c {
+            48 => cstr16!("0"), 49 => cstr16!("1"), 50 => cstr16!("2"), 51 => cstr16!("3"),
+            52 => cstr16!("4"), 53 => cstr16!("5"), 54 => cstr16!("6"), 55 => cstr16!("7"),
+            56 => cstr16!("8"), 57 => cstr16!("9"),
+            97 => cstr16!("a"), 98 => cstr16!("b"), 99 => cstr16!("c"), 100 => cstr16!("d"),
+            101 => cstr16!("e"), 102 => cstr16!("f"), 103 => cstr16!("g"), 104 => cstr16!("h"),
+            105 => cstr16!("i"), 106 => cstr16!("j"), 107 => cstr16!("k"), 108 => cstr16!("l"),
+            109 => cstr16!("m"), 110 => cstr16!("n"), 111 => cstr16!("o"), 112 => cstr16!("p"),
+            113 => cstr16!("q"), 114 => cstr16!("r"), 115 => cstr16!("s"), 116 => cstr16!("t"),
+            117 => cstr16!("u"), 118 => cstr16!("v"), 119 => cstr16!("w"), 120 => cstr16!("x"),
+            121 => cstr16!("y"), 122 => cstr16!("z"),
+            65 => cstr16!("A"), 66 => cstr16!("B"), 67 => cstr16!("C"), 68 => cstr16!("D"),
+            69 => cstr16!("E"), 70 => cstr16!("F"), 71 => cstr16!("G"), 72 => cstr16!("H"),
+            73 => cstr16!("I"), 74 => cstr16!("J"), 75 => cstr16!("K"), 76 => cstr16!("L"),
+            77 => cstr16!("M"), 78 => cstr16!("N"), 79 => cstr16!("O"), 80 => cstr16!("P"),
+            81 => cstr16!("Q"), 82 => cstr16!("R"), 83 => cstr16!("S"), 84 => cstr16!("T"),
+            85 => cstr16!("U"), 86 => cstr16!("V"), 87 => cstr16!("W"), 88 => cstr16!("X"),
+            89 => cstr16!("Y"), 90 => cstr16!("Z"),
+            32 => cstr16!(" "),   // space
+            45 => cstr16!("-"),   // hyphen
+            46 => cstr16!("."),   // period
+            _ => cstr16!(""),     // other - don't echo
+        };
+        let _ = stdout.output_string(ch);
+    });
 }
 
 /// Process a command

@@ -10,6 +10,7 @@ use uefi::mem::memory_map::MemoryMap;
 mod theme;
 mod runtime;
 mod filesystem;
+mod console;
 use theme::get_active_theme;
 
 // Global allocator for UEFI
@@ -47,9 +48,11 @@ enum InstallMode {
 /// 1. Captures the memory map
 /// 2. Exits UEFI boot services
 /// 3. Initializes kernel runtime
+/// 4. Sets console to runtime mode
 fn transition_to_runtime() {
     let theme = get_active_theme();
 
+    // Use console module for output (works in both modes)
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.set_color(theme.warning, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
@@ -61,7 +64,21 @@ Status:\r\n\
 "));
     });
 
-    // Use uefi::boot::exit_boot_services to get memory map and exit in one call
+    // Print status message BEFORE ExitBootServices
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(theme.success, theme.background);
+        let _ = stdout.output_string(cstr16!("\r\n\
+[RUNTIME MODE INITIALIZING]\r\n\
+Memory map captured. Exiting UEFI boot services now...\r\n\
+\r\n"));
+        let _ = stdout.set_color(theme.info, theme.background);
+        let _ = stdout.output_string(cstr16!("Filesystem:\r\n\
+  - Embedded filesystem initialized\r\n\
+  - Available programs: hello, echo, test, version, ls, ip, rpg\r\n\
+\r\n"));
+    });
+
+    // Exit boot services and get memory map
     let memory_map = unsafe { uefi::boot::exit_boot_services(None) };
 
     // Convert memory map to our format
@@ -75,36 +92,14 @@ Status:\r\n\
         });
     }
 
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.success, theme.background);
-        let _ = stdout.output_string(cstr16!("\r\n\
-[RUNTIME MODE ACTIVE]\r\n\
-UEFI boot services have been exited.\r\n\
-Kernel runtime is now active.\r\n\
-\r\n"));
-        let _ = stdout.set_color(theme.info, theme.background);
-        let _ = stdout.output_string(cstr16!("Memory Management:\r\n\
-  - Total descriptors: "));
-        let _ = stdout.output_uint(memory_map_vec.len() as u64);
-        let _ = stdout.output_string(cstr16!("\r\n\
-  - Conventional memory available\r\n\
-  - External applications framework active\r\n\
-\r\n"));
-        let _ = stdout.set_color(theme.success, theme.background);
-        let _ = stdout.output_string(cstr16!("Filesystem:\r\n\
-  - Embedded filesystem initialized\r\n\
-  - Available programs: hello, echo, test, version\r\n\
-\r\n"));
-    });
-
-    // Get length before moving memory_map_vec
     let map_len = memory_map_vec.len() * 48;
 
     // Initialize kernel runtime
     unsafe {
         runtime::init_runtime(memory_map_vec, map_len, 0);
-        // Initialize embedded filesystem
         filesystem::init_filesystem();
+        // Mark console as being in runtime mode
+        console::set_runtime_mode();
     }
 }
 
@@ -116,6 +111,9 @@ fn main() -> Status {
 
     // Initialize UEFI services
     uefi::helpers::init().unwrap();
+
+    // Initialize console layer (save protocols before ExitBootServices)
+    unsafe { console::init_console(); }
 
     // Show boot menu and get user selection
     let boot_mode = show_boot_menu();
@@ -142,7 +140,7 @@ fn main() -> Status {
         let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.output_string(cstr16!(
 "*                                                                         *\r\n\
-*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                    *\r\n\
+*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                   *\r\n\
 *                                                                         *\r\n"));
         let _ = stdout.set_color(theme.border, theme.background);
         let _ = stdout.output_string(cstr16!(
@@ -221,18 +219,15 @@ Currently running in CLI mode. Type 'help' for commands.\r\n\
 \r\n\
 "));
             });
-            // Transition to runtime before CLI
-            transition_to_runtime();
+            // Run CLI in boot services mode (no early ExitBootServices)
             run_cli_loop(boot_mode, install_mode);
         }
         BootMode::CommandLine => {
-            // Transition to runtime before CLI
-            transition_to_runtime();
+            // Run CLI in boot services mode (no early ExitBootServices)
             run_cli_loop(boot_mode, install_mode);
         }
         BootMode::Install => {
-            // Transition to runtime before CLI
-            transition_to_runtime();
+            // Run CLI in boot services mode (no early ExitBootServices)
             run_cli_loop(boot_mode, install_mode);
         }
     }
@@ -245,6 +240,7 @@ Currently running in CLI mode. Type 'help' for commands.\r\n\
 fn run_cli_loop(boot_mode: BootMode, install_mode: Option<InstallMode>) -> ! {
     let theme = get_active_theme();
 
+    // Show system ready message
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.set_color(theme.success, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
@@ -256,19 +252,42 @@ Rustica OS is running. Type 'help' for available commands.\r\n\
 
     // Command input buffer
     let mut input_buffer: [u16; 256] = [0; 256];
+    // Track if we've transitioned to runtime mode
+    let mut has_transitioned_to_runtime = false;
 
     loop {
-        // Show prompt using theme prompt color
-        uefi::system::with_stdout(|stdout| {
-            let _ = stdout.set_color(theme.prompt, theme.background);
-            let _ = stdout.output_string(cstr16!("rustica> "));
-        });
+        // Check if we're in runtime mode and use console module if so
+        if console::is_runtime_mode() {
+            // Show prompt using console module
+            let _ = console::set_color(theme.prompt, theme.background);
+            let _ = console::output_str("rustica> ");
+        } else {
+            // Show prompt using boot services
+            uefi::system::with_stdout(|stdout| {
+                let _ = stdout.set_color(theme.prompt, theme.background);
+                let _ = stdout.output_string(cstr16!("rustica> "));
+            });
+        }
 
-        // Read a line of input with echo
-        let input_len = read_line(&mut input_buffer);
+        // Read a line of input
+        let input_len = if console::is_runtime_mode() {
+            console::read_line(&mut input_buffer)
+        } else {
+            read_line(&mut input_buffer)
+        };
 
         // Process the command
         if input_len > 0 {
+            // Check if this is an external command that requires runtime mode
+            let is_external_cmd = is_external_command(&input_buffer[..input_len]);
+
+            // Transition to runtime if needed and not already done
+            if is_external_cmd && !has_transitioned_to_runtime {
+                transition_to_runtime();
+                has_transitioned_to_runtime = true;
+            }
+
+            // Process the command
             process_command(&input_buffer[..input_len], boot_mode, install_mode);
         }
     }
@@ -405,6 +424,20 @@ fn echo_char(c: u16) {
     });
 }
 
+/// Check if a command is an external program (requires runtime mode)
+fn is_external_command(cmd: &[u16]) -> bool {
+    let cmd_str = u16_slice_to_string(cmd);
+    let cmd_name = cmd_str.trim().split_whitespace().next().unwrap_or("");
+
+    // List of external commands that require runtime mode
+    matches!(cmd_name,
+        "hello" | "echo" | "test" | "version" |
+        "ls" | "ip" | "rpg" | "ping" | "dnslookup" |
+        "ssh" | "vi" | "nano" | "logview" |
+        "fwctl" | "install" | "installer"
+    )
+}
+
 /// Process a command using theme colors
 fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<InstallMode>) {
     let theme = get_active_theme();
@@ -413,9 +446,8 @@ fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<Instal
     if cmd_eq_ignore_case(cmd, "help") || cmd_eq_ignore_case(cmd, "?") {
         show_help();
     } else if cmd_eq_ignore_case(cmd, "clear") || cmd_eq_ignore_case(cmd, "cls") {
-        uefi::system::with_stdout(|stdout| {
-            let _ = stdout.clear();
-        });
+        // Use console module which works in both modes
+        let _ = console::clear_screen();
     } else if cmd_eq_ignore_case(cmd, "info") || cmd_eq_ignore_case(cmd, "status") {
         show_system_info(boot_mode, install_mode);
     } else if cmd_eq_ignore_case(cmd, "reboot") || cmd_eq_ignore_case(cmd, "restart") {
@@ -431,103 +463,32 @@ fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<Instal
 
         if is_runtime {
             // We're in runtime mode - try to execute external app
-            uefi::system::with_stdout(|stdout| {
-                let _ = stdout.set_color(theme.info, theme.background);
-                let _ = stdout.output_string(cstr16!("\r\n\
-[RUNTIME EXECUTION]\r\n\
-Attempting to execute external application...\r\n\
-\r\n"));
-                let _ = stdout.output_string(cstr16!("Command: "));
-                // Echo the command
-                for &c in cmd {
-                    if c >= 32 && c < 127 {
-                        let ch = match c {
-                            48 => cstr16!("0"), 49 => cstr16!("1"), 50 => cstr16!("2"), 51 => cstr16!("3"),
-                            52 => cstr16!("4"), 53 => cstr16!("5"), 54 => cstr16!("6"), 55 => cstr16!("7"),
-                            56 => cstr16!("8"), 57 => cstr16!("9"),
-                            // Lowercase letters
-                            97 => cstr16!("a"), 98 => cstr16!("b"), 99 => cstr16!("c"), 100 => cstr16!("d"),
-                            101 => cstr16!("e"), 102 => cstr16!("f"), 103 => cstr16!("g"), 104 => cstr16!("h"),
-                            105 => cstr16!("i"), 106 => cstr16!("j"), 107 => cstr16!("k"), 108 => cstr16!("l"),
-                            109 => cstr16!("m"), 110 => cstr16!("n"), 111 => cstr16!("o"), 112 => cstr16!("p"),
-                            113 => cstr16!("q"), 114 => cstr16!("r"), 115 => cstr16!("s"), 116 => cstr16!("t"),
-                            117 => cstr16!("u"), 118 => cstr16!("v"), 119 => cstr16!("w"), 120 => cstr16!("x"),
-                            121 => cstr16!("y"), 122 => cstr16!("z"),
-                            _ => cstr16!(""),
-                        };
-                        let _ = stdout.output_string(ch);
-                    }
-                }
-                let _ = stdout.output_string(cstr16!("\r\n\r\n"));
-            });
+            // Use console module for output (works after ExitBootServices)
+            let _ = console::set_color(theme.info, theme.background);
+            let _ = console::output_str("\r\n[RUNTIME EXECUTION]\r\nExecuting external application...\r\n\r\n");
 
             // Try to execute via runtime
             unsafe {
                 if let Some(runtime) = runtime::get_runtime() {
                     match runtime.execute(&cmd_str) {
                         Ok(_) => {
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.set_color(theme.success, theme.background);
-                                let _ = stdout.output_string(cstr16!("Execution completed.\r\n\r\n"));
-                            });
+                            let _ = console::set_color(theme.success, theme.background);
+                            let _ = console::output_str("Execution completed.\r\n\r\n");
                         }
                         Err(e) => {
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.set_color(theme.error, theme.background);
-                                let _ = stdout.output_string(cstr16!("Execution error: "));
-                                // Output error message character by character
-                                for b in e.bytes() {
-                                    let ch = match b {
-                                        b' ' => cstr16!(" "),
-                                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
-                                            // For alphanumeric and space, output as-is
-                                            // We need to map each byte to its cstr16! equivalent
-                                            match b {
-                                                b'a' => cstr16!("a"), b'b' => cstr16!("b"), b'c' => cstr16!("c"),
-                                                b'd' => cstr16!("d"), b'e' => cstr16!("e"), b'f' => cstr16!("f"),
-                                                b'g' => cstr16!("g"), b'h' => cstr16!("h"), b'i' => cstr16!("i"),
-                                                b'j' => cstr16!("j"), b'k' => cstr16!("k"), b'l' => cstr16!("l"),
-                                                b'm' => cstr16!("m"), b'n' => cstr16!("n"), b'o' => cstr16!("o"),
-                                                b'p' => cstr16!("p"), b'q' => cstr16!("q"), b'r' => cstr16!("r"),
-                                                b's' => cstr16!("s"), b't' => cstr16!("t"), b'u' => cstr16!("u"),
-                                                b'v' => cstr16!("v"), b'w' => cstr16!("w"), b'x' => cstr16!("x"),
-                                                b'y' => cstr16!("y"), b'z' => cstr16!("z"),
-                                                b'A' => cstr16!("A"), b'B' => cstr16!("B"), b'C' => cstr16!("C"),
-                                                b'D' => cstr16!("D"), b'E' => cstr16!("E"), b'F' => cstr16!("F"),
-                                                b'G' => cstr16!("G"), b'H' => cstr16!("H"), b'I' => cstr16!("I"),
-                                                b'J' => cstr16!("J"), b'K' => cstr16!("K"), b'L' => cstr16!("L"),
-                                                b'M' => cstr16!("M"), b'N' => cstr16!("N"), b'O' => cstr16!("O"),
-                                                b'P' => cstr16!("P"), b'Q' => cstr16!("Q"), b'R' => cstr16!("R"),
-                                                b'S' => cstr16!("S"), b'T' => cstr16!("T"), b'U' => cstr16!("U"),
-                                                b'V' => cstr16!("V"), b'W' => cstr16!("W"), b'X' => cstr16!("X"),
-                                                b'Y' => cstr16!("Y"), b'Z' => cstr16!("Z"),
-                                                b'0' => cstr16!("0"), b'1' => cstr16!("1"), b'2' => cstr16!("2"),
-                                                b'3' => cstr16!("3"), b'4' => cstr16!("4"), b'5' => cstr16!("5"),
-                                                b'6' => cstr16!("6"), b'7' => cstr16!("7"), b'8' => cstr16!("8"),
-                                                b'9' => cstr16!("9"),
-                                                _ => cstr16!(""),
-                                            }
-                                        }
-                                        b'-' => cstr16!("-"),
-                                        b':' => cstr16!(":"),
-                                        b'.' => cstr16!("."),
-                                        _ => cstr16!(""),
-                                    };
-                                    let _ = stdout.output_string(ch);
-                                }
-                                let _ = stdout.output_string(cstr16!("\r\n\r\n"));
-                            });
+                            let _ = console::set_color(theme.error, theme.background);
+                            let _ = console::output_str("Execution error: ");
+                            let _ = console::output_str(e);
+                            let _ = console::output_str("\r\n\r\n");
                         }
                     }
                 } else {
-                    uefi::system::with_stdout(|stdout| {
-                        let _ = stdout.set_color(theme.error, theme.background);
-                        let _ = stdout.output_string(cstr16!("Runtime not available.\r\n\r\n"));
-                    });
+                    let _ = console::set_color(theme.error, theme.background);
+                    let _ = console::output_str("Runtime not available.\r\n\r\n");
                 }
             }
         } else {
-            // Still in boot services mode - external apps not available
+            // Still in boot services mode - transition first
             uefi::system::with_stdout(|stdout| {
                 let _ = stdout.set_color(theme.warning, theme.background);
                 let _ = stdout.output_string(cstr16!("\r\n\

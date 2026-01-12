@@ -765,151 +765,52 @@ fn load_and_start_kernel() -> uefi::Result {
                     }
 
                     uefi::system::with_stdout(|stdout| {
-                        let _ = stdout.output_string(cstr16!("  - Calling LoadImage...\r\n"));
+                        let _ = stdout.output_string(cstr16!("  - Using direct entry point (LoadImage bypass)...\r\n"));
                     });
 
-                    // Load and start the kernel as an EFI image using raw boot services
-                    // Try LoadImage first, fall back to direct entry point call
+                    // Skip LoadImage entirely - it can hang on some UEFI firmware
+                    // Jump directly to the kernel's EFI entry point
                     let result = unsafe {
                         let bt = uefi::table::system_table_raw().unwrap();
                         let system_table = bt.as_ref();
-                        let boot_services = system_table.boot_services;
 
-                        let mut kernel_handle: *mut core::ffi::c_void = core::ptr::null_mut();
-                        let load_image = (*boot_services).load_image;
+                        // Find entry point in PE/COFF format
+                        let dos_header = kernel_data.as_ptr() as *const u8;
+                        let pe_offset = *(dos_header.add(0x3C) as *const u32) as usize;
+                        let pe_header = dos_header.add(pe_offset);
+                        let optional_header_offset = pe_offset + 0x18;
+                        let entry_point_rva = *(pe_header.add(optional_header_offset + 0x10) as *const u32) as usize;
+                        let image_base = kernel_data.as_ptr() as usize;
+                        let entry_point = (image_base + entry_point_rva) as *const ();
 
-                        // Call LoadImage with parameters matching UEFI spec:
-                        // EFI_STATUS LoadImage(
-                        //   IN BOOLEAN BootPolicy, TRUE = load from FilePath, FALSE = load from SourceBuffer
-                        //   IN EFI_HANDLE ParentImageHandle,
-                        //   IN EFI_DEVICE_PATH_PROTOCOL *FilePath, OPTIONAL
-                        //   IN VOID *SourceBuffer, OPTIONAL
-                        //   IN UINTN SourceSize,
-                        //   OUT EFI_HANDLE *ImageHandle
-                        // );
-                        let status = load_image(
-                            false.into(),  // BootPolicy: load from memory buffer
+                        uefi::system::with_stdout(|stdout| {
+                            let _ = stdout.output_string(cstr16!("  - Entry point at: 0x"));
+                            let _ = stdout.output_string(cstr16!("XXXX\r\n"));
+                            let _ = stdout.output_string(cstr16!("  - Jumping to kernel...\r\n"));
+                        });
+
+                        // UEFI entry point signature: fn(image_handle: Handle, system_table: *mut SystemTable) -> Status
+                        type EfiEntry = extern "efiapi" fn(*mut core::ffi::c_void, *mut uefi_raw::table::system::SystemTable) -> Status;
+                        let efi_entry: EfiEntry = core::mem::transmute(entry_point);
+
+                        let entry_status = efi_entry(
                             uefi::boot::image_handle().as_ptr(),
-                            core::ptr::null(),  // No FilePath
-                            kernel_data.as_ptr() as *mut u8,
-                            file_size,
-                            &mut kernel_handle,
+                            system_table as *const _ as *mut _
                         );
 
                         uefi::system::with_stdout(|stdout| {
-                            let _ = stdout.output_string(cstr16!("  - LoadImage status: "));
-                            match status {
+                            let _ = stdout.output_string(cstr16!("  - Kernel entry returned: "));
+                            match entry_status {
                                 Status::SUCCESS => {
                                     let _ = stdout.output_string(cstr16!("SUCCESS\r\n"));
                                 }
-                                Status::LOAD_ERROR => {
-                                    let _ = stdout.output_string(cstr16!("LOAD_ERROR\r\n"));
-                                }
-                                Status::INVALID_PARAMETER => {
-                                    let _ = stdout.output_string(cstr16!("INVALID_PARAMETER\r\n"));
-                                }
-                                Status::UNSUPPORTED => {
-                                    let _ = stdout.output_string(cstr16!("UNSUPPORTED\r\n"));
-                                }
-                                Status::BUFFER_TOO_SMALL => {
-                                    let _ = stdout.output_string(cstr16!("BUFFER_TOO_SMALL\r\n"));
-                                }
                                 _ => {
-                                    // Display hex error code
-                                    let code = status.0;
-                                    let _ = stdout.output_string(cstr16!("UNKNOWN(0x"));
-                                    // Simple hex display
-                                    let hex_chars = [cstr16!("0"), cstr16!("1"), cstr16!("2"), cstr16!("3"),
-                                                    cstr16!("4"), cstr16!("5"), cstr16!("6"), cstr16!("7"),
-                                                    cstr16!("8"), cstr16!("9"), cstr16!("A"), cstr16!("B"),
-                                                    cstr16!("C"), cstr16!("D"), cstr16!("E"), cstr16!("F")];
-                                    let hi = (code >> 12) & 0xF;
-                                    let mid_hi = (code >> 8) & 0xF;
-                                    let mid_lo = (code >> 4) & 0xF;
-                                    let lo = code & 0xF;
-                                    let _ = stdout.output_string(hex_chars[hi as usize]);
-                                    let _ = stdout.output_string(hex_chars[mid_hi as usize]);
-                                    let _ = stdout.output_string(hex_chars[mid_lo as usize]);
-                                    let _ = stdout.output_string(hex_chars[lo as usize]);
-                                    let _ = stdout.output_string(cstr16!(")\r\n"));
-
-                                    // Show common error codes
-                                    let _ = stdout.output_string(cstr16!("    (0x8001=LOAD_ERROR, 0x8002=INVALID_PARAM)\r\n"));
+                                    let _ = stdout.output_string(cstr16!("FAILED\r\n"));
                                 }
                             }
                         });
 
-                        if !status.is_success() {
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.output_string(cstr16!("  - LoadImage failed, trying direct entry point...\r\n"));
-                            });
-
-                            // Fallback: Find and call the EFI entry point directly
-                            // PE/COFF format: entry point is at offset 0x28 in PE header
-                            let dos_header = kernel_data.as_ptr() as *const u8;
-                            let pe_offset = *(dos_header.add(0x3C) as *const u32) as usize;
-                            let pe_header = dos_header.add(pe_offset);
-                            let optional_header_offset = pe_offset + 0x18;
-                            let entry_point_rva = *(pe_header.add(optional_header_offset + 0x10) as *const u32) as usize;
-                            let image_base = kernel_data.as_ptr() as usize;
-                            let entry_point = (image_base + entry_point_rva) as *const ();
-
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.output_string(cstr16!("  - Jumping to kernel entry point...\r\n"));
-                            });
-
-                            // UEFI entry point signature: fn(image_handle: Handle, system_table: *mut SystemTable) -> Status
-                            type EfiEntry = extern "efiapi" fn(*mut core::ffi::c_void, *mut uefi_raw::table::system::SystemTable) -> Status;
-                            let efi_entry: EfiEntry = core::mem::transmute(entry_point);
-
-                            let entry_status = efi_entry(
-                                uefi::boot::image_handle().as_ptr(),
-                                system_table as *const _ as *mut _
-                            );
-
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.output_string(cstr16!("  - Kernel entry returned: "));
-                                match entry_status {
-                                    Status::SUCCESS => {
-                                        let _ = stdout.output_string(cstr16!("SUCCESS\r\n"));
-                                    }
-                                    _ => {
-                                        let _ = stdout.output_string(cstr16!("FAILED\r\n"));
-                                    }
-                                }
-                            });
-
-                            Err(entry_status)
-                        } else {
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.output_string(cstr16!("  - Calling StartImage...\r\n"));
-                            });
-
-                            let start_image = (*boot_services).start_image;
-                            let status = start_image(
-                                kernel_handle,
-                                core::ptr::null_mut(),
-                                core::ptr::null_mut(),
-                            );
-
-                            uefi::system::with_stdout(|stdout| {
-                                let _ = stdout.output_string(cstr16!("  - StartImage status: "));
-                                match status {
-                                    Status::SUCCESS => {
-                                        let _ = stdout.output_string(cstr16!("SUCCESS\r\n"));
-                                    }
-                                    _ => {
-                                        let _ = stdout.output_string(cstr16!("FAILED\r\n"));
-                                    }
-                                }
-                            });
-
-                            if status.is_success() {
-                                Err(uefi::Status::ABORTED)
-                            } else {
-                                Err(status)
-                            }
-                        }
+                        Err(entry_status)
                     };
 
                     result.map_err(|e| uefi::Error::from(e))

@@ -64,14 +64,19 @@ fn main() -> Status {
         let _ = stdout.clear();
         let _ = stdout.enable_cursor(true);
 
-        // Display kernel banner
+        // Display kernel banner with border color
+        let _ = stdout.set_color(theme.border, theme.background);
         let _ = stdout.output_string(cstr16!(
 "\r\n\
-***************************************************************************\r\n\
-*                                                                         *\r\n\
-*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                    *\r\n\
-*                                                                         *\r\n\
-***************************************************************************\r\n\
+***************************************************************************\r\n"));
+        let _ = stdout.set_color(theme.foreground, theme.background);
+        let _ = stdout.output_string(cstr16!(
+"*                                                                         *\r\n\
+*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                   *\r\n\
+*                                                                         *\r\n"));
+        let _ = stdout.set_color(theme.border, theme.background);
+        let _ = stdout.output_string(cstr16!(
+"***************************************************************************\r\n\
 \r\n\
 [KERNEL ENTRY POINT REACHED]\r\n\
 \r\n\
@@ -484,21 +489,26 @@ fn show_boot_menu() -> BootMode {
     const MENU_TIMEOUT_SECONDS: u64 = 10;
     const MENU_DELAY_MS: u64 = 100;
     let max_attempts = (MENU_TIMEOUT_SECONDS * 1000) / MENU_DELAY_MS;
+    let theme = get_active_theme();
 
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Black);
+        let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.clear();
         let _ = stdout.enable_cursor(true);
 
-        // Display boot menu
+        // Display boot menu with border color
+        let _ = stdout.set_color(theme.border, theme.background);
         let _ = stdout.output_string(cstr16!(
 "\r\n\
-***************************************************************************\r\n\
-*                                                                         *\r\n\
+***************************************************************************\r\n"));
+        let _ = stdout.set_color(theme.foreground, theme.background);
+        let _ = stdout.output_string(cstr16!(
+"*                                                                         *\r\n\
 *                      RUSTUX OS BOOTLOADER v0.3.0                        *\r\n\
-*                                                                         *\r\n\
-***************************************************************************\r\n\
+*                                                                         *\r\n"));
+        let _ = stdout.set_color(theme.border, theme.background);
+        let _ = stdout.output_string(cstr16!(
+"***************************************************************************\r\n\
 \r\n\
 Select Boot Mode:\r\n\
 \r\n\
@@ -597,21 +607,26 @@ fn show_install_menu() -> InstallMode {
     const MENU_TIMEOUT_SECONDS: u64 = 30;  // 30 seconds for install mode selection
     const MENU_DELAY_MS: u64 = 100;
     let max_attempts = (MENU_TIMEOUT_SECONDS * 1000) / MENU_DELAY_MS;
+    let theme = get_active_theme();
 
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Black);
+        let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.clear();
         let _ = stdout.enable_cursor(true);
 
-        // Display install mode menu
+        // Display install mode menu with border color
+        let _ = stdout.set_color(theme.border, theme.background);
         let _ = stdout.output_string(cstr16!(
 "\r\n\
-***************************************************************************\r\n\
-*                                                                         *\r\n\
+***************************************************************************\r\n"));
+        let _ = stdout.set_color(theme.foreground, theme.background);
+        let _ = stdout.output_string(cstr16!(
+"*                                                                         *\r\n\
 *                   INSTALLATION MODE SELECTION                           *\r\n\
-*                                                                         *\r\n\
-***************************************************************************\r\n\
+*                                                                         *\r\n"));
+        let _ = stdout.set_color(theme.border, theme.background);
+        let _ = stdout.output_string(cstr16!(
+"***************************************************************************\r\n\
 \r\n\
 Select installation type:\r\n\
 \r\n\

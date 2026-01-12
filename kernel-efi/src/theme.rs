@@ -31,27 +31,32 @@ pub struct Theme {
     pub warning: Color,
     /// Error messages
     pub error: Color,
+    /// Border/decorative color (Dracula purple/pink)
+    pub border: Color,
 }
 
 /// Get the default Dracula theme
 pub fn get_dracula_theme() -> Theme {
     // Dracula color palette (mapped to UEFI colors)
-    // Background: #282a36 → Blue (closest UEFI match for dark bg)
+    // Background: #282a36 → Black (darkest UEFI color for dark bg)
+    // Current Line: #44475a → Blue (used for selections)
     // Foreground: #f8f8f2 → White
+    // Comment: #6272a4 → Cyan (not used in CLI)
     // Cyan: #8be9fd → Cyan
     // Green: #50fa7b → Green
     // Orange: #ffb86c → Yellow (UEFI doesn't have orange)
-    // Pink: #ff79c6 → Magenta (UEFI doesn't have pink)
-    // Purple: #bd93f9 → Magenta
+    // Pink: #ff79c6 → Magenta (not used in CLI)
+    // Purple: #bd93f9 → Magenta (not used in CLI)
     // Red: #ff5555 → Red
     // Yellow: #f1fa8c → Yellow
 
     Theme {
-        // Dark background - using Blue as base (can be configured to Black if supported)
-        background: Color::Blue,
+        // Dark background - using Black as darkest available UEFI color
+        // Dracula's #282a36 mapped to UEFI Black (closest match for dark bg)
+        background: Color::Black,
 
         // Slightly lighter background for selections
-        background_alt: Color::Black,
+        background_alt: Color::Blue,
 
         // Primary foreground - white text
         foreground: Color::White,
@@ -73,6 +78,9 @@ pub fn get_dracula_theme() -> Theme {
 
         // Error - red (matches ff5555)
         error: Color::Red,
+
+        // Border - magenta for Dracula pink/purple (#ff79c6, #bd93f9)
+        border: Color::Magenta,
     }
 }
 
@@ -92,6 +100,7 @@ pub mod themes {
             success: Color::Green,
             warning: Color::Yellow,
             error: Color::Red,
+            border: Color::Blue,
         }
     }
 
@@ -107,6 +116,7 @@ pub mod themes {
             success: Color::Green,
             warning: Color::Yellow,
             error: Color::Red,
+            border: Color::White,
         }
     }
 }

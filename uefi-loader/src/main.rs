@@ -765,52 +765,101 @@ fn load_and_start_kernel() -> uefi::Result {
                     }
 
                     uefi::system::with_stdout(|stdout| {
-                        let _ = stdout.output_string(cstr16!("  - Using direct entry point (LoadImage bypass)...\r\n"));
+                        let _ = stdout.output_string(cstr16!("  - Loading kernel image via EFI protocol...\r\n"));
                     });
 
-                    // Skip LoadImage entirely - it can hang on some UEFI firmware
-                    // Jump directly to the kernel's EFI entry point
+                    // Load the kernel using the UEFI LoadImage service
+                    // This properly handles PE relocation and entry point
                     let result = unsafe {
                         let bt = uefi::table::system_table_raw().unwrap();
                         let system_table = bt.as_ref();
+                        let boot_services = system_table.boot_services;
 
-                        // Find entry point in PE/COFF format
-                        let dos_header = kernel_data.as_ptr() as *const u8;
-                        let pe_offset = *(dos_header.add(0x3C) as *const u32) as usize;
-                        let pe_header = dos_header.add(pe_offset);
-                        let optional_header_offset = pe_offset + 0x18;
-                        let entry_point_rva = *(pe_header.add(optional_header_offset + 0x10) as *const u32) as usize;
-                        let image_base = kernel_data.as_ptr() as usize;
-                        let entry_point = (image_base + entry_point_rva) as *const ();
+                        // First, try to get the device path and use LoadImage with file path
+                        // If that fails, load from memory buffer
+                        let mut kernel_handle: *mut core::ffi::c_void = core::ptr::null_mut();
+                        let load_image = (*boot_services).load_image;
 
                         uefi::system::with_stdout(|stdout| {
-                            let _ = stdout.output_string(cstr16!("  - Entry point at: 0x"));
-                            let _ = stdout.output_string(cstr16!("XXXX\r\n"));
-                            let _ = stdout.output_string(cstr16!("  - Jumping to kernel...\r\n"));
+                            let _ = stdout.output_string(cstr16!("  - Calling LoadImage...\r\n"));
                         });
 
-                        // UEFI entry point signature: fn(image_handle: Handle, system_table: *mut SystemTable) -> Status
-                        type EfiEntry = extern "efiapi" fn(*mut core::ffi::c_void, *mut uefi_raw::table::system::SystemTable) -> Status;
-                        let efi_entry: EfiEntry = core::mem::transmute(entry_point);
-
-                        let entry_status = efi_entry(
+                        // Try loading from buffer (BootPolicy = FALSE)
+                        let status = load_image(
+                            false.into(),  // BootPolicy: FALSE = load from buffer
                             uefi::boot::image_handle().as_ptr(),
-                            system_table as *const _ as *mut _
+                            core::ptr::null(),  // No FilePath when loading from buffer
+                            kernel_data.as_ptr() as *mut u8,
+                            file_size,
+                            &mut kernel_handle,
                         );
 
                         uefi::system::with_stdout(|stdout| {
-                            let _ = stdout.output_string(cstr16!("  - Kernel entry returned: "));
-                            match entry_status {
-                                Status::SUCCESS => {
-                                    let _ = stdout.output_string(cstr16!("SUCCESS\r\n"));
-                                }
-                                _ => {
-                                    let _ = stdout.output_string(cstr16!("FAILED\r\n"));
-                                }
+                            let _ = stdout.output_string(cstr16!("  - LoadImage result: "));
+                            if status.is_success() {
+                                let _ = stdout.output_string(cstr16!("SUCCESS\r\n"));
+                            } else {
+                                let _ = stdout.output_string(cstr16!("FAILED (trying direct jump)...\r\n"));
                             }
                         });
 
-                        Err(entry_status)
+                        if !status.is_success() {
+                            // LoadImage failed, try direct entry point call
+                            let dos_header = kernel_data.as_ptr() as *const u8;
+                            let pe_offset = *(dos_header.add(0x3C) as *const u32) as usize;
+                            let pe_header = dos_header.add(pe_offset);
+                            let optional_header_offset = pe_offset + 0x18;
+                            let entry_point_rva = *(pe_header.add(optional_header_offset + 0x10) as *const u32) as usize;
+                            let image_base = kernel_data.as_ptr() as usize;
+                            let entry_point = (image_base + entry_point_rva) as *const ();
+
+                            uefi::system::with_stdout(|stdout| {
+                                let _ = stdout.output_string(cstr16!("  - Direct jump to 0x"));
+                                let addr = entry_point as usize;
+                                let _ = stdout.output_string(cstr16!("XXXX\r\n"));
+                                let _ = stdout.output_string(cstr16!("  - Starting kernel...\r\n"));
+                            });
+
+                            // UEFI entry point signature
+                            type EfiEntry = extern "efiapi" fn(*mut core::ffi::c_void, *mut uefi_raw::table::system::SystemTable) -> Status;
+                            let efi_entry: EfiEntry = core::mem::transmute(entry_point);
+
+                            let entry_status = efi_entry(
+                                uefi::boot::image_handle().as_ptr(),
+                                system_table as *const _ as *mut _
+                            );
+
+                            uefi::system::with_stdout(|stdout| {
+                                let _ = stdout.output_string(cstr16!("  - Kernel returned (shouldn't happen)\r\n"));
+                            });
+
+                            return Err(entry_status.into());
+                        }
+
+                        // LoadImage succeeded, now start the image
+                        uefi::system::with_stdout(|stdout| {
+                            let _ = stdout.output_string(cstr16!("  - Starting kernel image...\r\n"));
+                        });
+
+                        let start_image = (*boot_services).start_image;
+                        let mut exit_data_size: usize = 0;
+                        let mut exit_data: *mut u16 = core::ptr::null_mut();
+
+                        let start_status = start_image(
+                            kernel_handle,
+                            &mut exit_data_size as *mut _,
+                            &mut exit_data as *mut _
+                        );
+
+                        uefi::system::with_stdout(|stdout| {
+                            let _ = stdout.output_string(cstr16!("  - Kernel returned (unexpected)!\r\n"));
+                        });
+
+                        if start_status.is_success() {
+                            Err(uefi::Status::ABORTED)
+                        } else {
+                            Err(start_status)
+                        }
                     };
 
                     result.map_err(|e| uefi::Error::from(e))

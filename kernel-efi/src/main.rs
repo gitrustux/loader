@@ -106,16 +106,23 @@ Memory map captured. Exiting UEFI boot services now...\r\n\
 /// UEFI entry point for the kernel
 #[entry]
 fn main() -> Status {
-    // Early debug output - write directly before any initialization
+    // IMMEDIATE output - this is the FIRST thing that runs in the kernel
+    // Write directly without any initialization
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!("Rustux: Entry point reached\r\n"));
+        let _ = stdout.output_string(cstr16!("\r\n\r\n=== KERNEL ENTRY POINT REACHED ===\r\n"));
+    });
+
+    // Small delay to make sure this is visible
+    uefi::boot::stall(Duration::from_millis(200));
+
+    // More debug output
+    uefi::system::with_stdout(|stdout| {
         let _ = stdout.output_string(cstr16!("Rustux: Skipping helpers::init()...\r\n"));
     });
 
-    // Small delay to ensure bootloader output is visible
-    uefi::boot::stall(Duration::from_millis(500));
+    uefi::boot::stall(Duration::from_millis(100));
 
-    // Initialize console layer directly without helpers::init()
+    // Initialize console
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.output_string(cstr16!("Rustux: Initializing console...\r\n"));
     });
@@ -125,7 +132,7 @@ fn main() -> Status {
         let _ = stdout.output_string(cstr16!("Rustux: Console initialized\r\n"));
     });
 
-    // Skip boot menu for testing - boot directly into CLI mode
+    // Skip boot menu - boot directly into CLI mode
     let boot_mode = BootMode::CommandLine;
     let install_mode = None;
     let theme = get_active_theme();

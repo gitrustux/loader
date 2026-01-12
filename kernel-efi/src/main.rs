@@ -9,6 +9,7 @@ use uefi::mem::memory_map::MemoryMap;
 
 mod theme;
 mod runtime;
+mod filesystem;
 use theme::get_active_theme;
 
 // Global allocator for UEFI
@@ -89,9 +90,10 @@ Kernel runtime is now active.\r\n\
   - Conventional memory available\r\n\
   - External applications framework active\r\n\
 \r\n"));
-        let _ = stdout.set_color(theme.warning, theme.background);
-        let _ = stdout.output_string(cstr16!("Note: Filesystem access is required to load external binaries.\r\n\
-Execution infrastructure is ready for filesystem implementation.\r\n\
+        let _ = stdout.set_color(theme.success, theme.background);
+        let _ = stdout.output_string(cstr16!("Filesystem:\r\n\
+  - Embedded filesystem initialized\r\n\
+  - Available programs: hello, echo, test, version\r\n\
 \r\n"));
     });
 
@@ -101,6 +103,8 @@ Execution infrastructure is ready for filesystem implementation.\r\n\
     // Initialize kernel runtime
     unsafe {
         runtime::init_runtime(memory_map_vec, map_len, 0);
+        // Initialize embedded filesystem
+        filesystem::init_filesystem();
     }
 }
 
@@ -578,6 +582,7 @@ fn cmd_eq_ignore_case(cmd: &[u16], target: &str) -> bool {
 /// Show help message using theme colors
 fn show_help() {
     let theme = get_active_theme();
+    let is_runtime = runtime::is_runtime_mode();
 
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.set_color(theme.foreground, theme.background);
@@ -588,9 +593,24 @@ Available Commands:\r\n\
   help, ?        - Show this help message\r\n\
   clear, cls     - Clear the screen\r\n\
   info, status   - Show system information\r\n\
-  version, ver   - Show version information\r\n\
   reboot         - Restart the system\r\n\
+\r\n"));
+
+        // Show external apps if in runtime mode
+        if is_runtime {
+            let _ = stdout.set_color(theme.info, theme.background);
+            let _ = stdout.output_string(cstr16!(
+"External Applications:\r\n\
 \r\n\
+  hello           - Print greeting from userspace\r\n\
+  echo            - Echo arguments (stub)\r\n\
+  test            - Run basic tests\r\n\
+  version         - Show program version\r\n\
+\r\n"));
+            let _ = stdout.set_color(theme.foreground, theme.background);
+        }
+
+        let _ = stdout.output_string(cstr16!("\r\n\
 "));
     });
 }

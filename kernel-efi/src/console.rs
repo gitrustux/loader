@@ -10,7 +10,7 @@
 //! if we saved the interface pointer before exiting.
 
 use uefi::proto::console::text::Color;
-use uefi::CStr16;
+use uefi::{CStr16, cstr16};
 
 /// Saved text output protocol pointer (works after ExitBootServices)
 static mut TEXT_OUTPUT_PTR: Option<usize> = None;
@@ -22,31 +22,30 @@ static mut TEXT_INPUT_PTR: Option<usize> = None;
 static mut IN_RUNTIME_MODE: bool = false;
 
 /// Initialize the console layer - save protocol pointers before ExitBootServices
+///
+/// NOTE: Due to UEFI protocol conflicts with the bootloader, we don't save
+/// the console protocol pointers. Instead, we rely on uefi::system::with_stdout
+/// which will continue to work in boot services mode.
+///
+/// After ExitBootServices is called, the console will stop working.
+/// For post-boot console, a native driver will be needed.
 pub unsafe fn init_console() {
-    use uefi::boot::{get_handle_for_protocol, open_protocol_exclusive};
-    use uefi::proto::console::text::Output;
-    use uefi::proto::console::text::Input;
+    // Debug output
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.output_string(cstr16!("[CONSOLE] init_console() - SKIPPING PROTOCOL SAVE\r\n"));
+        let _ = stdout.output_string(cstr16!("[CONSOLE] Using uefi::system::with_stdout directly\r\n"));
+    });
 
-    // Get and save stdout protocol pointer
-    if let Ok(handle) = get_handle_for_protocol::<Output>() {
-        if let Ok(protocol) = open_protocol_exclusive::<Output>(handle) {
-            // Get a mutable reference and convert to raw pointer
-            let interface_ptr: *const Output = &*protocol;
-            TEXT_OUTPUT_PTR = Some(interface_ptr as usize);
-            core::mem::forget(protocol); // Prevent cleanup - we're keeping the pointer
-        }
-    }
-
-    // Get and save stdin protocol pointer
-    if let Ok(handle) = get_handle_for_protocol::<Input>() {
-        if let Ok(protocol) = open_protocol_exclusive::<Input>(handle) {
-            let interface_ptr: *const Input = &*protocol;
-            TEXT_INPUT_PTR = Some(interface_ptr as usize);
-            core::mem::forget(protocol);
-        }
-    }
+    // Don't try to open the console protocols - the bootloader already has them open
+    // This would cause a hang with open_protocol_exclusive
+    // TEXT_OUTPUT_PTR and TEXT_INPUT_PTR remain None
+    // All console output goes through uefi::system::with_stdout
 
     IN_RUNTIME_MODE = false;
+
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.output_string(cstr16!("[CONSOLE] Console init complete (using UEFI stdout)\r\n"));
+    });
 }
 
 /// Mark that we've entered runtime mode (ExitBootServices called)

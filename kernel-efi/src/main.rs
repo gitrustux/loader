@@ -107,29 +107,42 @@ Memory map captured. Exiting UEFI boot services now...\r\n\
 #[entry]
 fn main() -> Status {
     // IMMEDIATE output - this is the FIRST thing that runs in the kernel
-    // Write directly without any initialization
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.output_string(cstr16!("\r\n\r\n=== KERNEL ENTRY POINT REACHED ===\r\n"));
     });
 
-    // Small delay to make sure this is visible
     uefi::boot::stall(Duration::from_millis(200));
 
-    // More debug output
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.output_string(cstr16!("Rustux: Skipping helpers::init()...\r\n"));
     });
 
     uefi::boot::stall(Duration::from_millis(100));
 
-    // Initialize console
+    // Initialize console layer (with detailed debug tracing)
+    // The init_console() function now has step-by-step debug output to identify
+    // exactly which UEFI protocol call causes issues
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!("Rustux: Initializing console...\r\n"));
+        let _ = stdout.output_string(cstr16!("Rustux: Initializing console layer...\r\n"));
     });
-    unsafe { console::init_console(); }
+
+    #[cfg(feature = "early-uefi-console-only")]
+    {
+        uefi::system::with_stdout(|stdout| {
+            let _ = stdout.output_string(cstr16!("Rustux: [EARLY-UEFI-CONSOLE-ONLY] Skipping custom console init\r\n"));
+        });
+        // Skip console::init_console() entirely - only use uefi::system::with_stdout
+    }
+
+    #[cfg(not(feature = "early-uefi-console-only"))]
+    {
+        unsafe { console::init_console(); }
+    }
+
+    uefi::boot::stall(Duration::from_millis(100));
 
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!("Rustux: Console initialized\r\n"));
+        let _ = stdout.output_string(cstr16!("Rustux: Console setup complete\r\n"));
     });
 
     // Skip boot menu - boot directly into CLI mode

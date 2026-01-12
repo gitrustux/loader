@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 authors = ["The Rustux Authors"]
 
+[features]
+default = []
+early-uefi-console-only = []
+
 [dependencies]
 uefi = { version = "0.36", features = ["alloc", "logger"] }
 uefi-raw = "0.13"

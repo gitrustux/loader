@@ -22,6 +22,7 @@ use spin::Mutex;
 
 use crate::rustux::types::*;
 use crate::kernel::lib::gfx::{GfxFont, GfxSurface};
+use crate::kernel::lib::vga_font::VGA_FONT;
 
 /// Default text color (white)
 pub const TEXT_COLOR: u32 = 0xFFFFFFFF;
@@ -148,9 +149,9 @@ impl GfxConsole {
         // Fill screen with background color
         if let Some(surface) = self.surface {
             unsafe {
-                if let Some(s) = surface.as_ref() {
-                    // TODO: Implement fillrect
-                    let _ = (s, crash_console);
+                if let Some(s) = surface.as_mut() {
+                    let back = self.back_color.load(Ordering::Acquire);
+                    s.fillrect(0, 0, s.width, s.height, back);
                 }
             }
         }
@@ -254,10 +255,20 @@ impl GfxConsole {
             let front = self.front_color.load(Ordering::Acquire);
             let back = self.back_color.load(Ordering::Acquire);
 
+            let pixel_x = x * font.width;
+            let pixel_y = y * font.height;
+
             unsafe {
-                if let Some(s) = surface.as_ref() {
-                    // TODO: Implement putchar
-                    let _ = (s, font, c, x, y, front, back);
+                if let Some(s) = surface.as_mut() {
+                    crate::kernel::lib::gfx::gfx_putchar(
+                        s,
+                        font,
+                        c,
+                        pixel_x,
+                        pixel_y,
+                        front,
+                        back,
+                    );
                 }
             }
         }
@@ -265,13 +276,32 @@ impl GfxConsole {
 
     /// Scroll the console up by one line
     fn scroll_up(&self) {
-        let y = self.y.fetch_sub(1, Ordering::AcqRel);
+        if let (Some(surface), Some(font)) = (self.surface, self.font) {
+            let char_height = font.height;
+            unsafe {
+                if let Some(s) = surface.as_mut() {
+                    // Copy all lines up by one character row
+                    s.copyrect(
+                        0,
+                        char_height,
+                        s.width,
+                        s.height - char_height,
+                        0,
+                        0,
+                    );
 
-        // TODO: Implement scroll using copyrect
-        let _ = y;
-
-        // Clear bottom line
-        self.clear_line(y);
+                    // Clear the new bottom line
+                    let back = self.back_color.load(Ordering::Acquire);
+                    s.fillrect(
+                        0,
+                        s.height - char_height,
+                        s.width,
+                        char_height,
+                        back,
+                    );
+                }
+            }
+        }
     }
 
     /// Clear a line
@@ -280,11 +310,17 @@ impl GfxConsole {
     ///
     /// * `y` - Line number to clear
     fn clear_line(&self, y: u32) {
-        if let Some(surface) = self.surface {
+        if let (Some(surface), Some(font)) = (self.surface, self.font) {
             unsafe {
-                if let Some(s) = surface.as_ref() {
-                    // TODO: Implement line clearing
-                    let _ = (s, y);
+                if let Some(s) = surface.as_mut() {
+                    let back = self.back_color.load(Ordering::Acquire);
+                    s.fillrect(
+                        0,
+                        y * font.height,
+                        s.width,
+                        font.height,
+                        back,
+                    );
                 }
             }
         }
@@ -292,8 +328,14 @@ impl GfxConsole {
 
     /// Flush the console to hardware
     pub fn flush(&self) {
-        // TODO: Implement blit to hardware surface if needed
-        // and flush hardware surface
+        // Flush software surface to display
+        if let Some(surface) = self.surface {
+            unsafe {
+                if let Some(s) = surface.as_ref() {
+                    s.flush();
+                }
+            }
+        }
     }
 
     /// Put a pixel directly (bypasses console)
@@ -306,9 +348,8 @@ impl GfxConsole {
     pub fn putpixel(&self, x: u32, y: u32, color: u32) {
         if let Some(surface) = self.surface {
             unsafe {
-                if let Some(s) = surface.as_ref() {
-                    // TODO: Implement putpixel
-                    let _ = (s, x, y, color);
+                if let Some(s) = surface.as_mut() {
+                    s.putpixel(x, y, color);
                 }
             }
         }
@@ -381,8 +422,8 @@ pub fn gfxconsole_start(surface: *mut GfxSurface, hw_surface: *mut GfxSurface) {
 
 /// Placeholder font (TODO: load actual font)
 fn placeholder_font() -> &'static GfxFont {
-    // TODO: Return actual font
-    unsafe { core::mem::zeroed() }
+    // Use the built-in VGA 8x16 font
+    &VGA_FONT
 }
 
 #[cfg(test)]

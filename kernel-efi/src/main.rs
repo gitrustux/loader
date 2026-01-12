@@ -11,6 +11,7 @@ mod theme;
 mod runtime;
 mod filesystem;
 mod console;
+mod native_console;
 use theme::get_active_theme;
 
 // Global allocator for UEFI
@@ -100,6 +101,20 @@ Memory map captured. Exiting UEFI boot services now...\r\n\
         filesystem::init_filesystem();
         // Mark console as being in runtime mode
         console::set_runtime_mode();
+
+        // Initialize native console (after ExitBootServices, UEFI console stops working)
+        // Start with serial console as fallback
+        use native_console::{init_serial_console, SerialConfig};
+
+        let serial_config = SerialConfig {
+            base: 0x3F8,      // COM1
+            baud_divisor: 12, // 9600 baud
+            data_bits: 8,
+            stop_bits: 1,
+            parity: 0,
+        };
+
+        init_serial_console(serial_config);
     }
 }
 

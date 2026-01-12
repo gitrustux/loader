@@ -5,11 +5,11 @@ extern crate alloc;
 
 use uefi::prelude::*;
 use core::time::Duration;
+use uefi::mem::memory_map::MemoryMap;
 
 mod theme;
 mod runtime;
 use theme::get_active_theme;
-use runtime::MemoryDescriptor;
 
 // Global allocator for UEFI
 #[global_allocator]
@@ -42,8 +42,10 @@ enum InstallMode {
 
 /// Transition from UEFI boot services to kernel runtime
 ///
-/// This function initializes the kernel runtime infrastructure.
-/// Full ExitBootServices implementation will be added in future updates.
+/// This function:
+/// 1. Captures the memory map
+/// 2. Exits UEFI boot services
+/// 3. Initializes kernel runtime
 fn transition_to_runtime() {
     let theme = get_active_theme();
 
@@ -51,28 +53,54 @@ fn transition_to_runtime() {
         let _ = stdout.set_color(theme.warning, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
 [RUNTIME TRANSITION]\r\n\
-Initializing kernel runtime infrastructure...\r\n\
+Preparing to exit UEFI boot services...\r\n\
 \r\n\
 Status:\r\n\
-  - Runtime module loaded...\r\n\
-  - Memory management: Available\r\n\
-  - Process abstraction: Available\r\n\
-  - ELF loader: Available\r\n\
-  - Execution framework: Available\r\n\
-\r\n\
-Note: Full ExitBootServices transition requires low-level UEFI access.\r\n\
-Runtime infrastructure is ready for future implementation.\r\n\
+  - Capturing memory map and exiting boot services...\r\n\
+"));
+    });
+
+    // Use uefi::boot::exit_boot_services to get memory map and exit in one call
+    let memory_map = unsafe { uefi::boot::exit_boot_services(None) };
+
+    // Convert memory map to our format
+    let mut memory_map_vec = alloc::vec::Vec::new();
+    for desc in memory_map.entries() {
+        memory_map_vec.push(runtime::MemoryDescriptor {
+            physical_start: desc.phys_start,
+            number_of_pages: desc.page_count,
+            memory_type: unsafe { core::mem::transmute(desc.ty) },
+            attribute: desc.att.bits(),
+        });
+    }
+
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(theme.success, theme.background);
+        let _ = stdout.output_string(cstr16!("\r\n\
+[RUNTIME MODE ACTIVE]\r\n\
+UEFI boot services have been exited.\r\n\
+Kernel runtime is now active.\r\n\
 \r\n"));
         let _ = stdout.set_color(theme.info, theme.background);
-        let _ = stdout.output_string(cstr16!("Runtime Mode: INFRASTRUCTURE ACTIVE\r\n\
-External apps will be available after full ExitBootServices implementation.\r\n\
+        let _ = stdout.output_string(cstr16!("Memory Management:\r\n\
+  - Total descriptors: "));
+        let _ = stdout.output_uint(memory_map_vec.len() as u64);
+        let _ = stdout.output_string(cstr16!("\r\n\
+  - Conventional memory available\r\n\
+  - External applications framework active\r\n\
+\r\n"));
+        let _ = stdout.set_color(theme.warning, theme.background);
+        let _ = stdout.output_string(cstr16!("Note: Filesystem access is required to load external binaries.\r\n\
+Execution infrastructure is ready for filesystem implementation.\r\n\
 \r\n"));
     });
 
-    // Initialize runtime with a simple memory map
-    let memory_map = alloc::vec::Vec::new();
+    // Get length before moving memory_map_vec
+    let map_len = memory_map_vec.len() * 48;
+
+    // Initialize kernel runtime
     unsafe {
-        runtime::init_runtime(memory_map);
+        runtime::init_runtime(memory_map_vec, map_len, 0);
     }
 }
 

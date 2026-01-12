@@ -6,6 +6,9 @@ extern crate alloc;
 use uefi::prelude::*;
 use core::time::Duration;
 
+mod theme;
+use theme::{get_active_theme, Theme};
+
 // Global allocator for UEFI
 #[global_allocator]
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
@@ -54,9 +57,10 @@ fn main() -> Status {
         None
     };
 
+    let theme = get_active_theme();
+
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.clear();
         let _ = stdout.enable_cursor(true);
 
@@ -65,7 +69,7 @@ fn main() -> Status {
 "\r\n\
 ***************************************************************************\r\n\
 *                                                                         *\r\n\
-*                 RUSTUX OS KERNEL v0.1.0 - EFI BOOT                      *\r\n\
+*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                    *\r\n\
 *                                                                         *\r\n\
 ***************************************************************************\r\n\
 \r\n\
@@ -79,9 +83,8 @@ Status:\r\n\
 The kernel is now running as a native UEFI application.\r\n\
 "));
 
-        // Show selected boot mode
-        let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
-                                 uefi::proto::console::text::Color::Blue);
+        // Show selected boot mode using info color
+        let _ = stdout.set_color(theme.info, theme.background);
         match boot_mode {
             BootMode::Desktop => {
                 let _ = stdout.output_string(cstr16!("\r\n\
@@ -96,7 +99,7 @@ Initializing GUI system...\r\n\
             BootMode::Install => {
                 let _ = stdout.output_string(cstr16!("\r\n\
 Boot Mode: INSTALLATION\r\n\
-  - Installing Rustux OS to target device\r\n\
+  - Installing Rustica OS to target device\r\n\
 "));
                 match install_mode {
                     Some(InstallMode::Desktop) => {
@@ -119,7 +122,7 @@ Initializing system...\r\n\
             BootMode::CommandLine => {
                 let _ = stdout.output_string(cstr16!("\r\n\
 Boot Mode: COMMAND LINE (CLI)\r\n\
-  - Loading Rustux OS Shell\r\n\
+  - Loading Rustica OS Shell\r\n\
   - Command-line interface only\r\n\
   - Minimal resource usage\r\n\
 \r\n\
@@ -133,9 +136,9 @@ Initializing shell...\r\n\
     match boot_mode {
         BootMode::Desktop => {
             // Desktop mode - show GUI message then run CLI until GUI is implemented
+            let theme = get_active_theme();
             uefi::system::with_stdout(|stdout| {
-                let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
-                                         uefi::proto::console::text::Color::Blue);
+                let _ = stdout.set_color(theme.warning, theme.background);
                 let _ = stdout.output_string(cstr16!("\r\n\
 [GUI MODE]\r\n\
 Desktop environment (GNOME-like) will be implemented soon.\r\n\
@@ -159,9 +162,10 @@ Currently running in CLI mode. Type 'help' for commands.\r\n\
 
 /// Run the interactive command-line loop
 fn run_cli_loop(boot_mode: BootMode, install_mode: Option<InstallMode>) -> ! {
+    let theme = get_active_theme();
+
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::Green,
-                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.set_color(theme.success, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
 [SYSTEM READY]\r\n\
 Rustica OS is running. Type 'help' for available commands.\r\n\
@@ -173,10 +177,9 @@ Rustica OS is running. Type 'help' for available commands.\r\n\
     let mut input_buffer: [u16; 256] = [0; 256];
 
     loop {
-        // Show prompt - Yellow for visibility, "rustica" not "rustux"
+        // Show prompt using theme prompt color
         uefi::system::with_stdout(|stdout| {
-            let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
-                                     uefi::proto::console::text::Color::Blue);
+            let _ = stdout.set_color(theme.prompt, theme.background);
             let _ = stdout.output_string(cstr16!("rustica> "));
         });
 
@@ -252,24 +255,20 @@ fn read_line(buffer: &mut [u16]) -> usize {
     pos
 }
 
-/// Echo a single character to stdout in white
+/// Echo a single character to stdout using theme input color
 fn echo_char(c: u16) {
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Blue);
+    let theme = get_active_theme();
 
-        // Match on character value
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(theme.input, theme.background);
+
+        // Match on character value - all printable ASCII (32-126)
         let ch = match c {
+            // Digits
             48 => cstr16!("0"), 49 => cstr16!("1"), 50 => cstr16!("2"), 51 => cstr16!("3"),
             52 => cstr16!("4"), 53 => cstr16!("5"), 54 => cstr16!("6"), 55 => cstr16!("7"),
             56 => cstr16!("8"), 57 => cstr16!("9"),
-            97 => cstr16!("a"), 98 => cstr16!("b"), 99 => cstr16!("c"), 100 => cstr16!("d"),
-            101 => cstr16!("e"), 102 => cstr16!("f"), 103 => cstr16!("g"), 104 => cstr16!("h"),
-            105 => cstr16!("i"), 106 => cstr16!("j"), 107 => cstr16!("k"), 108 => cstr16!("l"),
-            109 => cstr16!("m"), 110 => cstr16!("n"), 111 => cstr16!("o"), 112 => cstr16!("p"),
-            113 => cstr16!("q"), 114 => cstr16!("r"), 115 => cstr16!("s"), 116 => cstr16!("t"),
-            117 => cstr16!("u"), 118 => cstr16!("v"), 119 => cstr16!("w"), 120 => cstr16!("x"),
-            121 => cstr16!("y"), 122 => cstr16!("z"),
+            // Uppercase letters
             65 => cstr16!("A"), 66 => cstr16!("B"), 67 => cstr16!("C"), 68 => cstr16!("D"),
             69 => cstr16!("E"), 70 => cstr16!("F"), 71 => cstr16!("G"), 72 => cstr16!("H"),
             73 => cstr16!("I"), 74 => cstr16!("J"), 75 => cstr16!("K"), 76 => cstr16!("L"),
@@ -277,17 +276,58 @@ fn echo_char(c: u16) {
             81 => cstr16!("Q"), 82 => cstr16!("R"), 83 => cstr16!("S"), 84 => cstr16!("T"),
             85 => cstr16!("U"), 86 => cstr16!("V"), 87 => cstr16!("W"), 88 => cstr16!("X"),
             89 => cstr16!("Y"), 90 => cstr16!("Z"),
+            // Lowercase letters
+            97 => cstr16!("a"), 98 => cstr16!("b"), 99 => cstr16!("c"), 100 => cstr16!("d"),
+            101 => cstr16!("e"), 102 => cstr16!("f"), 103 => cstr16!("g"), 104 => cstr16!("h"),
+            105 => cstr16!("i"), 106 => cstr16!("j"), 107 => cstr16!("k"), 108 => cstr16!("l"),
+            109 => cstr16!("m"), 110 => cstr16!("n"), 111 => cstr16!("o"), 112 => cstr16!("p"),
+            113 => cstr16!("q"), 114 => cstr16!("r"), 115 => cstr16!("s"), 116 => cstr16!("t"),
+            117 => cstr16!("u"), 118 => cstr16!("v"), 119 => cstr16!("w"), 120 => cstr16!("x"),
+            121 => cstr16!("y"), 122 => cstr16!("z"),
+            // Special characters
             32 => cstr16!(" "),   // space
+            33 => cstr16!("!"),   // exclamation
+            34 => cstr16!("\""),  // double quote
+            35 => cstr16!("#"),   // hash
+            36 => cstr16!("$"),   // dollar
+            37 => cstr16!("%"),   // percent
+            38 => cstr16!("&"),   // ampersand
+            39 => cstr16!("'"),   // single quote
+            40 => cstr16!("("),   // left paren
+            41 => cstr16!(")"),   // right paren
+            42 => cstr16!("*"),   // asterisk
+            43 => cstr16!("+"),   // plus
+            44 => cstr16!(","),   // comma
             45 => cstr16!("-"),   // hyphen
             46 => cstr16!("."),   // period
+            47 => cstr16!("/"),   // slash - FORWARD slash, not backspace!
+            58 => cstr16!(":"),   // colon
+            59 => cstr16!(";"),   // semicolon
+            60 => cstr16!("<"),   // less than
+            61 => cstr16!("="),   // equals
+            62 => cstr16!(">"),   // greater than
+            63 => cstr16!("?"),   // question mark
+            64 => cstr16!("@"),   // at sign
+            91 => cstr16!("["),   // left bracket
+            92 => cstr16!("\\"),  // backslash - escaped
+            93 => cstr16!("]"),   // right bracket
+            94 => cstr16!("^"),   // caret
+            95 => cstr16!("_"),   // underscore
+            96 => cstr16!("`"),   // backtick
+            123 => cstr16!("{"),  // left brace
+            124 => cstr16!("|"),  // pipe
+            125 => cstr16!("}"),  // right brace
+            126 => cstr16!("~"),  // tilde
             _ => cstr16!(""),     // other - don't echo
         };
         let _ = stdout.output_string(ch);
     });
 }
 
-/// Process a command
+/// Process a command using theme colors
 fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<InstallMode>) {
+    let theme = get_active_theme();
+
     // Simple command matching
     if cmd_eq_ignore_case(cmd, "help") || cmd_eq_ignore_case(cmd, "?") {
         show_help();
@@ -302,9 +342,9 @@ fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<Instal
     } else if cmd_eq_ignore_case(cmd, "version") || cmd_eq_ignore_case(cmd, "ver") {
         show_version();
     } else {
+        // Unknown command - use theme error color
         uefi::system::with_stdout(|stdout| {
-            let _ = stdout.set_color(uefi::proto::console::text::Color::Red,
-                                     uefi::proto::console::text::Color::Blue);
+            let _ = stdout.set_color(theme.error, theme.background);
             let _ = stdout.output_string(cstr16!("Unknown command. Type 'help' for available commands.\r\n\r\n"));
         });
     }
@@ -336,11 +376,12 @@ fn cmd_eq_ignore_case(cmd: &[u16], target: &str) -> bool {
     true
 }
 
-/// Show help message
+/// Show help message using theme colors
 fn show_help() {
+    let theme = get_active_theme();
+
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.output_string(cstr16!(
 "\r\n\
 Available Commands:\r\n\
@@ -355,11 +396,12 @@ Available Commands:\r\n\
     });
 }
 
-/// Show system information
+/// Show system information using theme colors
 fn show_system_info(boot_mode: BootMode, install_mode: Option<InstallMode>) {
+    let theme = get_active_theme();
+
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
 System Information:\r\n\
 \r\n\
@@ -391,13 +433,14 @@ System Information:\r\n\
     });
 }
 
-/// Show version information
+/// Show version information using theme colors
 fn show_version() {
+    let theme = get_active_theme();
+
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::White,
-                                 uefi::proto::console::text::Color::Blue);
+        let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
-Rustux OS\r\n\
+Rustica OS\r\n\
 Version: 0.1.0\r\n\
 Kernel: rustux-kernel-efi\r\n\
 Platform: UEFI\r\n\
@@ -406,11 +449,12 @@ Platform: UEFI\r\n\
     });
 }
 
-/// Reboot the system
+/// Reboot the system using theme warning color
 fn reboot_system() -> ! {
+    let theme = get_active_theme();
+
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(uefi::proto::console::text::Color::Yellow,
-                                 uefi::proto::console::text::Color::Red);
+        let _ = stdout.set_color(theme.warning, theme.background);
         let _ = stdout.output_string(cstr16!("\r\n\
 Rebooting system...\r\n\
 "));
@@ -463,11 +507,11 @@ Select Boot Mode:\r\n\
       - Full graphical interface with window management\r\n\
 \r\n\
   [2] Install to Disk\r\n\
-      - Install Rustux OS to target device\r\n\
+      - Install Rustica OS to target device\r\n\
       - Choose Desktop or Server mode\r\n\
 \r\n\
   [3] Command Line (CLI)\r\n\
-      - Load Rustux OS Shell only\r\n\
+      - Load Rustica OS Shell only\r\n\
       - Minimal resource usage\r\n\
 \r\n\
 "));

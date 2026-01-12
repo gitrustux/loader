@@ -114,7 +114,7 @@ fn main() -> Status {
         // Simple ASCII banner
         stdout.output_string(cstr16!(
 "==================================================================\r\n\
-||                     Rustux OS Bootloader                      ||\r\n\
+||                     RUSTUX BOOTLOADER                         ||\r\n\
 ||                   v0.3.0 - Zircon Patterns                   ||\r\n\
 ||==================================================================\r\n\
 \r\n\

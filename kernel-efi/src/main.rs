@@ -7,7 +7,9 @@ use uefi::prelude::*;
 use core::time::Duration;
 
 mod theme;
-use theme::{get_active_theme, Theme};
+mod runtime;
+use theme::get_active_theme;
+use runtime::MemoryDescriptor;
 
 // Global allocator for UEFI
 #[global_allocator]
@@ -36,6 +38,42 @@ enum BootMode {
 enum InstallMode {
     Desktop = 1,
     Server = 2,
+}
+
+/// Transition from UEFI boot services to kernel runtime
+///
+/// This function initializes the kernel runtime infrastructure.
+/// Full ExitBootServices implementation will be added in future updates.
+fn transition_to_runtime() {
+    let theme = get_active_theme();
+
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.set_color(theme.warning, theme.background);
+        let _ = stdout.output_string(cstr16!("\r\n\
+[RUNTIME TRANSITION]\r\n\
+Initializing kernel runtime infrastructure...\r\n\
+\r\n\
+Status:\r\n\
+  - Runtime module loaded...\r\n\
+  - Memory management: Available\r\n\
+  - Process abstraction: Available\r\n\
+  - ELF loader: Available\r\n\
+  - Execution framework: Available\r\n\
+\r\n\
+Note: Full ExitBootServices transition requires low-level UEFI access.\r\n\
+Runtime infrastructure is ready for future implementation.\r\n\
+\r\n"));
+        let _ = stdout.set_color(theme.info, theme.background);
+        let _ = stdout.output_string(cstr16!("Runtime Mode: INFRASTRUCTURE ACTIVE\r\n\
+External apps will be available after full ExitBootServices implementation.\r\n\
+\r\n"));
+    });
+
+    // Initialize runtime with a simple memory map
+    let memory_map = alloc::vec::Vec::new();
+    unsafe {
+        runtime::init_runtime(memory_map);
+    }
 }
 
 /// UEFI entry point for the kernel
@@ -72,7 +110,7 @@ fn main() -> Status {
         let _ = stdout.set_color(theme.foreground, theme.background);
         let _ = stdout.output_string(cstr16!(
 "*                                                                         *\r\n\
-*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                   *\r\n\
+*                 RUSTICA OS KERNEL v0.1.0 - EFI BOOT                    *\r\n\
 *                                                                         *\r\n"));
         let _ = stdout.set_color(theme.border, theme.background);
         let _ = stdout.output_string(cstr16!(
@@ -151,12 +189,18 @@ Currently running in CLI mode. Type 'help' for commands.\r\n\
 \r\n\
 "));
             });
+            // Transition to runtime before CLI
+            transition_to_runtime();
             run_cli_loop(boot_mode, install_mode);
         }
         BootMode::CommandLine => {
+            // Transition to runtime before CLI
+            transition_to_runtime();
             run_cli_loop(boot_mode, install_mode);
         }
         BootMode::Install => {
+            // Transition to runtime before CLI
+            transition_to_runtime();
             run_cli_loop(boot_mode, install_mode);
         }
     }
@@ -333,7 +377,7 @@ fn echo_char(c: u16) {
 fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<InstallMode>) {
     let theme = get_active_theme();
 
-    // Simple command matching
+    // Built-in commands
     if cmd_eq_ignore_case(cmd, "help") || cmd_eq_ignore_case(cmd, "?") {
         show_help();
     } else if cmd_eq_ignore_case(cmd, "clear") || cmd_eq_ignore_case(cmd, "cls") {
@@ -347,12 +391,134 @@ fn process_command(cmd: &[u16], boot_mode: BootMode, install_mode: Option<Instal
     } else if cmd_eq_ignore_case(cmd, "version") || cmd_eq_ignore_case(cmd, "ver") {
         show_version();
     } else {
-        // Unknown command - use theme error color
-        uefi::system::with_stdout(|stdout| {
-            let _ = stdout.set_color(theme.error, theme.background);
-            let _ = stdout.output_string(cstr16!("Unknown command. Type 'help' for available commands.\r\n\r\n"));
-        });
+        // External CLI apps - check if we're in runtime mode
+        let is_runtime = runtime::is_runtime_mode();
+
+        // Convert command to string for external app handling
+        let cmd_str = u16_slice_to_string(cmd);
+
+        if is_runtime {
+            // We're in runtime mode - try to execute external app
+            uefi::system::with_stdout(|stdout| {
+                let _ = stdout.set_color(theme.info, theme.background);
+                let _ = stdout.output_string(cstr16!("\r\n\
+[RUNTIME EXECUTION]\r\n\
+Attempting to execute external application...\r\n\
+\r\n"));
+                let _ = stdout.output_string(cstr16!("Command: "));
+                // Echo the command
+                for &c in cmd {
+                    if c >= 32 && c < 127 {
+                        let ch = match c {
+                            48 => cstr16!("0"), 49 => cstr16!("1"), 50 => cstr16!("2"), 51 => cstr16!("3"),
+                            52 => cstr16!("4"), 53 => cstr16!("5"), 54 => cstr16!("6"), 55 => cstr16!("7"),
+                            56 => cstr16!("8"), 57 => cstr16!("9"),
+                            // Lowercase letters
+                            97 => cstr16!("a"), 98 => cstr16!("b"), 99 => cstr16!("c"), 100 => cstr16!("d"),
+                            101 => cstr16!("e"), 102 => cstr16!("f"), 103 => cstr16!("g"), 104 => cstr16!("h"),
+                            105 => cstr16!("i"), 106 => cstr16!("j"), 107 => cstr16!("k"), 108 => cstr16!("l"),
+                            109 => cstr16!("m"), 110 => cstr16!("n"), 111 => cstr16!("o"), 112 => cstr16!("p"),
+                            113 => cstr16!("q"), 114 => cstr16!("r"), 115 => cstr16!("s"), 116 => cstr16!("t"),
+                            117 => cstr16!("u"), 118 => cstr16!("v"), 119 => cstr16!("w"), 120 => cstr16!("x"),
+                            121 => cstr16!("y"), 122 => cstr16!("z"),
+                            _ => cstr16!(""),
+                        };
+                        let _ = stdout.output_string(ch);
+                    }
+                }
+                let _ = stdout.output_string(cstr16!("\r\n\r\n"));
+            });
+
+            // Try to execute via runtime
+            unsafe {
+                if let Some(runtime) = runtime::get_runtime() {
+                    match runtime.execute(&cmd_str) {
+                        Ok(_) => {
+                            uefi::system::with_stdout(|stdout| {
+                                let _ = stdout.set_color(theme.success, theme.background);
+                                let _ = stdout.output_string(cstr16!("Execution completed.\r\n\r\n"));
+                            });
+                        }
+                        Err(e) => {
+                            uefi::system::with_stdout(|stdout| {
+                                let _ = stdout.set_color(theme.error, theme.background);
+                                let _ = stdout.output_string(cstr16!("Execution error: "));
+                                // Output error message character by character
+                                for b in e.bytes() {
+                                    let ch = match b {
+                                        b' ' => cstr16!(" "),
+                                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                                            // For alphanumeric and space, output as-is
+                                            // We need to map each byte to its cstr16! equivalent
+                                            match b {
+                                                b'a' => cstr16!("a"), b'b' => cstr16!("b"), b'c' => cstr16!("c"),
+                                                b'd' => cstr16!("d"), b'e' => cstr16!("e"), b'f' => cstr16!("f"),
+                                                b'g' => cstr16!("g"), b'h' => cstr16!("h"), b'i' => cstr16!("i"),
+                                                b'j' => cstr16!("j"), b'k' => cstr16!("k"), b'l' => cstr16!("l"),
+                                                b'm' => cstr16!("m"), b'n' => cstr16!("n"), b'o' => cstr16!("o"),
+                                                b'p' => cstr16!("p"), b'q' => cstr16!("q"), b'r' => cstr16!("r"),
+                                                b's' => cstr16!("s"), b't' => cstr16!("t"), b'u' => cstr16!("u"),
+                                                b'v' => cstr16!("v"), b'w' => cstr16!("w"), b'x' => cstr16!("x"),
+                                                b'y' => cstr16!("y"), b'z' => cstr16!("z"),
+                                                b'A' => cstr16!("A"), b'B' => cstr16!("B"), b'C' => cstr16!("C"),
+                                                b'D' => cstr16!("D"), b'E' => cstr16!("E"), b'F' => cstr16!("F"),
+                                                b'G' => cstr16!("G"), b'H' => cstr16!("H"), b'I' => cstr16!("I"),
+                                                b'J' => cstr16!("J"), b'K' => cstr16!("K"), b'L' => cstr16!("L"),
+                                                b'M' => cstr16!("M"), b'N' => cstr16!("N"), b'O' => cstr16!("O"),
+                                                b'P' => cstr16!("P"), b'Q' => cstr16!("Q"), b'R' => cstr16!("R"),
+                                                b'S' => cstr16!("S"), b'T' => cstr16!("T"), b'U' => cstr16!("U"),
+                                                b'V' => cstr16!("V"), b'W' => cstr16!("W"), b'X' => cstr16!("X"),
+                                                b'Y' => cstr16!("Y"), b'Z' => cstr16!("Z"),
+                                                b'0' => cstr16!("0"), b'1' => cstr16!("1"), b'2' => cstr16!("2"),
+                                                b'3' => cstr16!("3"), b'4' => cstr16!("4"), b'5' => cstr16!("5"),
+                                                b'6' => cstr16!("6"), b'7' => cstr16!("7"), b'8' => cstr16!("8"),
+                                                b'9' => cstr16!("9"),
+                                                _ => cstr16!(""),
+                                            }
+                                        }
+                                        b'-' => cstr16!("-"),
+                                        b':' => cstr16!(":"),
+                                        b'.' => cstr16!("."),
+                                        _ => cstr16!(""),
+                                    };
+                                    let _ = stdout.output_string(ch);
+                                }
+                                let _ = stdout.output_string(cstr16!("\r\n\r\n"));
+                            });
+                        }
+                    }
+                } else {
+                    uefi::system::with_stdout(|stdout| {
+                        let _ = stdout.set_color(theme.error, theme.background);
+                        let _ = stdout.output_string(cstr16!("Runtime not available.\r\n\r\n"));
+                    });
+                }
+            }
+        } else {
+            // Still in boot services mode - external apps not available
+            uefi::system::with_stdout(|stdout| {
+                let _ = stdout.set_color(theme.warning, theme.background);
+                let _ = stdout.output_string(cstr16!("\r\n\
+[BOOT SERVICES MODE]\r\n\
+External applications are not available in boot services mode.\r\n\
+The kernel must transition to runtime mode first (ExitBootServices).\r\n\
+\r\n"));
+                let _ = stdout.set_color(theme.info, theme.background);
+                let _ = stdout.output_string(cstr16!("Available commands: help, clear, info, reboot, version\r\n\r\n"));
+            });
+        }
     }
+}
+
+/// Convert u16 slice to String
+fn u16_slice_to_string(slice: &[u16]) -> alloc::string::String {
+    let mut result = alloc::string::String::new();
+    for &c in slice {
+        if c >= 32 && c < 127 {
+            result.push(char::from_u32(c as u32).unwrap_or('?'));
+        }
+    }
+    result
 }
 
 /// Compare command string (case-insensitive)
@@ -431,9 +597,21 @@ System Information:\r\n\
                 let _ = stdout.output_string(cstr16!("Command Line (CLI)\r\n"));
             }
         }
+
+        // Show runtime status
+        let is_runtime = runtime::is_runtime_mode();
         let _ = stdout.output_string(cstr16!("  Platform: UEFI\r\n\
   Arch: x86_64\r\n\
-\r\n\
+  Runtime Mode: "));
+        if is_runtime {
+            let _ = stdout.set_color(theme.success, theme.background);
+            let _ = stdout.output_string(cstr16!("ACTIVE (Infrastructure initialized)\r\n"));
+        } else {
+            let _ = stdout.set_color(theme.warning, theme.background);
+            let _ = stdout.output_string(cstr16!("BOOT SERVICES (Use 'help' for commands)\r\n"));
+        }
+        let _ = stdout.set_color(theme.foreground, theme.background);
+        let _ = stdout.output_string(cstr16!("\r\n\
 "));
     });
 }

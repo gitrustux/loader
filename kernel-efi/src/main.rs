@@ -306,16 +306,37 @@ Step 4: Exiting UEFI boot services...\r\n\
     //
     // We need to use our own memory allocator now
 
-    // PROBE: Enter a simple CPU loop to confirm ExitBootServices returned
-    // This will make the CPU busy-wait, confirming we're alive
+    // PROBE: VGA heartbeat to confirm ExitBootServices returned
+    // VGA text mode buffer is at 0xB8000 (standard x86 text mode address)
+    // Each character is 2 bytes: attribute (high byte) + ASCII (low byte)
+    const VGA_BUFFER: u64 = 0xB8000;
+
     unsafe {
+        let vga_buffer = VGA_BUFFER as *mut u16;
         let mut counter: u64 = 0;
+
+        // Write "RUNTIME MODE" message to VGA
+        let msg = "RUNTIME MODE - ExitBootServices SUCCESS - Alive!";
+        let mut ptr = vga_buffer;
+        for (i, &byte) in msg.as_bytes().iter().enumerate() {
+            if i < 80 {
+                *ptr.add(i) = 0x1F00 | (byte as u16); // Blue on white
+            }
+        }
+
+        // Heartbeat loop - toggle top-left character to show we're alive
         loop {
             counter = counter.wrapping_add(1);
-            // CPU hint that we're spinning
+
+            // Toggle character every 16 million iterations (~0.1 seconds)
+            if counter & 0xFFFFFF == 0 {
+                let chars = [b'|', b'/', b'-', b'\\'];
+                let ch = chars[(counter >> 24) as usize % 4] as u16;
+                *vga_buffer = 0x1F00 | ch; // Blue on white
+            }
+
             core::arch::asm!("pause", options(nomem, nostack));
-            // Periodically halt to save power
-            if counter % 1000000 == 0 {
+            if counter % 10000000 == 0 {
                 core::arch::asm!("hlt", options(nomem, nostack));
             }
         }

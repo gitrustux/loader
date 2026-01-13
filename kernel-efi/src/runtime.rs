@@ -444,24 +444,152 @@ unsafe fn init_exception_handlers_impl() -> bool {
     true
 }
 
+/// Local APIC MMIO register offsets
+#[repr(C)]
+pub struct LocalApicRegisters {
+    _reserved0: [u32; 2],           // 0x00-0x07
+    id: u32,                        // 0x08 - Local APIC ID
+    _reserved1: [u32; 3],           // 0x0C-0x17
+    version: u32,                   // 0x1C - Local APIC Version
+    _reserved2: [u32; 4],           // 0x20-0x2F
+    tpr: u32,                       // 0x30 - Task Priority Register
+    _reserved3: [u32; 3],           // 0x34-0x3F
+    eoi: u32,                       // 0x40 - EOI Register
+    _reserved4: [u32; 3],           // 0x44-0x4F
+    ldr: u32,                       // 0x50 - Logical Destination Register
+    _reserved5: [u32; 3],           // 0x54-0x5F
+    dfr: u32,                       // 0x60 - Destination Format Register
+    _reserved6: [u32; 3],           // 0x64-0x6F
+    svr: u32,                       // 0x70 - Spurious Interrupt Vector Register
+    _reserved7: [u32; 3],           // 0x74-0x7F
+    isr0: u32,                      // 0x80 - In-Service Register 0
+    isr1: u32,                      // 0x84 - In-Service Register 1
+    isr2: u32,                      // 0x88 - In-Service Register 2
+    isr3: u32,                      // 0x8C - In-Service Register 3
+    isr4: u32,                      // 0x90 - In-Service Register 4
+    isr5: u32,                      // 0x94 - In-Service Register 5
+    isr6: u32,                      // 0x98 - In-Service Register 6
+    isr7: u32,                      // 0x9C - In-Service Register 7
+    tmr0: u32,                      // 0xA0 - Trigger Mode Register 0
+    tmr1: u32,                      // 0xA4 - Trigger Mode Register 1
+    tmr2: u32,                      // 0xA8 - Trigger Mode Register 2
+    tmr3: u32,                      // 0xAC - Trigger Mode Register 3
+    tmr4: u32,                      // 0xB0 - Trigger Mode Register 4
+    tmr5: u32,                      // 0xB4 - Trigger Mode Register 5
+    tmr6: u32,                      // 0xB8 - Trigger Mode Register 6
+    tmr7: u32,                      // 0xBC - Trigger Mode Register 7
+    irr0: u32,                      // 0xC0 - Interrupt Request Register 0
+    irr1: u32,                      // 0xC4 - Interrupt Request Register 1
+    irr2: u32,                      // 0xC8 - Interrupt Request Register 2
+    irr3: u32,                      // 0xCC - Interrupt Request Register 3
+    irr4: u32,                      // 0xD0 - Interrupt Request Register 4
+    irr5: u32,                      // 0xD4 - Interrupt Request Register 5
+    irr6: u32,                      // 0xD8 - Interrupt Request Register 6
+    irr7: u32,                      // 0xDC - Interrupt Request Register 7
+    error_status: u32,              // 0xE0 - Error Status Register
+    _reserved8: [u32; 5],           // 0xE4-0xF7
+    icr_low: u32,                   // 0xF0 - Interrupt Command Register Low
+    icr_high: u32,                  // 0xF4 - Interrupt Command Register High
+    _reserved9: [u32; 2],           // 0xF8-0xFF
+    timer_lvt: u32,                 // 0x100 - Timer Local Vector Table
+    thermal_lvt: u32,               // 0x110 - Thermal Monitor LVT
+    perf_lvt: u32,                  // 0x120 - Performance Counter LVT
+    lint0: u32,                     // 0x130 - Local Interrupt 0 (LINT0)
+    lint1: u32,                     // 0x140 - Local Interrupt 1 (LINT1)
+    error_lvt: u32,                 // 0x150 - Error LVT
+    _reserved10: [u32; 3],          // 0x160-0x16F
+    timer_initial: u32,             // 0x170 - Timer Initial Count
+    timer_current: u32,             // 0x180 - Timer Current Count
+    _reserved11: [u32; 2],          // 0x190-0x19F
+    timer_divide: u32,              // 0x1A0 - Timer Divide Configuration
+    _reserved12: [u32; 1],          // 0x1A4-0x1A7
+}
+
+impl LocalApicRegisters {
+    /// Write to a register with volatile semantics
+    #[inline]
+    unsafe fn write_reg(&self, offset: usize, value: u32) {
+        let base = self as *const _ as usize;
+        let ptr = (base + offset) as *mut u32;
+        ptr.write_volatile(value);
+    }
+
+    /// Read from a register with volatile semantics
+    #[inline]
+    unsafe fn read_reg(&self, offset: usize) -> u32 {
+        let base = self as *const _ as usize;
+        let ptr = (base + offset) as *const u32;
+        ptr.read_volatile()
+    }
+}
+
+/// Local APIC base address (default from x86_64 CPU)
+const LOCAL_APIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
+
+/// Local APIC mapped address (will be set during initialization)
+static mut LOCAL_APIC_ADDRESS: Option<&'static mut LocalApicRegisters> = None;
+
 /// Interrupt controller state
 pub struct InterruptController {
     pub enabled: bool,
+    apic_base: u64,
 }
 
 impl InterruptController {
     pub const fn new() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            apic_base: LOCAL_APIC_DEFAULT_BASE,
+        }
     }
 
-    pub fn enable(&mut self) {
-        // TODO: Initialize APIC/PIC for x86_64
-        self.enabled = true;
+    /// Initialize the Local APIC
+    pub unsafe fn enable(&mut self) -> bool {
+        // Map Local APIC MMIO region
+        let apic_addr = self.apic_base as *mut LocalApicRegisters;
+        LOCAL_APIC_ADDRESS = Some(&mut *apic_addr);
+
+        if let Some(ref apic) = LOCAL_APIC_ADDRESS {
+            // Enable APIC via Spurious Interrupt Vector Register (offset 0x70)
+            // Bit 8: APIC Software Enable/Disable
+            // Bits 0-7: Spurious Vector
+            apic.write_reg(0x70, 0x100 | 0xFF); // Enable APIC, set spurious vector to 0xFF
+
+            // Set Task Priority Register to 0 (allow all interrupts) (offset 0x30)
+            apic.write_reg(0x30, 0);
+
+            // Disable all LVT entries initially
+            apic.write_reg(0x100, 0x10000); // Mask timer (offset 0x100)
+            apic.write_reg(0x110, 0x10000); // Mask thermal (offset 0x110)
+            apic.write_reg(0x120, 0x10000); // Mask perf (offset 0x120)
+            apic.write_reg(0x130, 0x10000); // Mask LINT0 (offset 0x130)
+            apic.write_reg(0x140, 0x10000); // Mask LINT1 (offset 0x140)
+            apic.write_reg(0x150, 0x10000); // Mask error (offset 0x150)
+
+            self.enabled = true;
+            return true;
+        }
+
+        false
     }
 
     pub fn disable(&mut self) {
-        // TODO: Disable APIC/PIC
+        // Disable APIC
+        unsafe {
+            if let Some(ref apic) = LOCAL_APIC_ADDRESS {
+                // Disable APIC via SVR (offset 0x70, clear bit 8)
+                apic.write_reg(0x70, 0xFF);
+            }
+        }
         self.enabled = false;
+    }
+
+    /// Send End of Interrupt (EOI) to the APIC
+    pub unsafe fn send_eoi(&self) {
+        if let Some(ref apic) = LOCAL_APIC_ADDRESS {
+            // EOI register is at offset 0x40
+            apic.write_reg(0x40, 0);
+        }
     }
 }
 
@@ -474,9 +602,21 @@ static mut SCHEDULER: Option<Scheduler> = None;
 /// Initialize interrupt controller
 unsafe fn init_interrupt_controller_impl() -> bool {
     let mut controller = InterruptController::new();
-    controller.enable();
-    INTERRUPT_CONTROLLER = Some(controller);
-    true
+    if controller.enable() {
+        INTERRUPT_CONTROLLER = Some(controller);
+        true
+    } else {
+        false
+    }
+}
+
+/// Public wrapper for interrupt controller initialization
+pub unsafe fn init_interrupt_controller() -> Result<(), &'static str> {
+    if init_interrupt_controller_impl() {
+        Ok(())
+    } else {
+        Err("Failed to initialize interrupt controller")
+    }
 }
 
 /// Idle loop state
@@ -540,6 +680,14 @@ impl Scheduler {
         // TODO: Implement task scheduling
         // For now, this is a stub
     }
+}
+
+/// Initialize scheduler stub (Phase 5)
+pub unsafe fn init_scheduler_stub() -> Result<(), &'static str> {
+    let mut scheduler = Scheduler::new();
+    scheduler.start();
+    SCHEDULER = Some(scheduler);
+    Ok(())
 }
 
 /// Global allocator for kernel runtime (static storage, no allocation needed)

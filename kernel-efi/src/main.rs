@@ -324,6 +324,16 @@ Step 4: Exiting UEFI boot services...\r\n\
         runtime::init_exception_handlers()
     };
 
+    // Initialize interrupt controller (Phase 5: APIC/PIC)
+    let apic_result = unsafe {
+        runtime::init_interrupt_controller()
+    };
+
+    // Initialize scheduler stub (Phase 5)
+    let sched_result = unsafe {
+        runtime::init_scheduler_stub()
+    };
+
     // Write status to VGA
     const VGA_BUFFER: u64 = 0xB8000;
     unsafe {
@@ -361,9 +371,35 @@ Step 4: Exiting UEFI boot services...\r\n\
                 *idt_ptr.add(i) = 0x0A00 | (byte as u16); // Green on black
             }
         }
+
+        // Write APIC status at column 100
+        let apic_ptr = vga_buffer.add(100);
+        let apic_msg = if apic_result.is_ok() {
+            "APIC OK!"
+        } else {
+            "APIC ERR!"
+        };
+        for (i, &byte) in apic_msg.as_bytes().iter().enumerate() {
+            if i < 10 {
+                *apic_ptr.add(i) = 0x0D00 | (byte as u16); // Magenta on black
+            }
+        }
+
+        // Write Scheduler status at column 110
+        let sched_ptr = vga_buffer.add(110);
+        let sched_msg = if sched_result.is_ok() {
+            "SCHED OK!"
+        } else {
+            "SCHED ERR!"
+        };
+        for (i, &byte) in sched_msg.as_bytes().iter().enumerate() {
+            if i < 10 {
+                *sched_ptr.add(i) = 0x0C00 | (byte as u16); // Red on black
+            }
+        }
     }
 
-    // Now enter heartbeat loop - kernel is alive with allocator and IDT initialized
+    // Now enter heartbeat loop - kernel is alive with all runtime components initialized
     unsafe {
         let vga_buffer = VGA_BUFFER as *mut u16;
         let mut counter: u64 = 0;

@@ -299,24 +299,33 @@ Step 4: Exiting UEFI boot services...\r\n\
         let _ = stdout.output_string(cstr16!(">>> TRACE-D: ExitBootServices RETURNED! <<<\r\n"));
     });
 
-    // CRITICAL: After ExitBootServices, we cannot:
-    // - Use UEFI boot services (including allocator)
-    // - Use UEFI console (may not work)
-    // - Call serial_trace (causes hangs in this environment)
+    // ===================================================================
+    // RUNTIME MODE BEGINS HERE
+    // ===================================================================
+    // After ExitBootServices, we are in runtime mode:
+    // - NO UEFI boot services available
+    // - NO UEFI allocator (must use kernel allocator)
+    // - NO UEFI console (using VGA text mode instead)
     //
-    // We need to use our own memory allocator now
+    // FIRST PRIORITY: Initialize kernel allocator
+    // ===================================================================
 
-    // PROBE: VGA heartbeat to confirm ExitBootServices returned
-    // VGA text mode buffer is at 0xB8000 (standard x86 text mode address)
-    // Each character is 2 bytes: attribute (high byte) + ASCII (low byte)
+    // Initialize kernel allocator from memory map (MUST BE FIRST!)
+    let alloc_result = unsafe {
+        runtime::init_kernel_allocator_from_memory_map(
+            memory_map_buffer.as_ptr(),
+            map_size,
+            entry_size,
+        )
+    };
+
+    // Write status to VGA
     const VGA_BUFFER: u64 = 0xB8000;
-
     unsafe {
         let vga_buffer = VGA_BUFFER as *mut u16;
-        let mut counter: u64 = 0;
 
-        // Write "RUNTIME MODE" message to VGA
-        let msg = "RUNTIME MODE - ExitBootServices SUCCESS - Alive!";
+        // Write "RUNTIME MODE" message
+        let msg = "RUNTIME MODE";
         let mut ptr = vga_buffer;
         for (i, &byte) in msg.as_bytes().iter().enumerate() {
             if i < 80 {
@@ -324,11 +333,28 @@ Step 4: Exiting UEFI boot services...\r\n\
             }
         }
 
+        // Write allocator status at column 80
+        let status_ptr = vga_buffer.add(80);
+        let status_msg = if alloc_result.is_ok() {
+            "ALLOC OK! "
+        } else {
+            "ALLOC ERR "
+        };
+        for (i, &byte) in status_msg.as_bytes().iter().enumerate() {
+            *status_ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
+        }
+    }
+
+    // Now enter heartbeat loop - kernel is alive with allocator initialized
+    unsafe {
+        let vga_buffer = VGA_BUFFER as *mut u16;
+        let mut counter: u64 = 0;
+
         // Heartbeat loop - toggle top-left character to show we're alive
         loop {
             counter = counter.wrapping_add(1);
 
-            // Toggle character every 16 million iterations (~0.1 seconds)
+            // Toggle character every 16 million iterations
             if counter & 0xFFFFFF == 0 {
                 let chars = [b'|', b'/', b'-', b'\\'];
                 let ch = chars[(counter >> 24) as usize % 4] as u16;

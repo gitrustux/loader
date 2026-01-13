@@ -151,6 +151,9 @@ impl InterruptController {
 /// Global interrupt controller
 static mut INTERRUPT_CONTROLLER: Option<InterruptController> = None;
 
+/// Global scheduler
+static mut SCHEDULER: Option<Scheduler> = None;
+
 /// Initialize interrupt controller
 unsafe fn init_interrupt_controller_impl() -> bool {
     let mut controller = InterruptController::new();
@@ -222,8 +225,90 @@ impl Scheduler {
     }
 }
 
-/// Global scheduler
-static mut SCHEDULER: Option<Scheduler> = None;
+/// Global allocator for kernel runtime (static storage, no allocation needed)
+static mut KERNEL_ALLOCATOR_INITIALIZED: bool = false;
+static mut KERNEL_ALLOCATOR_STORAGE: BumpAllocator = BumpAllocator {
+    start: 0,
+    end: 0,
+    current: 0,
+};
+
+/// Initialize the kernel allocator from memory map (must be called first!)
+/// This function does NOT use the global allocator - it sets it up.
+///
+/// # Safety
+/// Must be called exactly once after ExitBootServices.
+pub unsafe fn init_kernel_allocator_from_memory_map(
+    memory_map_buffer: *const u8,
+    map_size: usize,
+    entry_size: usize,
+) -> Result<(), &'static str> {
+    use uefi_raw::table::boot::MemoryDescriptor;
+    use uefi_raw::table::boot::MemoryType;
+
+    // Find the largest conventional memory region
+    let desc_ptr = memory_map_buffer as *const MemoryDescriptor;
+    let mut offset = 0;
+    let mut best_start: u64 = 0;
+    let mut best_size: u64 = 0;
+
+    while offset < map_size {
+        let desc = &*desc_ptr.add(offset / entry_size);
+
+        // Check memory type - look for conventional memory or reusable boot memory
+        // Use matches! macro to properly compare MemoryType enum
+        let is_usable = matches!(desc.ty,
+            MemoryType::CONVENTIONAL      // Type 7: EfiConventionalMemory
+            | MemoryType::LOADER_CODE     // Type 1: EfiLoaderCode
+            | MemoryType::LOADER_DATA     // Type 2: EfiLoaderData
+            | MemoryType::BOOT_SERVICES_CODE
+            | MemoryType::BOOT_SERVICES_DATA
+        );
+
+        if is_usable && desc.page_count > 256 {
+            // Found a suitable region
+            if desc.page_count > best_size / 4096 {
+                best_start = desc.phys_start;
+                best_size = desc.page_count * 4096;
+            }
+        }
+
+        offset += entry_size;
+    }
+
+    if best_size < 1024 * 1024 {
+        return Err("No suitable memory region found (need at least 1MB)");
+    }
+
+    // Initialize the bump allocator with a portion of this memory
+    // Reserve first 1MB for the allocator heap
+    let heap_start = best_start;
+    let heap_size = 1024 * 1024; // 1MB
+
+    KERNEL_ALLOCATOR_STORAGE = BumpAllocator::new(heap_start, heap_size);
+    KERNEL_ALLOCATOR_INITIALIZED = true; // Mark as initialized
+
+    // Write success message to VGA
+    let vga_buffer = 0xB8000u64 as *mut u16;
+    let msg = "ALLOC OK!";
+    let mut ptr = vga_buffer.add(40); // Start at column 40
+    for (i, &byte) in msg.as_bytes().iter().enumerate() {
+        if i < 10 {
+            *ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the kernel allocator (returns None if not initialized)
+pub unsafe fn get_kernel_allocator() -> Option<&'static mut BumpAllocator> {
+    if KERNEL_ALLOCATOR_INITIALIZED {
+        Some(&mut KERNEL_ALLOCATOR_STORAGE)
+    } else {
+        None
+    }
+}
 
 /// Memory descriptor for kernel runtime (matches UEFI memory descriptor)
 #[derive(Debug, Clone, Copy)]

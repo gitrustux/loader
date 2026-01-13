@@ -337,6 +337,129 @@ static EXCEPTION_STUBS: [unsafe extern "C" fn() -> !; 32] = [
     exception_stub_28, exception_stub_29, exception_stub_30, exception_stub_31,
 ];
 
+/// ============================================================================
+/// PHASE 9: Keyboard Interrupt Handler (IRQ1)
+/// ============================================================================
+///
+/// IRQ1 is the keyboard interrupt on x86_64.
+/// It corresponds to IDT vector 33 (32 + 1).
+///
+
+/// Keyboard IRQ1 interrupt handler stub
+#[unsafe(naked)]
+unsafe extern "C" fn keyboard_irq_stub() -> ! {
+    core::arch::naked_asm!(
+        // Save all general-purpose registers
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // Call the keyboard handler
+        "call {handler}",
+        // Restore registers
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        // Send EOI to PIC
+        "mov al, 0x20",
+        "out 0x20, al",
+        // Return from interrupt
+        "iretq",
+        handler = sym crate::keyboard::keyboard_irq_handler
+    );
+}
+
+/// PIC (Programmable Interrupt Controller) I/O ports
+const PIC1_COMMAND: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+const PIC2_COMMAND: u16 = 0xA0;
+const PIC2_DATA: u16 = 0xA1;
+
+/// Initialize the PIC for IRQ handling
+///
+/// This function remaps the PIC IRQs to vectors 32-47 and enables
+/// the keyboard IRQ (IRQ1).
+unsafe fn init_pic() {
+    // ICW1: Initialize PIC, requires ICW4
+    outb(PIC1_COMMAND, 0x11);
+    outb(PIC2_COMMAND, 0x11);
+
+    // ICW2: Vector offset (32 for PIC1, 40 for PIC2)
+    outb(PIC1_DATA, 0x20); // PIC1: IRQ0-7 -> vectors 32-39
+    outb(PIC2_DATA, 0x28); // PIC2: IRQ8-15 -> vectors 40-47
+
+    // ICW3: PIC wiring (PIC2 is at IRQ2 on PIC1)
+    outb(PIC1_DATA, 0x04);
+    outb(PIC2_DATA, 0x02);
+
+    // ICW4: 8086 mode
+    outb(PIC1_DATA, 0x01);
+    outb(PIC2_DATA, 0x01);
+
+    // Enable IRQ1 (keyboard) on PIC1
+    // IRQ mask: 0 = enabled, 1 = disabled
+    // We enable IRQ0 (timer) and IRQ1 (keyboard)
+    outb(PIC1_DATA, 0xFC); // 0xFC = 11111100 (IRQ0 and IRQ1 enabled)
+    outb(PIC2_DATA, 0xFF); // All IRQs on PIC2 disabled
+}
+
+/// Output byte to I/O port
+#[inline(always)]
+unsafe fn outb(port: u16, value: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") value,
+        options(nomem, nostack)
+    );
+}
+
+/// Initialize keyboard interrupt handler
+pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
+    // Initialize PIC
+    init_pic();
+
+    // Get kernel code segment selector
+    let kernel_cs: u16;
+    core::arch::asm!(
+        "mov {0:x}, cs",
+        out(reg) kernel_cs,
+        options(nomem, nostack, preserves_flags)
+    );
+
+    // Set up IDT entry for IRQ1 (keyboard) at vector 33
+    let keyboard_handler = keyboard_irq_stub as u64;
+    IDT[33] = IdtEntry::interrupt_gate(keyboard_handler, kernel_cs);
+
+    // Initialize keyboard driver
+    crate::keyboard::init();
+
+    Ok(())
+}
+
 /// Default exception handler
 extern "C" fn default_exception_handler(_error_code: usize, rip: usize, _cs: usize, _rflags: usize) {
     // Write exception info to VGA
@@ -1240,7 +1363,7 @@ pub unsafe fn disable_uefi_services_permanently() -> Result<(), &'static str> {
     const VGA_BUFFER: u64 = 0xB8000;
     let vga_buffer = VGA_BUFFER as *mut u16;
     let msg = "UEFI DISABLED!";
-    let mut ptr = vga_buffer.add(120); // Column 120
+    let mut ptr = vga_buffer.add(130); // Column 130 (after KBD status)
     for (i, &byte) in msg.as_bytes().iter().enumerate() {
         if i < 15 {
             *ptr.add(i) = 0x0900 | (byte as u16); // Blue on black

@@ -13,6 +13,7 @@ mod filesystem;
 mod console;
 mod native_console;
 mod vga_console;
+mod keyboard;
 use theme::get_active_theme;
 
 // ============================================================================
@@ -342,6 +343,11 @@ Step 4: Exiting UEFI boot services...\r\n\
         runtime::init_interrupt_controller()
     };
 
+    // Initialize keyboard interrupts (Phase 9: PS/2 Keyboard Driver)
+    let keyboard_result = unsafe {
+        runtime::init_keyboard_interrupts()
+    };
+
     // Initialize scheduler stub (Phase 5)
     let sched_result = unsafe {
         runtime::init_scheduler_stub()
@@ -413,6 +419,19 @@ Step 4: Exiting UEFI boot services...\r\n\
         for (i, &byte) in sched_msg.as_bytes().iter().enumerate() {
             if i < 10 {
                 *sched_ptr.add(i) = 0x0C00 | (byte as u16); // Red on black
+            }
+        }
+
+        // Write Keyboard status at column 120
+        let kbd_ptr = vga_buffer.add(120);
+        let kbd_msg = if keyboard_result.is_ok() {
+            "KBD OK!  "
+        } else {
+            "KBD ERR! "
+        };
+        for (i, &byte) in kbd_msg.as_bytes().iter().enumerate() {
+            if i < 10 {
+                *kbd_ptr.add(i) = 0x0F00 | (byte as u16); // White on black
             }
         }
     }

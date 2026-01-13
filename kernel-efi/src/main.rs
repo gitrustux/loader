@@ -12,6 +12,7 @@ mod runtime;
 mod filesystem;
 mod console;
 mod native_console;
+mod vga_console;
 use theme::get_active_theme;
 
 // ============================================================================
@@ -312,8 +313,15 @@ Step 4: Exiting UEFI boot services...\r\n\
     // - NO UEFI allocator (must use kernel allocator)
     // - NO UEFI console (using VGA text mode instead)
     //
-    // FIRST PRIORITY: Initialize kernel allocator
+    // FIRST PRIORITY: Initialize VGA console, then kernel allocator
     // ===================================================================
+
+    // Initialize VGA console (Phase 8: Native Console Driver)
+    vga_console::init();
+    vga_console::set_color(14, 0); // Yellow on black
+    vga_console::puts("\n\n*** VGA CONSOLE ACTIVE ***\n");
+    vga_console::puts("Kernel successfully exited UEFI boot services.\n");
+    vga_console::puts("All output now via VGA text mode (0xB8000).\n\n");
 
     // Initialize kernel allocator from memory map (MUST BE FIRST!)
     let alloc_result = unsafe {
@@ -476,6 +484,11 @@ Step 4: Exiting UEFI boot services...\r\n\
         let vga_buffer = VGA_BUFFER as *mut u16;
         let mut counter: u64 = 0;
 
+        // Use VGA console for status messages
+        vga_console::set_color(10, 0); // Light green on black
+        vga_console::puts("All runtime components initialized.\n");
+        vga_console::puts("Entering heartbeat loop...\n\n");
+
         // Heartbeat loop - toggle top-left character to show we're alive
         loop {
             counter = counter.wrapping_add(1);
@@ -485,6 +498,11 @@ Step 4: Exiting UEFI boot services...\r\n\
                 let chars = [b'|', b'/', b'-', b'\\'];
                 let ch = chars[(counter >> 24) as usize % 4] as u16;
                 *vga_buffer = 0x1F00 | ch; // Blue on white
+            }
+
+            // Print a heartbeat character every ~100 million iterations
+            if counter & 0xFFFFFFF == 0 {
+                vga_console::putc('.');
             }
 
             core::arch::asm!("pause", options(nomem, nostack));

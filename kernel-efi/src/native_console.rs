@@ -526,6 +526,15 @@ impl SerialConsole {
             let ptr = port as *mut u8;
             ptr.write_volatile(val);
         }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            // For RISC-V, use MMIO with proper memory ordering
+            let ptr = port as *mut u8;
+            ptr.write_volatile(val);
+            // Ensure write completes before continuing
+            core::arch::asm!("fence ow, ow", options(nostack));
+        }
     }
 
     /// Read a byte from serial port
@@ -550,7 +559,15 @@ impl SerialConsole {
             ptr.read_volatile()
         }
 
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(target_arch = "riscv64")]
+        {
+            // For RISC-V, use MMIO with proper memory ordering
+            let ptr = port as *const u8;
+            core::arch::asm!("fence ir, ir", options(nostack));
+            ptr.read_volatile()
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
         {
             // Default stub for other architectures
             0

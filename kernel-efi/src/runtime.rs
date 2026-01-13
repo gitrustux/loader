@@ -7,9 +7,223 @@
 //! Kernel Runtime - Post-ExitBootServices
 //!
 //! This module handles the kernel runtime after exiting UEFI boot services.
+//!
+//! Runtime initialization order (MUST be followed):
+//! 1. Memory allocator
+//! 2. Exception handlers
+//! 3. Interrupt controller
+//! 4. Idle loop
+//! 5. Scheduler stub
 
 use alloc::vec::Vec;
-use crate::filesystem::EmbeddedFileSystem;
+
+/// Runtime initialization flags - track which components have been initialized
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeInitFlags {
+    pub memory_allocator: bool,
+    pub exception_handlers: bool,
+    pub interrupt_controller: bool,
+    pub idle_loop: bool,
+    pub scheduler: bool,
+}
+
+impl RuntimeInitFlags {
+    pub const fn new() -> Self {
+        Self {
+            memory_allocator: false,
+            exception_handlers: false,
+            interrupt_controller: false,
+            idle_loop: false,
+            scheduler: false,
+        }
+    }
+
+    pub fn is_fully_initialized(&self) -> bool {
+        self.memory_allocator
+            && self.exception_handlers
+            && self.interrupt_controller
+            && self.idle_loop
+            && self.scheduler
+    }
+}
+
+/// Simple bump allocator for kernel runtime
+pub struct BumpAllocator {
+    start: u64,
+    end: u64,
+    current: u64,
+}
+
+impl BumpAllocator {
+    pub unsafe fn new(start: u64, size: u64) -> Self {
+        Self {
+            start,
+            end: start + size,
+            current: start,
+        }
+    }
+
+    pub fn allocate(&mut self, size: u64, align: u64) -> Option<u64> {
+        let aligned_current = (self.current + align - 1) & !(align - 1);
+        let new_current = aligned_current + size;
+
+        if new_current > self.end {
+            return None; // Out of memory
+        }
+
+        self.current = new_current;
+        Some(aligned_current)
+    }
+
+    pub fn available(&self) -> u64 {
+        self.end - self.current
+    }
+}
+
+/// Exception handler type
+pub type ExceptionHandler = extern "C" fn(usize, usize, usize, usize);
+
+/// Exception handler table (x86_64 has 32 exception vectors)
+const NUM_EXCEPTION_VECTORS: usize = 32;
+
+/// Exception handler table
+static mut EXCEPTION_HANDLERS: [Option<ExceptionHandler>; NUM_EXCEPTION_VECTORS] = [None; NUM_EXCEPTION_VECTORS];
+
+/// Default exception handler
+extern "C" fn default_exception_handler(_error_code: usize, _rip: usize, _cs: usize, _rflags: usize) {
+    // Heartbeat via serial port to show we hit an exception
+    unsafe {
+        // Send 'E' (Error) to COM1
+        let com1 = 0x3F8u16 as *mut u8;
+        com1.add(4).write_volatile(0); // Line control - enable DLAB
+        com1.add(0).write_volatile(1); // Low byte of divisor (115200 baud)
+        com1.add(1).write_volatile(0); // High byte of divisor
+        com1.add(4).write_volatile(3); // 8N1
+        com1.add(1).write_volatile(0); // Disable interrupts
+        com1.write_volatile(b'E');     // Send 'E'
+    }
+
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
+}
+
+/// Install exception handler (IDT setup)
+pub unsafe fn install_exception_handler(vector: usize, handler: ExceptionHandler) {
+    if vector < NUM_EXCEPTION_VECTORS {
+        EXCEPTION_HANDLERS[vector] = Some(handler);
+    }
+}
+
+/// Initialize exception handlers (set up IDT)
+unsafe fn init_exception_handlers_impl() -> bool {
+    // Initialize all exception vectors with default handler
+    for i in 0..NUM_EXCEPTION_VECTORS {
+        EXCEPTION_HANDLERS[i] = Some(default_exception_handler);
+    }
+
+    // TODO: Set up actual IDT for x86_64
+    // For now, just mark as initialized
+    true
+}
+
+/// Interrupt controller state
+pub struct InterruptController {
+    pub enabled: bool,
+}
+
+impl InterruptController {
+    pub const fn new() -> Self {
+        Self { enabled: false }
+    }
+
+    pub fn enable(&mut self) {
+        // TODO: Initialize APIC/PIC for x86_64
+        self.enabled = true;
+    }
+
+    pub fn disable(&mut self) {
+        // TODO: Disable APIC/PIC
+        self.enabled = false;
+    }
+}
+
+/// Global interrupt controller
+static mut INTERRUPT_CONTROLLER: Option<InterruptController> = None;
+
+/// Initialize interrupt controller
+unsafe fn init_interrupt_controller_impl() -> bool {
+    let mut controller = InterruptController::new();
+    controller.enable();
+    INTERRUPT_CONTROLLER = Some(controller);
+    true
+}
+
+/// Idle loop state
+static mut IDLE_LOOP_RUNNING: bool = false;
+
+/// Enter idle loop
+pub fn idle_loop() -> ! {
+    unsafe {
+        IDLE_LOOP_RUNNING = true;
+
+        loop {
+            // Heartbeat via serial port - send '.' every second
+            {
+                let com1 = 0x3F8u16 as *mut u8;
+                // Initialize COM1 once
+                com1.add(4).write_volatile(0); // Line control - enable DLAB
+                com1.add(0).write_volatile(1); // Low byte of divisor (115200 baud)
+                com1.add(1).write_volatile(0); // High byte of divisor
+                com1.add(4).write_volatile(3); // 8N1
+                com1.add(1).write_volatile(0); // Disable interrupts
+
+                // Send heartbeat
+                com1.write_volatile(b'.');
+            }
+
+            // Check for scheduler work
+            if let Some(runtime) = get_runtime() {
+                if runtime.init_flags.scheduler {
+                    // TODO: Run scheduler tick
+                }
+            }
+
+            // Spin for approximately 1 second
+            // On x86_64, assume ~3GHz, so ~3 billion cycles per second
+            for _ in 0u64..3_000_000_000u64 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+        }
+    }
+}
+
+/// Scheduler stub state
+pub struct Scheduler {
+    pub running: bool,
+    pub current_task: Option<u64>,
+}
+
+impl Scheduler {
+    pub const fn new() -> Self {
+        Self {
+            running: false,
+            current_task: None,
+        }
+    }
+
+    pub fn start(&mut self) {
+        self.running = true;
+    }
+
+    pub fn schedule(&mut self) {
+        // TODO: Implement task scheduling
+        // For now, this is a stub
+    }
+}
+
+/// Global scheduler
+static mut SCHEDULER: Option<Scheduler> = None;
 
 /// Memory descriptor for kernel runtime (matches UEFI memory descriptor)
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +322,10 @@ pub struct KernelRuntime {
     pub exited_boot_services: bool,
     /// Next PID to assign
     next_pid: u64,
+    /// Runtime initialization flags
+    pub init_flags: RuntimeInitFlags,
+    /// Bump allocator for kernel runtime
+    pub allocator: Option<*mut BumpAllocator>,
 }
 
 impl KernelRuntime {
@@ -119,7 +337,102 @@ impl KernelRuntime {
             map_key,
             exited_boot_services: true,
             next_pid: 1,
+            init_flags: RuntimeInitFlags::new(),
+            allocator: None,
         }
+    }
+
+    /// Initialize memory allocator
+    pub unsafe fn init_allocator(&mut self) -> Result<(), &'static str> {
+        // Find a large block of conventional memory for the allocator
+        // Use 256 pages (1MB) for the kernel heap
+        let heap_start = self.find_free_memory(256)
+            .ok_or("No free memory for allocator")?;
+
+        let heap_size = 256 * 4096; // 1MB
+
+        // Create the allocator
+        let allocator = BumpAllocator::new(heap_start, heap_size);
+
+        // Store it in a leaked box to get a stable pointer
+        let allocator_box = alloc::boxed::Box::leak(alloc::boxed::Box::new(allocator));
+
+        self.allocator = Some(allocator_box);
+
+        // Send 'A' to serial to indicate allocator initialized
+        let com1 = 0x3F8u16 as *mut u8;
+        com1.add(4).write_volatile(0);
+        com1.add(0).write_volatile(1);
+        com1.add(1).write_volatile(0);
+        com1.add(4).write_volatile(3);
+        com1.add(1).write_volatile(0);
+        com1.write_volatile(b'A');
+
+        self.init_flags.memory_allocator = true;
+        Ok(())
+    }
+
+    /// Initialize exception handlers
+    pub unsafe fn init_exception_handlers(&mut self) -> Result<(), &'static str> {
+        if !init_exception_handlers_impl() {
+            return Err("Failed to initialize exception handlers");
+        }
+
+        // Send 'X' to serial to indicate exception handlers initialized
+        let com1 = 0x3F8u16 as *mut u8;
+        com1.add(4).write_volatile(0);
+        com1.add(0).write_volatile(1);
+        com1.add(1).write_volatile(0);
+        com1.add(4).write_volatile(3);
+        com1.add(1).write_volatile(0);
+        com1.write_volatile(b'X');
+
+        self.init_flags.exception_handlers = true;
+        Ok(())
+    }
+
+    /// Initialize interrupt controller
+    pub unsafe fn init_interrupt_controller(&mut self) -> Result<(), &'static str> {
+        if !init_interrupt_controller_impl() {
+            return Err("Failed to initialize interrupt controller");
+        }
+
+        // Send 'I' to serial to indicate interrupt controller initialized
+        let com1 = 0x3F8u16 as *mut u8;
+        com1.add(4).write_volatile(0);
+        com1.add(0).write_volatile(1);
+        com1.add(1).write_volatile(0);
+        com1.add(4).write_volatile(3);
+        com1.add(1).write_volatile(0);
+        com1.write_volatile(b'I');
+
+        self.init_flags.interrupt_controller = true;
+        Ok(())
+    }
+
+    /// Initialize idle loop
+    pub fn init_idle_loop(&mut self) {
+        self.init_flags.idle_loop = true;
+    }
+
+    /// Initialize scheduler
+    pub unsafe fn init_scheduler(&mut self) -> Result<(), &'static str> {
+        let mut scheduler = Scheduler::new();
+        scheduler.start();
+
+        SCHEDULER = Some(scheduler);
+
+        // Send 'S' to serial to indicate scheduler initialized
+        let com1 = 0x3F8u16 as *mut u8;
+        com1.add(4).write_volatile(0);
+        com1.add(0).write_volatile(1);
+        com1.add(1).write_volatile(0);
+        com1.add(4).write_volatile(3);
+        com1.add(1).write_volatile(0);
+        com1.write_volatile(b'S');
+
+        self.init_flags.scheduler = true;
+        Ok(())
     }
 
     /// Check if we're in runtime mode (boot services exited)

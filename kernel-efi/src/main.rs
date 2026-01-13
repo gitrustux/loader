@@ -14,6 +14,7 @@ mod console;
 mod native_console;
 mod vga_console;
 mod keyboard;
+mod syscall;
 use theme::get_active_theme;
 
 // ============================================================================
@@ -348,6 +349,11 @@ Step 4: Exiting UEFI boot services...\r\n\
         runtime::init_keyboard_interrupts()
     };
 
+    // Initialize syscall interface (Phase 10: Minimal Syscall Interface)
+    let syscall_result = unsafe {
+        syscall::init_syscalls()
+    };
+
     // Initialize scheduler stub (Phase 5)
     let sched_result = unsafe {
         runtime::init_scheduler_stub()
@@ -425,13 +431,26 @@ Step 4: Exiting UEFI boot services...\r\n\
         // Write Keyboard status at column 120
         let kbd_ptr = vga_buffer.add(120);
         let kbd_msg = if keyboard_result.is_ok() {
-            "KBD OK!  "
+            "KBD OK!"
         } else {
-            "KBD ERR! "
+            "KBD ERR!"
         };
         for (i, &byte) in kbd_msg.as_bytes().iter().enumerate() {
             if i < 10 {
                 *kbd_ptr.add(i) = 0x0F00 | (byte as u16); // White on black
+            }
+        }
+
+        // Write Syscall status at column 128
+        let syscall_ptr = vga_buffer.add(128);
+        let syscall_msg = if syscall_result.is_ok() {
+            "SYSCALL OK"
+        } else {
+            "SYSCALL ERR"
+        };
+        for (i, &byte) in syscall_msg.as_bytes().iter().enumerate() {
+            if i < 10 {
+                *syscall_ptr.add(i) = 0x0B00 | (byte as u16); // Cyan on black
             }
         }
     }

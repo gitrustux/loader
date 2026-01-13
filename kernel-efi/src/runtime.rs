@@ -111,7 +111,7 @@ pub struct IdtEntry {
 
 impl IdtEntry {
     /// Create a new IDT entry
-    const fn new(handler: u64, selector: u16, type_attr: u8) -> Self {
+    pub const fn new(handler: u64, selector: u16, type_attr: u8) -> Self {
         Self {
             offset_low: (handler & 0xFFFF) as u16,
             selector,
@@ -174,7 +174,7 @@ impl IdtPointer {
 
 /// Interrupt Descriptor Table (256 entries for x86_64)
 /// We only use the first 32 for CPU exceptions, the rest are for IRQs
-static mut IDT: [IdtEntry; 256] = [IdtEntry::absent(); 256];
+pub static mut IDT: [IdtEntry; 256] = [IdtEntry::absent(); 256];
 
 /// Exception frame pushed by x86_64 CPU
 #[repr(C)]

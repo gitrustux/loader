@@ -205,27 +205,30 @@ Step 4: Exiting UEFI boot services...\r\n\
     let mut entry_version: u32 = 0;
 
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-C1: Getting memory map size <<<\r\n"));
+        let _ = stdout.output_string(cstr16!(">>> TRACE-C1: Get memory map size <<<\r\n"));
     });
 
+    // Use raw boot services for first GetMemoryMap call
     unsafe {
         let get_memory_map = (*boot_services).get_memory_map;
-        let status = get_memory_map(
+        let _ = get_memory_map(
             &mut map_size,
             core::ptr::null_mut(),
             &mut map_key,
             &mut entry_size,
             &mut entry_version,
         );
-        // Expected to return BUFFER_TOO_SMALL, continue
     }
 
-    // Allocate buffer for memory map
-    // Add extra space to account for possible growth between calls
+    // Allocate buffer for memory map with extra space
     map_size += entry_size * 8;
 
     uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-C2: Allocating memory map buffer <<<\r\n"));
+        let _ = stdout.output_string(cstr16!(">>> TRACE-C2: Allocate buffer ("));
+        let _ = stdout.output_uint(map_size as u64);
+        let _ = stdout.output_string(cstr16!(" bytes, "));
+        let _ = stdout.output_uint(entry_size as u64);
+        let _ = stdout.output_string(cstr16!(" entry size) <<<\r\n"));
     });
 
     let buffer_pages = (map_size + 0xFFF) / 0x1000;
@@ -236,20 +239,28 @@ Step 4: Exiting UEFI boot services...\r\n\
         Err(_) => {
             uefi::system::with_stdout(|stdout| {
                 let _ = stdout.set_color(theme.error, theme.background);
-                let _ = stdout.output_string(cstr16!("  !! Failed to allocate memory map buffer - HALTING\r\n"));
+                let _ = stdout.output_string(cstr16!("  !! Failed to allocate buffer - HALTING\r\n"));
             });
             loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
         }
     };
 
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-C3: Getting actual memory map <<<\r\n"));
-    });
+    // NOTE: NO TRACE-C3 - frozen zone begins immediately after allocation
 
-    // Second pass: Get actual memory map with our buffer
-    // CRITICAL: After this call, enter FROZEN ZONE immediately
+    // ===================================================================
+    // FROZEN ZONE BEGINS HERE
+    // ===================================================================
+    // CRITICAL: NO console output, allocations, or protocol calls from here
+    // until after ExitBootServices returns successfully.
+    // ===================================================================
+
     let exit_status = unsafe {
+        // Second pass: Get actual memory map
+        let bt = uefi::table::system_table_raw().unwrap();
+        let st = bt.as_ref();
+        let boot_services = st.boot_services;
         let get_memory_map = (*boot_services).get_memory_map;
+
         let status = get_memory_map(
             &mut map_size,
             memory_map_buffer.as_ptr() as *mut _,
@@ -258,30 +269,12 @@ Step 4: Exiting UEFI boot services...\r\n\
             &mut entry_version,
         );
 
-        // ===================================================================
-        // FROZEN ZONE BEGINS HERE - IMMEDIATELY AFTER GetMemoryMap
-        // ===================================================================
-        // CRITICAL: After GetMemoryMap, UEFI requires that ABSOLUTELY NOTHING
-        // happens that could change the memory map before ExitBootServices.
-        //
-        // FORBIDDEN in frozen zone:
-        //   - NO allocations (Vec::new, Box::new, String::from, etc.)
-        //   - NO console output (UEFI console may allocate internally)
-        //   - NO string formatting
-        //   - NO protocol calls
-        //   - NO logging
-        //   - NOTHING that touches the allocator
-        //
-        // ONLY raw CPU instructions and direct ExitBootServices call allowed.
-        // ===================================================================
-
         if !status.is_success() {
-            // GetMemoryMap failed - halt without any output (frozen zone)
+            // Can't print in frozen zone - just halt
             loop { core::arch::asm!("hlt", options(nomem, nostack)); }
         }
 
-        // Call ExitBootServices with the map_key we just got
-        // This is the ONLY allowed operation in the frozen zone
+        // Call ExitBootServices
         let exit_boot_services_fn = (*boot_services).exit_boot_services;
         exit_boot_services_fn(image_handle.as_ptr(), map_key)
     };

@@ -16,6 +16,7 @@ mod vga_console;
 mod keyboard;
 mod syscall;
 mod userspace_bin;
+mod shell;
 use theme::get_active_theme;
 
 // ============================================================================
@@ -520,36 +521,15 @@ Step 4: Exiting UEFI boot services...\r\n\
 
     // Now enter heartbeat loop - kernel is alive with all runtime components initialized
     unsafe {
-        let vga_buffer = VGA_BUFFER as *mut u16;
-        let mut counter: u64 = 0;
-
         // Use VGA console for status messages
         vga_console::set_color(10, 0); // Light green on black
         vga_console::puts("All runtime components initialized.\n");
-        vga_console::puts("Entering heartbeat loop...\n\n");
-
-        // Heartbeat loop - toggle top-left character to show we're alive
-        loop {
-            counter = counter.wrapping_add(1);
-
-            // Toggle character every 16 million iterations
-            if counter & 0xFFFFFF == 0 {
-                let chars = [b'|', b'/', b'-', b'\\'];
-                let ch = chars[(counter >> 24) as usize % 4] as u16;
-                *vga_buffer = 0x1F00 | ch; // Blue on white
-            }
-
-            // Print a heartbeat character every ~100 million iterations
-            if counter & 0xFFFFFFF == 0 {
-                vga_console::putc('.');
-            }
-
-            core::arch::asm!("pause", options(nomem, nostack));
-            if counter % 10000000 == 0 {
-                core::arch::asm!("hlt", options(nomem, nostack));
-            }
-        }
+        vga_console::puts("Starting shell (Phase 12)...\n\n");
     }
+
+    // Phase 12: Run the minimal shell stub
+    // This is the final milestone: "I type text → I see text" in runtime mode
+    shell::run_shell();
 
     // Parse the memory map we captured
     let mut memory_map_vec = alloc::vec::Vec::new();

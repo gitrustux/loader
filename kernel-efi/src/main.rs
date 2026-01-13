@@ -198,6 +198,11 @@ Step 4: Exiting UEFI boot services...\r\n\
     let boot_services = st.boot_services;
     let image_handle = uefi::boot::image_handle();
 
+    // Store UEFI system table pointer for later cleanup (Phase 6)
+    unsafe {
+        runtime::set_uefi_system_table(bt.as_ptr());
+    }
+
     // First pass: Get memory map size (call with null buffer)
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
@@ -332,6 +337,11 @@ Step 4: Exiting UEFI boot services...\r\n\
     // Initialize scheduler stub (Phase 5)
     let sched_result = unsafe {
         runtime::init_scheduler_stub()
+    };
+
+    // Disable UEFI services permanently (Phase 6)
+    let uefi_disable_result = unsafe {
+        runtime::disable_uefi_services_permanently()
     };
 
     // Write status to VGA

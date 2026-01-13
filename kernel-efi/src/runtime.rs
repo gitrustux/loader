@@ -1191,3 +1191,102 @@ pub unsafe fn get_runtime() -> Option<&'static mut KernelRuntime> {
 pub fn is_runtime_mode() -> bool {
     unsafe { KERNEL_RUNTIME.is_some() }
 }
+
+/// ========================================================================
+/// PHASE 6: Disable UEFI Services Permanently
+/// ========================================================================
+///
+/// After ExitBootServices, UEFI boot services are no longer available.
+/// This module provides functions to permanently disable UEFI services
+/// and prevent accidental use of UEFI APIs in runtime mode.
+///
+
+use uefi_raw::table::system::SystemTable;
+
+/// Flag indicating if UEFI services have been permanently disabled
+static mut UEFI_SERVICES_DISABLED: bool = false;
+
+/// UEFI system table pointer (set to None after disabling)
+static mut UEFI_SYSTEM_TABLE: Option<*const SystemTable> = None;
+
+/// Set the UEFI system table pointer (called during kernel init)
+pub unsafe fn set_uefi_system_table(table: *const SystemTable) {
+    UEFI_SYSTEM_TABLE = Some(table);
+}
+
+/// Disable UEFI services permanently
+///
+/// This function:
+/// 1. Zeros out the UEFI system table pointer
+/// 2. Marks UEFI services as disabled
+/// 3. Writes confirmation to VGA
+///
+/// # Safety
+/// Must be called AFTER ExitBootServices returns successfully.
+/// Calling this before ExitBootServices will cause undefined behavior.
+pub unsafe fn disable_uefi_services_permanently() -> Result<(), &'static str> {
+    // Already disabled?
+    if UEFI_SERVICES_DISABLED {
+        return Ok(());
+    }
+
+    // Clear the system table pointer to prevent accidental use
+    UEFI_SYSTEM_TABLE = None;
+
+    // Mark as disabled
+    UEFI_SERVICES_DISABLED = true;
+
+    // Write confirmation to VGA
+    const VGA_BUFFER: u64 = 0xB8000;
+    let vga_buffer = VGA_BUFFER as *mut u16;
+    let msg = "UEFI DISABLED!";
+    let mut ptr = vga_buffer.add(120); // Column 120
+    for (i, &byte) in msg.as_bytes().iter().enumerate() {
+        if i < 15 {
+            *ptr.add(i) = 0x0900 | (byte as u16); // Blue on black
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if UEFI services are disabled
+pub fn is_uefi_disabled() -> bool {
+    unsafe { UEFI_SERVICES_DISABLED }
+}
+
+/// Panic if UEFI services are still accessible
+///
+/// This is a safety function that can be called at the beginning
+/// of any function that should only run in runtime mode.
+#[inline(always)]
+pub fn assert_runtime_mode() {
+    if !is_uefi_disabled() {
+        // UEFI services still accessible - this is a bug!
+        unsafe {
+            const VGA_BUFFER: u64 = 0xB8000;
+            let vga_buffer = VGA_BUFFER as *mut u16;
+            let msg = b"ERROR: UEFI NOT DISABLED!";
+            for (i, &byte) in msg.iter().enumerate() {
+                if i < 80 {
+                    *vga_buffer.add(i) = 0x4F00 | (byte as u16); // Red on white
+                }
+            }
+        }
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
+    }
+}
+
+/// Get UEFI system table pointer (returns None if disabled)
+///
+/// This function prevents accidental use of UEFI services after
+/// they have been disabled.
+pub unsafe fn get_uefi_system_table() -> Option<*const SystemTable> {
+    if UEFI_SERVICES_DISABLED {
+        None
+    } else {
+        UEFI_SYSTEM_TABLE
+    }
+}

@@ -41,6 +41,15 @@ impl EmbeddedFileSystem {
 
     /// Add test binaries to the filesystem
     fn add_test_binaries(&mut self) {
+        // Add the embedded userspace test program (Phase 11)
+        // This is a real Rust program that uses Rustux syscalls
+        let userspace_bin = crate::userspace_bin::USERSPACE_BIN.to_vec();
+        self.files.insert(String::from("test"), FileEntry {
+            name: String::from("test"),
+            data: userspace_bin,
+            is_executable: true,
+        });
+
         // Simple "hello" program - prints "Hello from userspace!"
         // This is a minimal x86_64 ELF binary
         let hello_elf = create_hello_elf();

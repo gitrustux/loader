@@ -15,6 +15,7 @@ mod native_console;
 mod vga_console;
 mod keyboard;
 mod syscall;
+mod userspace_bin;
 use theme::get_active_theme;
 
 // ============================================================================

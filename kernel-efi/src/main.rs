@@ -409,6 +409,68 @@ Step 4: Exiting UEFI boot services...\r\n\
         }
     }
 
+    // Phase 7: Test ELF loader - initialize filesystem and load a binary
+    let elf_result = unsafe {
+        // Initialize embedded filesystem
+        filesystem::init_filesystem();
+
+        // Get the filesystem
+        if let Some(fs) = filesystem::get_filesystem() {
+            // Try to load the "hello" ELF binary
+            if let Some(file) = fs.read("hello") {
+                // Create a runtime instance for loading
+                let memory_map = alloc::vec::Vec::new();
+                let runtime = runtime::KernelRuntime::new(memory_map, 0, 0);
+
+                // Attempt to load the ELF binary
+                match runtime.load_elf(&file.data) {
+                    Ok(binary) => {
+                        // Write ELF load success to VGA (row 1)
+                        const VGA_BUFFER: u64 = 0xB8000;
+                        let vga_buffer = VGA_BUFFER as *mut u16;
+                        let row1 = vga_buffer.add(80); // Second row
+
+                        let msg = "ELF LOADED! ENTRY=";
+                        let mut ptr = row1;
+                        for (i, &byte) in msg.as_bytes().iter().enumerate() {
+                            if i < 80 {
+                                *ptr.add(i) = 0x0B00 | (byte as u16); // Cyan on black
+                            }
+                        }
+
+                        // Write entry point in hex
+                        let hex = b"0123456789ABCDEF";
+                        let mut entry_ptr = row1.add(msg.len());
+                        let mut entry_val = binary.entry_point;
+                        for i in 0..16 {
+                            let nibble = (entry_val >> (60 - i * 4)) & 0xF;
+                            *entry_ptr.add(i) = 0x0B00 | (hex[nibble as usize] as u16);
+                        }
+
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Write ELF load error to VGA
+                        const VGA_BUFFER: u64 = 0xB8000;
+                        let vga_buffer = VGA_BUFFER as *mut u16;
+                        let row1 = vga_buffer.add(80);
+                        let msg = "ELF LOAD ERR";
+                        for (i, &byte) in msg.as_bytes().iter().enumerate() {
+                            if i < 80 {
+                                *row1.add(i) = 0x0400 | (byte as u16); // Red on black
+                            }
+                        }
+                        Err(e)
+                    }
+                }
+            } else {
+                Err("File not found")
+            }
+        } else {
+            Err("Filesystem not initialized")
+        }
+    };
+
     // Now enter heartbeat loop - kernel is alive with all runtime components initialized
     unsafe {
         let vga_buffer = VGA_BUFFER as *mut u16;

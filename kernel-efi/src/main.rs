@@ -319,6 +319,11 @@ Step 4: Exiting UEFI boot services...\r\n\
         )
     };
 
+    // Initialize exception handlers (Phase 5: IDT setup)
+    let idt_result = unsafe {
+        runtime::init_exception_handlers()
+    };
+
     // Write status to VGA
     const VGA_BUFFER: u64 = 0xB8000;
     unsafe {
@@ -343,9 +348,22 @@ Step 4: Exiting UEFI boot services...\r\n\
         for (i, &byte) in status_msg.as_bytes().iter().enumerate() {
             *status_ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
         }
+
+        // Write IDT status at column 90
+        let idt_ptr = vga_buffer.add(90);
+        let idt_msg = if idt_result.is_ok() {
+            "IDT OK!"
+        } else {
+            "IDT ERR!"
+        };
+        for (i, &byte) in idt_msg.as_bytes().iter().enumerate() {
+            if i < 10 {
+                *idt_ptr.add(i) = 0x0A00 | (byte as u16); // Green on black
+            }
+        }
     }
 
-    // Now enter heartbeat loop - kernel is alive with allocator initialized
+    // Now enter heartbeat loop - kernel is alive with allocator and IDT initialized
     unsafe {
         let vga_buffer = VGA_BUFFER as *mut u16;
         let mut counter: u64 = 0;

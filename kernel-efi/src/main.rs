@@ -171,24 +171,8 @@ Step 3: Disabling interrupts before ExitBootServices...\r\n\
     }
 
     // TRACE 2: Interrupts disabled
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-B: Interrupts disabled <<<\r\n"));
-    });
-
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.success, theme.background);
-        let _ = stdout.output_string(cstr16!("  -> Interrupts disabled\r\n"));
-
-        let _ = stdout.set_color(theme.warning, theme.background);
-        let _ = stdout.output_string(cstr16!("\r\n\
-Step 4: Exiting UEFI boot services...\r\n\
-"));
-    });
-
-    // TRACE 3: About to call ExitBootServices
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-C: About to call ExitBootServices <<<\r\n"));
-    });
+    // NO console output before ExitBootServices - can cause hangs
+    // Console output will resume after ExitBootServices completes (using VGA)
 
     // STEP 4: Exit boot services and get memory map
     // CRITICAL: uefi::boot::exit_boot_services(None) does internal allocations
@@ -214,12 +198,13 @@ Step 4: Exiting UEFI boot services...\r\n\
     let mut entry_size: usize = 0;
     let mut entry_version: u32 = 0;
 
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-C1: Get memory map size <<<\r\n"));
-    });
-
-    // Use raw boot services for first GetMemoryMap call
+    // NO console output before ExitBootServices operations
+    // Use the safer uefi::boot::get_memory_map_size() wrapper
     unsafe {
+        let bt = uefi::table::system_table_raw().unwrap();
+        let st = bt.as_ref();
+        let boot_services = st.boot_services;
+
         let get_memory_map = (*boot_services).get_memory_map;
         let _ = get_memory_map(
             &mut map_size,
@@ -292,11 +277,8 @@ Step 4: Exiting UEFI boot services...\r\n\
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
     }
 
-    // TRACE-D: ExitBootServices returned successfully!
-    // Note: UEFI console may not work after ExitBootServices, so this might not appear
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-D: ExitBootServices RETURNED! <<<\r\n"));
-    });
+    // NO console output after ExitBootServices!
+    // UEFI console is not available - must use VGA text mode instead
 
     // ===================================================================
     // RUNTIME MODE BEGINS HERE

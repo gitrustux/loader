@@ -231,28 +231,17 @@ Step 4: Exiting UEFI boot services...\r\n\
     }
 
     // Allocate buffer for memory map with extra space
-    map_size += entry_size * 8;
+    // Add significant padding (16 entries worth) to account for memory map changes
+    map_size += entry_size * 16;
 
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-C2: Allocate buffer ("));
-        let _ = stdout.output_uint(map_size as u64);
-        let _ = stdout.output_string(cstr16!(" bytes, "));
-        let _ = stdout.output_uint(entry_size as u64);
-        let _ = stdout.output_string(cstr16!(" entry size) <<<\r\n"));
-    });
-
-    let buffer_pages = (map_size + 0xFFF) / 0x1000;
-    let memory_map_buffer = match unsafe {
-        uefi::boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, buffer_pages)
-    } {
-        Ok(addr) => addr,
-        Err(_) => {
-            uefi::system::with_stdout(|stdout| {
-                let _ = stdout.set_color(theme.error, theme.background);
-                let _ = stdout.output_string(cstr16!("  !! Failed to allocate buffer - HALTING\r\n"));
-            });
-            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
-        }
+    // Use allocate_pool instead of allocate_pages - more reliable for small buffers
+    // NO console output before allocation - can cause hangs on some UEFI firmware
+    let memory_map_buffer = unsafe {
+        uefi::boot::allocate_pool(MemoryType::LOADER_DATA, map_size)
+            .unwrap_or_else(|_| {
+                // Allocation failed - halt
+                loop { core::arch::asm!("hlt", options(nomem, nostack)); }
+            })
     };
 
     // NOTE: NO TRACE-C3 - frozen zone begins immediately after allocation

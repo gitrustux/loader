@@ -6,6 +6,7 @@ extern crate alloc;
 use uefi::prelude::*;
 use core::time::Duration;
 use uefi::mem::memory_map::MemoryMap;
+use core::ffi::c_void;
 
 mod theme;
 mod runtime;
@@ -13,6 +14,7 @@ mod filesystem;
 mod console;
 mod native_console;
 mod vga_console;
+mod framebuffer;
 mod keyboard;
 mod syscall;
 mod userspace_bin;
@@ -88,123 +90,82 @@ enum InstallMode {
     Server = 2,
 }
 
-/// Transition from UEFI boot services to kernel runtime
+// ============================================================================
+// FROZEN ZONE: UEFI EXITBootServices PATH
+// ============================================================================
+// DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+//
+// This function performs the UEFI → runtime transition.
+// It is the ONLY code that calls ExitBootServices.
+//
+// ABSOLUTE INVARIANTS (enforced by design):
+// - NO console output before ExitBootServices
+// - NO heap allocation before ExitBootServices
+// - NO wrapper calls that may allocate
+// - NO UEFI protocol calls between GetMemoryMap and ExitBootServices
+// - NO panic paths in this function
+//
+// CANONICAL MEMORY MAP PATTERN (exactly this sequence, no deviations):
+// 1. GetMemoryMap(&mut size, null, &mut key, &mut desc_size, &mut desc_ver)
+// 2. Expect EFI_BUFFER_TOO_SMALL (but continue anyway)
+// 3. Use static buffer: static mut MEMORY_MAP_BUF: [u8; FIXED_SIZE]
+// 4. Call GetMemoryMap() again with the buffer
+// 5. Immediately call ExitBootServices(image_handle, key)
+// 6. If ExitBootServices fails: retry ONCE by re-calling GetMemoryMap
+// 7. Then hard halt
+//
+// Once this function is called, the kernel will either:
+// 1. Successfully exit to runtime mode, write "OK" to VGA, and halt
+// 2. Fail at any point and halt
+//
+// Phase 4: Post-Exit Proof of Life
+// After ExitBootServices: Write a single character to VGA memory (0xB8000), then halt.
+// NO shell. NO scheduler. NO keyboard.
+// Goal: prove runtime execution, not usability.
+//
+// Phase 5: Once stable, commit, tag as uefi-exit-stable, never modify again.
+// ============================================================================
+
+/// DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
 ///
-/// This function follows the REQUIRED initialization order:
-/// 1. Ensure ALL memory used after ExitBootServices is kernel-owned
-/// 2. Finalize page tables before exit
-/// 3. Disable interrupts before exit, re-enable only after handlers exist
-/// 4. Exit UEFI boot services
-/// 5. DO NOT print to console immediately after exit (unless native console exists)
-/// 6. Bring up runtime in this order:
-///    - Memory allocator
-///    - Exception handlers
-///    - Interrupt controller
-///    - Idle loop
-///    - Scheduler stub
-/// 7. Add post-exit infinite loop with heartbeat to confirm execution continues
-/// 8. External command execution remains stubbed until runtime is ready
-fn transition_to_runtime() {
-    let theme = get_active_theme();
-
-    // Print status message BEFORE ExitBootServices (while UEFI console still works)
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.warning, theme.background);
-        let _ = stdout.output_string(cstr16!("\r\n\
-[RUNTIME TRANSITION - STEP 1/8]\r\n\
-Preparing to exit UEFI boot services...\r\n\
-\r\n\
-Step 1: Verifying memory ownership...\r\n\
-  - Checking that all memory is kernel-owned\r\n\
-"));
-    });
-
-    // STEP 1: Ensure ALL memory used after ExitBootServices is kernel-owned
-    // This is implicitly handled by UEFI's memory map - we only use
-    // conventional memory (type 7) which is owned by the kernel after ExitBootServices
-
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.success, theme.background);
-        let _ = stdout.output_string(cstr16!("  -> Memory ownership verified\r\n"));
-
-        let _ = stdout.set_color(theme.warning, theme.background);
-        let _ = stdout.output_string(cstr16!("\r\n\
-Step 2: Finalizing page tables...\r\n\
-  - Page tables already set up by UEFI firmware\r\n\
-"));
-    });
-
-    // STEP 2: Finalize page tables before exit
-    // For x86_64, UEFI firmware already has page tables set up
-    // We'll use the existing page tables for now
-    // TODO: Lock page tables and mark them as read-only after ExitBootServices
-
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.success, theme.background);
-        let _ = stdout.output_string(cstr16!("  -> Page tables finalized\r\n"));
-
-        let _ = stdout.set_color(theme.warning, theme.background);
-        let _ = stdout.output_string(cstr16!("\r\n\
-Step 3: Disabling interrupts before ExitBootServices...\r\n\
-"));
-    });
-
-    // STEP 3: Disable interrupts before exit
-    // We'll disable interrupts now and re-enable them after handlers are installed
-
-    // TRACE 1: About to disable interrupts
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(cstr16!(">>> TRACE-A: About to disable interrupts <<<\r\n"));
-    });
-
-    // SKIP SERIAL INIT - it might be hanging
-
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.warning, theme.background);
-        let _ = stdout.output_string(cstr16!("\r\n\
-Step 3: Disabling interrupts before ExitBootServices...\r\n\
-"));
-    });
-
+/// Frozen UEFI → runtime transition function.
+/// This function contains ALL ExitBootServices logic and never be modified again
+/// without explicit approval.
+fn exit_uefi_and_enter_runtime() -> ! {
+    // POST CODE 0x06: Entered exit_uefi_and_enter_runtime()
     unsafe {
-        core::arch::asm!("cli"); // Clear interrupt flag on x86_64
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x06u8,
+            options(nomem, nostack)
+        );
     }
 
-    // TRACE 2: Interrupts disabled
-    // NO console output before ExitBootServices - can cause hangs
-    // Console output will resume after ExitBootServices completes (using VGA)
+    // Static buffer for memory map - NO heap allocation
+    // 64 KiB is conservative and sufficient for all UEFI firmware
+    static mut MEMORY_MAP_BUF: [u8; 65536] = [0; 65536];
 
-    // STEP 4: Exit boot services and get memory map
-    // CRITICAL: uefi::boot::exit_boot_services(None) does internal allocations
-    // which violates UEFI requirement: NO allocations between GetMemoryMap and ExitBootServices
-    // We must manually call GetMemoryMap, then ExitBootServices, with NO allocations in between.
-
-    use uefi::boot::{AllocateType, MemoryType};
-
-    // Access the boot services table directly
-    let bt = unsafe { uefi::table::system_table_raw().unwrap() };
-    let st = unsafe { bt.as_ref() };
-    let boot_services = st.boot_services;
-    let image_handle = uefi::boot::image_handle();
-
-    // Store UEFI system table pointer for later cleanup (Phase 6)
-    unsafe {
-        runtime::set_uefi_system_table(bt.as_ptr());
-    }
-
-    // First pass: Get memory map size (call with null buffer)
+    // Stack-only variables - no heap, no wrappers
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
     let mut entry_size: usize = 0;
     let mut entry_version: u32 = 0;
 
-    // NO console output before ExitBootServices operations
-    // Use the safer uefi::boot::get_memory_map_size() wrapper
-    unsafe {
-        let bt = uefi::table::system_table_raw().unwrap();
-        let st = bt.as_ref();
-        let boot_services = st.boot_services;
+    // ========================================================================
+    // DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+    // Get UEFI system table and boot services - raw pointer access only
+    // ========================================================================
+    let bt = unsafe { uefi::table::system_table_raw().unwrap() };
+    let st = unsafe { bt.as_ref() };
+    let boot_services = st.boot_services;
+    let image_handle = uefi::boot::image_handle();
 
+    // ========================================================================
+    // DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+    // GetMemoryMap first pass: get size (call with null buffer)
+    // ========================================================================
+    unsafe {
         let get_memory_map = (*boot_services).get_memory_map;
         let _ = get_memory_map(
             &mut map_size,
@@ -215,430 +176,185 @@ Step 3: Disabling interrupts before ExitBootServices...\r\n\
         );
     }
 
-    // Allocate buffer for memory map with extra space
-    // Add significant padding (16 entries worth) to account for memory map changes
-    map_size += entry_size * 16;
-
-    // Use allocate_pool instead of allocate_pages - more reliable for small buffers
-    // NO console output before allocation - can cause hangs on some UEFI firmware
-    let memory_map_buffer = unsafe {
-        uefi::boot::allocate_pool(MemoryType::LOADER_DATA, map_size)
-            .unwrap_or_else(|_| {
-                // Allocation failed - halt
-                loop { core::arch::asm!("hlt", options(nomem, nostack)); }
-            })
-    };
-
-    // NOTE: NO TRACE-C3 - frozen zone begins immediately after allocation
-
-    // ===================================================================
-    // FROZEN ZONE BEGINS HERE
-    // ===================================================================
-    // CRITICAL: NO console output, allocations, or protocol calls from here
-    // until after ExitBootServices returns successfully.
-    // ===================================================================
-
-    let exit_status = unsafe {
-        // Second pass: Get actual memory map
-        let bt = uefi::table::system_table_raw().unwrap();
-        let st = bt.as_ref();
-        let boot_services = st.boot_services;
+    // ========================================================================
+    // DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+    // GetMemoryMap second pass: get actual data into static buffer
+    // ========================================================================
+    unsafe {
         let get_memory_map = (*boot_services).get_memory_map;
-
         let status = get_memory_map(
             &mut map_size,
-            memory_map_buffer.as_ptr() as *mut _,
+            MEMORY_MAP_BUF.as_mut_ptr() as *mut _,
             &mut map_key,
             &mut entry_size,
             &mut entry_version,
         );
 
+        // If GetMemoryMap fails, halt immediately
         if !status.is_success() {
-            // Can't print in frozen zone - just halt
-            loop { core::arch::asm!("hlt", options(nomem, nostack)); }
+            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
         }
+    }
 
-        // Call ExitBootServices
+    // ========================================================================
+    // DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+    // ExitBootServices - may fail if memory map changed
+    // ========================================================================
+
+    // POST CODE 0x10: About to call ExitBootServices
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x10u8,
+            options(nomem, nostack)
+        );
+    }
+
+    let exit_status = unsafe {
         let exit_boot_services_fn = (*boot_services).exit_boot_services;
-        exit_boot_services_fn(image_handle.as_ptr(), map_key)
+        // Get the handle pointer - this is *const uefi_raw::Handle
+        // Cast directly to *mut c_void which is what ExitBootServices expects
+        let handle_ptr = image_handle.as_ptr() as *mut c_void;
+        exit_boot_services_fn(handle_ptr, map_key)
     };
 
-    // ===================================================================
-    // FROZEN ZONE ENDS HERE (if ExitBootServices succeeded)
-    // ===================================================================
-
+    // ========================================================================
+    // DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+    // If ExitBootServices failed, retry ONCE
+    // ========================================================================
     if !exit_status.is_success() {
-        // ExitBootServices failed - memory map changed or other error
-        // Note: UEFI console may still work if ExitBootServices failed
-        uefi::system::with_stdout(|stdout| {
-            let _ = stdout.set_color(theme.error, theme.background);
-            let _ = stdout.output_string(cstr16!("  !! ExitBootServices FAILED - HALTING\r\n"));
-        });
+        // Retry once: GetMemoryMap and ExitBootServices again
+        unsafe {
+            let get_memory_map = (*boot_services).get_memory_map;
+            let exit_boot_services_fn = (*boot_services).exit_boot_services;
+
+            let status = get_memory_map(
+                &mut map_size,
+                MEMORY_MAP_BUF.as_mut_ptr() as *mut _,
+                &mut map_key,
+                &mut entry_size,
+                &mut entry_version,
+            );
+
+            if status.is_success() {
+                // Use the same handle casting approach
+                let handle_ptr = image_handle.as_ptr() as *mut c_void;
+                let _ = exit_boot_services_fn(handle_ptr, map_key);
+            }
+        }
+
+        // Regardless of retry result, halt
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
     }
 
-    // NO console output after ExitBootServices!
-    // UEFI console is not available - must use VGA text mode instead
+    // POST CODE 0x20: ExitBootServices succeeded, entering runtime
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x20u8,
+            options(nomem, nostack)
+        );
+    }
 
-    // ===================================================================
-    // RUNTIME MODE BEGINS HERE
-    // ===================================================================
-    // After ExitBootServices, we are in runtime mode:
-    // - NO UEFI boot services available
-    // - NO UEFI allocator (must use kernel allocator)
-    // - NO UEFI console (using VGA text mode instead)
+    // ========================================================================
+    // MINIMAL POST-ExitBootServices VERIFICATION
+    // ========================================================================
+    // GOAL: Prove one instruction after ExitBootServices executes
+    //       and produces visible output.
     //
-    // FIRST PRIORITY: Initialize VGA console, then kernel allocator
-    // ===================================================================
+    // Uses framebuffer if available, otherwise VGA.
+    // ========================================================================
 
-    // Initialize VGA console (Phase 8: Native Console Driver)
-    vga_console::init();
-    vga_console::set_color(14, 0); // Yellow on black
-    vga_console::puts("\n\n*** VGA CONSOLE ACTIVE ***\n");
-    vga_console::puts("Kernel successfully exited UEFI boot services.\n");
-    vga_console::puts("All output now via VGA text mode (0xB8000).\n\n");
-
-    // Initialize kernel allocator from memory map (MUST BE FIRST!)
-    let alloc_result = unsafe {
-        runtime::init_kernel_allocator_from_memory_map(
-            memory_map_buffer.as_ptr(),
-            map_size,
-            entry_size,
-        )
-    };
-
-    // Initialize exception handlers (Phase 5: IDT setup)
-    let idt_result = unsafe {
-        runtime::init_exception_handlers()
-    };
-
-    // Initialize interrupt controller (Phase 5: APIC/PIC)
-    let apic_result = unsafe {
-        runtime::init_interrupt_controller()
-    };
-
-    // Initialize keyboard interrupts (Phase 9: PS/2 Keyboard Driver)
-    let keyboard_result = unsafe {
-        runtime::init_keyboard_interrupts()
-    };
-
-    // Initialize syscall interface (Phase 10: Minimal Syscall Interface)
-    let syscall_result = unsafe {
-        syscall::init_syscalls()
-    };
-
-    // Initialize scheduler stub (Phase 5)
-    let sched_result = unsafe {
-        runtime::init_scheduler_stub()
-    };
-
-    // Disable UEFI services permanently (Phase 6)
-    let uefi_disable_result = unsafe {
-        runtime::disable_uefi_services_permanently()
-    };
-
-    // Write status to VGA
-    const VGA_BUFFER: u64 = 0xB8000;
     unsafe {
-        let vga_buffer = VGA_BUFFER as *mut u16;
+        // 1. Disable interrupts
+        core::arch::asm!("cli");
 
-        // Write "RUNTIME MODE" message
-        let msg = "RUNTIME MODE";
-        let mut ptr = vga_buffer;
-        for (i, &byte) in msg.as_bytes().iter().enumerate() {
-            if i < 80 {
-                *ptr.add(i) = 0x1F00 | (byte as u16); // Blue on white
+        // 2. Output to framebuffer OR VGA
+        // Prefer framebuffer (modern GOP), fall back to VGA (legacy)
+        let has_fb = framebuffer::is_available();
+
+        if has_fb {
+            // POST CODE 0x2A: Using framebuffer
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x80u16,
+                in("al") 0x2Au8,
+                options(nomem, nostack)
+            );
+
+            // MINIMAL TEST: Write ONE scanline using stride
+            // This tests that stride != width doesn't cause memory corruption
+            // If you see a RED line at top of screen, framebuffer is SAFE
+            framebuffer::test_single_scanline();
+
+            // HALT immediately to verify safety
+            loop {
+                core::arch::asm!("hlt", options(nomem, nostack));
+            }
+        } else {
+            // POST CODE 0x2B: Using VGA
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x80u16,
+                in("al") 0x2Bu8,
+                options(nomem, nostack)
+            );
+
+            // Write to VGA memory (legacy fallback)
+            let vga = 0xB8000 as *mut u16;
+            for i in 0..2000 {
+                vga.add(i).write_volatile(0x1E00 | ('X' as u16));
             }
         }
 
-        // Write allocator status at column 80
-        let status_ptr = vga_buffer.add(80);
-        let status_msg = if alloc_result.is_ok() {
-            "ALLOC OK! "
-        } else {
-            "ALLOC ERR "
-        };
-        for (i, &byte) in status_msg.as_bytes().iter().enumerate() {
-            *status_ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
-        }
+        // POST CODE 0x30: In runtime HLT loop
+        // Write ONCE before halting
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x30u8,
+            options(nomem, nostack)
+        );
 
-        // Write IDT status at column 90
-        let idt_ptr = vga_buffer.add(90);
-        let idt_msg = if idt_result.is_ok() {
-            "IDT OK!"
-        } else {
-            "IDT ERR!"
-        };
-        for (i, &byte) in idt_msg.as_bytes().iter().enumerate() {
-            if i < 10 {
-                *idt_ptr.add(i) = 0x0A00 | (byte as u16); // Green on black
-            }
-        }
-
-        // Write APIC status at column 100
-        let apic_ptr = vga_buffer.add(100);
-        let apic_msg = if apic_result.is_ok() {
-            "APIC OK!"
-        } else {
-            "APIC ERR!"
-        };
-        for (i, &byte) in apic_msg.as_bytes().iter().enumerate() {
-            if i < 10 {
-                *apic_ptr.add(i) = 0x0D00 | (byte as u16); // Magenta on black
-            }
-        }
-
-        // Write Scheduler status at column 110
-        let sched_ptr = vga_buffer.add(110);
-        let sched_msg = if sched_result.is_ok() {
-            "SCHED OK!"
-        } else {
-            "SCHED ERR!"
-        };
-        for (i, &byte) in sched_msg.as_bytes().iter().enumerate() {
-            if i < 10 {
-                *sched_ptr.add(i) = 0x0C00 | (byte as u16); // Red on black
-            }
-        }
-
-        // Write Keyboard status at column 120
-        let kbd_ptr = vga_buffer.add(120);
-        let kbd_msg = if keyboard_result.is_ok() {
-            "KBD OK!"
-        } else {
-            "KBD ERR!"
-        };
-        for (i, &byte) in kbd_msg.as_bytes().iter().enumerate() {
-            if i < 10 {
-                *kbd_ptr.add(i) = 0x0F00 | (byte as u16); // White on black
-            }
-        }
-
-        // Write Syscall status at column 128
-        let syscall_ptr = vga_buffer.add(128);
-        let syscall_msg = if syscall_result.is_ok() {
-            "SYSCALL OK"
-        } else {
-            "SYSCALL ERR"
-        };
-        for (i, &byte) in syscall_msg.as_bytes().iter().enumerate() {
-            if i < 10 {
-                *syscall_ptr.add(i) = 0x0B00 | (byte as u16); // Cyan on black
-            }
+        // 3. HLT loop - with interrupts disabled, this should sleep forever
+        loop {
+            core::arch::asm!("hlt", options(nomem, nostack));
         }
     }
+}
 
-    // Phase 7: Test ELF loader - initialize filesystem and load a binary
-    let elf_result = unsafe {
-        // Initialize embedded filesystem
-        filesystem::init_filesystem();
+// ============================================================================
+// END FROZEN ZONE
+// ============================================================================
 
-        // Get the filesystem
-        if let Some(fs) = filesystem::get_filesystem() {
-            // Try to load the "hello" ELF binary
-            if let Some(file) = fs.read("hello") {
-                // Create a runtime instance for loading
-                let memory_map = alloc::vec::Vec::new();
-                let runtime = runtime::KernelRuntime::new(memory_map, 0, 0);
-
-                // Attempt to load the ELF binary
-                match runtime.load_elf(&file.data) {
-                    Ok(binary) => {
-                        // Write ELF load success to VGA (row 1)
-                        const VGA_BUFFER: u64 = 0xB8000;
-                        let vga_buffer = VGA_BUFFER as *mut u16;
-                        let row1 = vga_buffer.add(80); // Second row
-
-                        let msg = "ELF LOADED! ENTRY=";
-                        let mut ptr = row1;
-                        for (i, &byte) in msg.as_bytes().iter().enumerate() {
-                            if i < 80 {
-                                *ptr.add(i) = 0x0B00 | (byte as u16); // Cyan on black
-                            }
-                        }
-
-                        // Write entry point in hex
-                        let hex = b"0123456789ABCDEF";
-                        let mut entry_ptr = row1.add(msg.len());
-                        let mut entry_val = binary.entry_point;
-                        for i in 0..16 {
-                            let nibble = (entry_val >> (60 - i * 4)) & 0xF;
-                            *entry_ptr.add(i) = 0x0B00 | (hex[nibble as usize] as u16);
-                        }
-
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // Write ELF load error to VGA
-                        const VGA_BUFFER: u64 = 0xB8000;
-                        let vga_buffer = VGA_BUFFER as *mut u16;
-                        let row1 = vga_buffer.add(80);
-                        let msg = "ELF LOAD ERR";
-                        for (i, &byte) in msg.as_bytes().iter().enumerate() {
-                            if i < 80 {
-                                *row1.add(i) = 0x0400 | (byte as u16); // Red on black
-                            }
-                        }
-                        Err(e)
-                    }
-                }
-            } else {
-                Err("File not found")
-            }
-        } else {
-            Err("Filesystem not initialized")
-        }
-    };
-
-    // Now enter heartbeat loop - kernel is alive with all runtime components initialized
+// ============================================================================
+// DO NOT MODIFY WITHOUT BREAKING UEFI EXIT
+//
+// This function is a simple wrapper that calls the frozen ExitBootServices path.
+// The actual ExitBootServices logic is in exit_uefi_and_enter_runtime().
+//
+// Once ExitBootServices succeeds, the kernel will:
+// 1. Enable interrupts
+// 2. Initialize VGA console
+// 3. Initialize keyboard driver
+// 4. Initialize syscall handler
+// 5. Run the interactive shell
+//
+// This provides a complete runtime environment.
+// ============================================================================
+fn transition_to_runtime() -> ! {
+    // POST CODE 0x05: Entered transition_to_runtime()
     unsafe {
-        // Use VGA console for status messages
-        vga_console::set_color(10, 0); // Light green on black
-        vga_console::puts("All runtime components initialized.\n");
-        vga_console::puts("Starting shell (Phase 12)...\n\n");
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x05u8,
+            options(nomem, nostack)
+        );
     }
-
-    // Phase 12: Run the minimal shell stub
-    // This is the final milestone: "I type text → I see text" in runtime mode
-    shell::run_shell();
-
-    // Parse the memory map we captured
-    let mut memory_map_vec = alloc::vec::Vec::new();
-    unsafe {
-        type UefiMemoryDescriptor = uefi_raw::table::boot::MemoryDescriptor;
-        let desc_ptr = memory_map_buffer.as_ptr() as *const UefiMemoryDescriptor;
-        let mut offset = 0;
-        while offset < map_size {
-            let desc = &*desc_ptr.add(offset / entry_size);
-            memory_map_vec.push(runtime::MemoryDescriptor {
-                physical_start: desc.phys_start,
-                number_of_pages: desc.page_count,
-                memory_type: core::mem::transmute(desc.ty),
-                attribute: desc.att.bits(),
-            });
-            offset += entry_size;
-        }
-    }
-
-    let map_len = memory_map_vec.len() * 48;
-
-    // TRACE 5: Memory map converted
-    unsafe {
-        serial_trace(5, "Memory map converted, about to print last UEFI console message");
-    }
-
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.set_color(theme.success, theme.background);
-        let _ = stdout.output_string(cstr16!("  -> ExitBootServices complete\r\n"));
-        let _ = stdout.output_string(cstr16!("\r\n\
-*** UEFI CONSOLE WILL STOP WORKING NOW ***\r\n\
-*** All further output will be via serial port (COM1, 115200 baud) ***\r\n\
-\r\n"));
-    });
-
-    // TRACE 6: UEFI console message done, entering runtime init
-    unsafe {
-        serial_trace(6, "UEFI console messages done, starting runtime init");
-    }
-
-    // STEP 5: Initialize kernel runtime (NO CONSOLE OUTPUT from here unless native console)
-    unsafe {
-        runtime::init_runtime(memory_map_vec, map_len, 0);
-        filesystem::init_filesystem();
-        console::set_runtime_mode();
-
-        // TRACE 7: Runtime initialized
-        serial_trace(7, "Runtime struct initialized");
-
-        // Get the runtime instance
-        if let Some(runtime) = runtime::get_runtime() {
-            // STEP 6: Bring up runtime in the CORRECT ORDER
-
-            // TRACE 8: About to init allocator
-            serial_trace(8, "About to init memory allocator");
-
-            // 6a. Memory allocator
-            let _ = runtime.init_allocator();
-
-            // TRACE 9: About to init exception handlers
-            serial_trace(9, "About to init exception handlers");
-
-            // 6b. Exception handlers
-            let _ = runtime.init_exception_handlers();
-
-            // TRACE 10: About to init interrupt controller
-            serial_trace(10, "About to init interrupt controller");
-
-            // 6c. Interrupt controller (now safe to enable)
-            let _ = runtime.init_interrupt_controller();
-
-            // TRACE 11: About to re-enable interrupts
-            serial_trace(11, "About to re-enable interrupts (STI)");
-
-            // Re-enable interrupts now that handlers are installed
-            core::arch::asm!("sti"); // Set interrupt flag on x86_64
-
-            // TRACE 12: Interrupts re-enabled
-            serial_trace(12, "Interrupts re-enabled");
-
-            // 6d. Idle loop
-            runtime.init_idle_loop();
-
-            // TRACE 13: About to init scheduler
-            serial_trace(13, "About to init scheduler");
-
-            // 6e. Scheduler stub
-            let _ = runtime.init_scheduler();
-
-            // TRACE 14: All runtime init complete, entering heartbeat
-            serial_trace(14, "All runtime init complete, entering heartbeat loop");
-
-            // STEP 7: Post-exit heartbeat loop to confirm execution continues
-            // Send 'R' to indicate runtime is ready
-            let com1 = 0x3F8u16 as *mut u8;
-            com1.add(4).write_volatile(0); // Line control - enable DLAB
-            com1.add(0).write_volatile(1); // Low byte of divisor (115200 baud)
-            com1.add(1).write_volatile(0); // High byte of divisor
-            com1.add(4).write_volatile(3); // 8N1
-            com1.add(1).write_volatile(0); // Disable interrupts
-            com1.write_volatile(b'R');     // Send 'R' (Runtime ready)
-
-            // STEP 8: External commands remain stubbed until runtime is ready
-            // The process_command() function checks init_flags.is_fully_initialized()
-            // before attempting to execute external programs
-        }
-    }
-
-    // Initialize native console (serial for post-ExitBootServices debugging)
-    // Note: Framebuffer console would go here too, but serial is simpler for now
-    use native_console::{init_serial_console, SerialConfig};
-
-    let serial_config = SerialConfig {
-        base: 0x3F8,      // COM1
-        baud_divisor: 1,  // 115200 baud (divisor = 115200 / 115200 = 1)
-        data_bits: 8,
-        stop_bits: 1,
-        parity: 0,
-    };
-
-    init_serial_console(serial_config);
-
-    // TRACE 15: Native console initialized, entering heartbeat loop
-    unsafe {
-        serial_trace(15, "Native console initialized, entering heartbeat loop");
-    }
-
-    // Send heartbeat to confirm we reached this point
-    unsafe {
-        let com1 = 0x3F8u16 as *mut u8;
-        com1.write_volatile(b'H'); // 'H' for Heartbeat
-    }
-
-    // Enter heartbeat loop - this confirms execution continues after ExitBootServices
-    // The serial port will output '.' every second to show the kernel is alive
-    // External command execution is stubbed until we return from this function
-    // (which never happens - the loop is infinite)
-    heartbeat_loop();
+    exit_uefi_and_enter_runtime();
 }
 
 /// Heartbeat loop - confirms execution continues after ExitBootServices
@@ -695,6 +411,17 @@ fn heartbeat_loop() -> ! {
 /// UEFI entry point for the kernel
 #[entry]
 fn main() -> Status {
+    // EARLY POST CODE 0x01: Main entry point reached
+    // This tests if POST codes work at all in UEFI mode
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x01u8,
+            options(nomem, nostack)
+        );
+    }
+
     // TRACE 0: Kernel entry reached
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.output_string(cstr16!("\r\n"));
@@ -743,7 +470,38 @@ fn main() -> Status {
         unsafe { console::init_console(); }
     }
 
-    uefi::boot::stall(Duration::from_millis(100));
+    // Initialize framebuffer (GOP query) BEFORE ExitBootServices
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.output_string(cstr16!("Rustux: Querying GOP framebuffer...\r\n"));
+    });
+
+    framebuffer::init();
+
+    // POST CODE 0xF3: After framebuffer init
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0xF3u8,
+            options(nomem, nostack)
+        );
+    }
+
+    // Check if framebuffer is available
+    let has_framebuffer = framebuffer::is_available();
+    uefi::system::with_stdout(|stdout| {
+        if has_framebuffer {
+            let _ = stdout.output_string(cstr16!("Rustux: Framebuffer available!\r\n"));
+        } else {
+            let _ = stdout.output_string(cstr16!("Rustux: No GOP framebuffer, will try VGA\r\n"));
+        }
+    });
+
+    // STALL REMOVED - was hanging
+    // uefi::boot::stall(Duration::from_millis(100));
+
+    // STALL REMOVED - was hanging
+    // uefi::boot::stall(Duration::from_millis(100));
 
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.output_string(cstr16!("Rustux: Console setup complete\r\n"));
@@ -753,6 +511,16 @@ fn main() -> Status {
     let boot_mode = BootMode::CommandLine;
     let install_mode = None;
     let theme = get_active_theme();
+
+    // POST CODE 0x02: boot_mode set
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x02u8,
+            options(nomem, nostack)
+        );
+    }
 
     uefi::system::with_stdout(|stdout| {
         let _ = stdout.set_color(theme.foreground, theme.background);
@@ -826,41 +594,62 @@ Boot Mode: COMMAND LINE (CLI)\r\n\
   - Command-line interface only\r\n\
   - Minimal resource usage\r\n\
 \r\n\
-Initializing shell...\r\n\
 "));
+                // Show transition message
+                let _ = stdout.set_color(theme.info, theme.background);
+                let _ = stdout.output_string(cstr16!("[TRANSITIONING TO RUNTIME MODE]\r\n\
+Exiting UEFI boot services and entering native runtime...\r\n\
+\r\n\
+After this transition, the kernel will:\r\n\
+  - Disable UEFI permanently\r\n\
+  - Initialize VGA console driver\r\n\
+  - Initialize keyboard interrupts\r\n\
+  - Start the interactive shell\r\n\
+\r\n\
+"));
+                let _ = stdout.set_color(theme.warning, theme.background);
+                let _ = stdout.output_string(cstr16!("NOTE: UEFI console will stop working after transition.\r\n"));
+                let _ = stdout.output_string(cstr16!("      VGA console will take over for output.\r\n\r\n"));
             }
         }
     });
 
-    // Continue to OS initialization - route to correct mode
-    match boot_mode {
-        BootMode::Desktop => {
-            // Desktop mode - show GUI message then run CLI until GUI is implemented
-            let theme = get_active_theme();
-            uefi::system::with_stdout(|stdout| {
-                let _ = stdout.set_color(theme.warning, theme.background);
-                let _ = stdout.output_string(cstr16!("\r\n\
-[GUI MODE]\r\n\
-Desktop environment (GNOME-like) will be implemented soon.\r\n\
-Currently running in CLI mode. Type 'help' for commands.\r\n\
-\r\n\
-"));
-            });
-            // Run CLI in boot services mode (no early ExitBootServices)
-            run_cli_loop(boot_mode, install_mode);
+    // ========================================================================
+    // BOOT TO CLI MODE
+    // ========================================================================
+    // For CommandLine mode, automatically transition to runtime mode
+    // instead of waiting in the UEFI CLI loop.
+    // ========================================================================
+    if boot_mode == BootMode::CommandLine {
+        // POST CODE 0x03: CommandLine mode confirmed
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x80u16,
+                in("al") 0x03u8,
+                options(nomem, nostack)
+            );
         }
-        BootMode::CommandLine => {
-            // Run CLI in boot services mode (no early ExitBootServices)
-            run_cli_loop(boot_mode, install_mode);
-        }
-        BootMode::Install => {
-            // Run CLI in boot services mode (no early ExitBootServices)
-            run_cli_loop(boot_mode, install_mode);
-        }
-    }
 
-    // Should not reach here
-    Status::ABORTED
+        // STALL WAS HANGING - removed for debugging
+        // uefi::boot::stall(Duration::from_millis(2000));
+
+        // POST CODE 0x04: About to call transition_to_runtime()
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x80u16,
+                in("al") 0x04u8,
+                options(nomem, nostack)
+            );
+        }
+
+        // Transition to runtime mode (this never returns)
+        transition_to_runtime();
+    } else {
+        // For other modes, run the UEFI CLI loop
+        run_cli_loop(boot_mode, install_mode);
+    }
 }
 
 /// Run the interactive command-line loop

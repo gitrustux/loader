@@ -38,6 +38,21 @@ const VGA_HEIGHT: usize = 25;
 /// Default color: White on black
 const COLOR_DEFAULT: u16 = 0x0F00;
 
+/// VGA I/O ports
+const VGA_MISC_WRITE: u16 = 0x3C2;
+const VGA_CRTC_INDEX: u16 = 0x3D4;
+const VGA_CRTC_DATA: u16 = 0x3D5;
+
+/// Output byte to VGA port
+unsafe fn outb(port: u16, value: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") value,
+        options(nomem, nostack)
+    );
+}
+
 /// VGA Console state (static, no heap)
 struct VgaConsoleState {
     /// Current cursor row (0-24)
@@ -62,6 +77,39 @@ impl VgaConsoleState {
 /// Global console state
 static mut CONSOLE_STATE: VgaConsoleState = VgaConsoleState::new();
 
+/// Force VGA text mode 3 (80x25, 16 colors)
+///
+/// This function explicitly switches the VGA hardware to text mode,
+/// disabling any GOP/framebuffer mode that UEFI may have left active.
+/// This MUST be called before writing to 0xB8000 for reliable output.
+///
+/// ## Safety
+/// This function uses port I/O and must only be called after the
+/// kernel has gained control of the hardware (after UEFI boot).
+pub fn force_text_mode() {
+    unsafe {
+        // Select VGA color text mode (mode 3: 80x25, 16 colors)
+        // BIOS interrupt would be INT 10h, AH=00h, AL=03h
+        // But we're in protected mode, so we program VGA directly
+
+        // Set misc output register to select color mode and enable CPU access
+        // Bit 0-1: Clock select (00 = reserved, 01 = use 28.322 MHz)
+        // Bit 2: Disable internal video driver (0 = enable, 1 = disable)
+        // Bit 3: 64KB (0) or 32KB (1) memory address bit
+        // Bit 4: 0 = color emulation, 1 = mono emulation
+        // Bit 5-6: Horizontal sync polarity
+        // Bit 7: Vertical sync polarity
+        // For color text mode: 0x67 = 0110 0111 (CPU clock enable, color mode)
+        outb(VGA_MISC_WRITE, 0x67);
+
+        // Clear the entire screen to black
+        let vga_buffer = VGA_BUFFER as *mut u16;
+        for i in 0..(VGA_WIDTH * VGA_HEIGHT) {
+            vga_buffer.add(i).write_volatile(0x0F00 | (' ' as u16));
+        }
+    }
+}
+
 /// Initialize the VGA console
 ///
 /// This function clears the screen and resets the cursor position.
@@ -72,6 +120,209 @@ pub fn init() {
         CONSOLE_STATE.row = 0;
         CONSOLE_STATE.column = 0;
         CONSOLE_STATE.color = COLOR_DEFAULT;
+    }
+}
+
+/// Display a full-screen banner confirming VGA is working
+///
+/// This function writes directly to the VGA buffer to create a visible
+/// full-screen banner. This is a DETERMINISTIC test - if VGA text mode
+/// is working, you WILL see this screen.
+///
+/// ## Success Criteria
+/// - Blue background across entire screen
+/// - Yellow text with "RUSTUX KERNEL - RUNTIME MODE" on row 0
+/// - Multiple rows of status messages
+/// - A blinking cursor at bottom
+///
+/// If you don't see this, VGA text mode is NOT initialized.
+pub fn display_runtime_banner() {
+    unsafe {
+        let vga_buffer = VGA_BUFFER as *mut u16;
+
+        // Fill background with blue (color 0x1F00 = blue bg, white fg)
+        for i in 0..(VGA_WIDTH * VGA_HEIGHT) {
+            vga_buffer.add(i).write_volatile(0x1F00 | (' ' as u16));
+        }
+
+        // Row 0: Title (yellow on blue = 0x1E00)
+        let title = b"RUSTUX KERNEL - RUNTIME MODE - VGA ACTIVE";
+        let base = 0;
+        for (i, &byte) in title.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1E00 | (byte as u16));
+            }
+        }
+
+        // Row 2: Separator (white on blue = 0x1F00)
+        for i in 0..VGA_WIDTH {
+            vga_buffer.add(2 * VGA_WIDTH + i).write_volatile(0x1F00 | ('=' as u16));
+        }
+
+        // Row 4: Status (green on blue = 0x1A00)
+        let status = b"Status: VGA Text Mode Initialized";
+        let base = 4 * VGA_WIDTH;
+        for (i, &byte) in status.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1A00 | (byte as u16));
+            }
+        }
+
+        // Row 6: IDT status
+        let idt_msg = b"[ ] IDT loaded - Waiting for check";
+        let base = 6 * VGA_WIDTH;
+        for (i, &byte) in idt_msg.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1F00 | (byte as u16));
+            }
+        }
+
+        // Row 7: PIC status
+        let pic_msg = b"[ ] PIC configured - Waiting for check";
+        let base = 7 * VGA_WIDTH;
+        for (i, &byte) in pic_msg.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1F00 | (byte as u16));
+            }
+        }
+
+        // Row 8: IRQ1 status
+        let irq_msg = b"[ ] IRQ1 handler - Waiting for check";
+        let base = 8 * VGA_WIDTH;
+        for (i, &byte) in irq_msg.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1F00 | (byte as u16));
+            }
+        }
+
+        // Row 9: Interrupts enabled
+        let int_msg = b"[ ] Interrupts enabled - Waiting for STI";
+        let base = 9 * VGA_WIDTH;
+        for (i, &byte) in int_msg.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1F00 | (byte as u16));
+            }
+        }
+
+        // Row 11: Instructions (yellow on blue)
+        let instr = b"TESTING: Press any key to trigger IRQ1 interrupt";
+        let base = 11 * VGA_WIDTH;
+        for (i, &byte) in instr.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1E00 | (byte as u16));
+            }
+        }
+
+        // Row 12: More instructions
+        let instr2 = b"         If IRQ1 works, character will appear below";
+        let base = 12 * VGA_WIDTH;
+        for (i, &byte) in instr2.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1E00 | (byte as u16));
+            }
+        }
+
+        // Row 14: Keypress output area
+        for i in 0..VGA_WIDTH {
+            vga_buffer.add(14 * VGA_WIDTH + i).write_volatile(0x1F00 | ('-' as u16));
+        }
+
+        // Row 15: Output label
+        let output_label = b"IRQ1 Key Output (last key pressed):";
+        let base = 15 * VGA_WIDTH;
+        for (i, &byte) in output_label.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1A00 | (byte as u16));
+            }
+        }
+
+        // Row 17: Blinking cursor indicator
+        let cursor_row = 17 * VGA_WIDTH;
+        for i in 0..VGA_WIDTH {
+            if i == 40 {
+                // Cursor position (bright white on blue = 0x9F00)
+                vga_buffer.add(cursor_row + i).write_volatile(0x9F00 | (0xDB as u16)); // 0xDB = block character
+            } else {
+                vga_buffer.add(cursor_row + i).write_volatile(0x1F00 | (' ' as u16));
+            }
+        }
+
+        // Row 20-24: System info
+        let info1 = b"System Status: KERNEL ALIVE - Runtime Mode Active";
+        let base = 20 * VGA_WIDTH;
+        for (i, &byte) in info1.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x0F00 | (byte as u16));
+            }
+        }
+
+        let info2 = b"CPU Mode:     Protected Mode, Interrupts Disabled";
+        let base = 21 * VGA_WIDTH;
+        for (i, &byte) in info2.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x0F00 | (byte as u16));
+            }
+        }
+
+        let info3 = b"Next Step:    Waiting for interrupt verification...";
+        let base = 22 * VGA_WIDTH;
+        for (i, &byte) in info3.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x0F00 | (byte as u16));
+            }
+        }
+    }
+}
+
+/// Mark a checklist item as done
+///
+/// Updates the specified row with a green "[OK]" marker.
+///
+/// # Arguments
+/// * `row` - Row number (0-24) to update
+pub fn mark_checkpoint(row: usize) {
+    unsafe {
+        let vga_buffer = VGA_BUFFER as *mut u16;
+        if row < VGA_HEIGHT {
+            let base = row * VGA_WIDTH;
+            // Write "[OK]" in bright green (0x9A00)
+            vga_buffer.add(base).write_volatile(0x9A00 | ('[' as u16));
+            vga_buffer.add(base + 1).write_volatile(0x9A00 | ('O' as u16));
+            vga_buffer.add(base + 2).write_volatile(0x9A00 | ('K' as u16));
+            vga_buffer.add(base + 3).write_volatile(0x9A00 | (']' as u16));
+        }
+    }
+}
+
+/// Write a character to the key output area (row 16)
+///
+/// Used by the IRQ1 handler to display the last key pressed.
+///
+/// # Arguments
+/// * `c` - Character to display
+pub fn write_key_output(c: char) {
+    unsafe {
+        let vga_buffer = VGA_BUFFER as *mut u16;
+        let row = 16;
+        let base = row * VGA_WIDTH;
+
+        // Clear the line first
+        for i in 0..VGA_WIDTH {
+            vga_buffer.add(base + i).write_volatile(0x1F00 | (' ' as u16));
+        }
+
+        // Write the character in bright yellow (0x9E00) at center
+        let msg = b"Last key: ";
+        for (i, &byte) in msg.iter().enumerate() {
+            if i < VGA_WIDTH {
+                vga_buffer.add(base + i).write_volatile(0x1E00 | (byte as u16));
+            }
+        }
+
+        // Write the actual key (bright yellow on blue = 0x9E00)
+        let key_start = 11;
+        vga_buffer.add(base + key_start).write_volatile(0x9E00 | (c as u16));
+        vga_buffer.add(base + key_start + 1).write_volatile(0x9E00 | (' ' as u16));
     }
 }
 

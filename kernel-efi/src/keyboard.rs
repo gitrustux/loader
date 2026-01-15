@@ -225,8 +225,12 @@ pub extern "C" fn keyboard_irq_handler() {
 
                 // Ignore null bytes (unsupported keys)
                 if ascii != 0 {
-                    // Write to input buffer
+                    // Write to input buffer for shell (if shell is enabled)
                     INPUT_BUFFER.write(ascii);
+
+                    // ALWAYS write to VGA output area for IRQ1 testing
+                    // This provides immediate visual feedback that IRQ1 is working
+                    crate::vga_console::write_key_output(ascii as char);
                 }
             }
         }
@@ -238,8 +242,14 @@ pub extern "C" fn keyboard_irq_handler() {
 /// # Safety
 /// This function uses port I/O and must be called with proper synchronization.
 unsafe fn read_data_port() -> u8 {
-    let port = KEYBOARD_DATA_PORT as *mut u8;
-    port.read_volatile()
+    let mut value: u8;
+    core::arch::asm!(
+        "in al, dx",
+        inlateout("dx") KEYBOARD_DATA_PORT => _,
+        out("al") value,
+        options(nomem, nostack)
+    );
+    value
 }
 
 /// Check if keyboard has data available

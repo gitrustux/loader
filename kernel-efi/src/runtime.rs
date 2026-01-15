@@ -421,8 +421,9 @@ unsafe fn init_pic() {
 
     // Enable IRQ1 (keyboard) on PIC1
     // IRQ mask: 0 = enabled, 1 = disabled
-    // We enable IRQ0 (timer) and IRQ1 (keyboard)
-    outb(PIC1_DATA, 0xFC); // 0xFC = 11111100 (IRQ0 and IRQ1 enabled)
+    // We enable ONLY IRQ1 (keyboard) for now
+    // IRQ0 (timer) is DISABLED to allow HLT to actually idle the CPU
+    outb(PIC1_DATA, 0xFD); // 0xFD = 11111101 (IRQ1 enabled, IRQ0 disabled)
     outb(PIC2_DATA, 0xFF); // All IRQs on PIC2 disabled
 }
 

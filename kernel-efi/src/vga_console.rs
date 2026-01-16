@@ -17,7 +17,8 @@
 //! - No heap allocation (no Vec, String, Box)
 //!
 //! ## Usage
-//! ```rust
+
+#![allow(dead_code)] // Many items are for future features
 //! // Initialize console
 //! vga_console::init();
 //!

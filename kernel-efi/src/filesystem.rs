@@ -9,6 +9,10 @@
 //! This module provides a simple in-memory filesystem with embedded binaries
 //! that can be executed after ExitBootServices.
 
+#![allow(dead_code)] // Many items are for future features
+
+extern crate alloc;
+
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;

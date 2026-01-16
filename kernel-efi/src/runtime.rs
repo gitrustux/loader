@@ -15,6 +15,10 @@
 //! 4. Idle loop
 //! 5. Scheduler stub
 
+#![allow(dead_code)] // Many items are for future features
+
+extern crate alloc;
+
 use alloc::vec::Vec;
 
 /// Runtime initialization flags - track which components have been initialized
@@ -392,6 +396,62 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
     );
 }
 
+/// ============================================================================
+/// PHASE 10: Mouse Interrupt Handler (IRQ12)
+/// ============================================================================
+///
+/// IRQ12 is the mouse interrupt on x86_64.
+/// It corresponds to IDT vector 44 (32 + 12).
+///
+
+/// Mouse IRQ12 interrupt handler stub
+#[unsafe(naked)]
+unsafe extern "C" fn mouse_irq_stub() -> ! {
+    core::arch::naked_asm!(
+        // Save all general-purpose registers
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // Call the mouse handler
+        "call {handler}",
+        // Restore registers
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        // Send EOI to both PICs (IRQ12 is on PIC2)
+        "mov al, 0x20",
+        "out 0xA0, al",
+        "out 0x20, al",
+        // Return from interrupt
+        "iretq",
+        handler = sym crate::mouse::mouse_irq_handler
+    );
+}
+
 /// PIC (Programmable Interrupt Controller) I/O ports
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -401,7 +461,7 @@ const PIC2_DATA: u16 = 0xA1;
 /// Initialize the PIC for IRQ handling
 ///
 /// This function remaps the PIC IRQs to vectors 32-47 and enables
-/// the keyboard IRQ (IRQ1).
+/// the keyboard IRQ (IRQ1) and mouse IRQ (IRQ12).
 unsafe fn init_pic() {
     // ICW1: Initialize PIC, requires ICW4
     outb(PIC1_COMMAND, 0x11);
@@ -419,12 +479,17 @@ unsafe fn init_pic() {
     outb(PIC1_DATA, 0x01);
     outb(PIC2_DATA, 0x01);
 
-    // Enable IRQ1 (keyboard) on PIC1
+    // Enable IRQ1 (keyboard) on PIC1, IRQ2 (cascade) must be enabled
     // IRQ mask: 0 = enabled, 1 = disabled
-    // We enable ONLY IRQ1 (keyboard) for now
+    // We enable IRQ1 (keyboard) and IRQ2 (cascade to PIC2)
     // IRQ0 (timer) is DISABLED to allow HLT to actually idle the CPU
-    outb(PIC1_DATA, 0xFD); // 0xFD = 11111101 (IRQ1 enabled, IRQ0 disabled)
-    outb(PIC2_DATA, 0xFF); // All IRQs on PIC2 disabled
+    outb(PIC1_DATA, 0xF9); // 0xF9 = 11111001 (IRQ0, IRQ1 disabled? wait let me recalculate)
+    // 0xF9 = 11111001: bits 0-7
+    // bit 0 (IRQ0 timer) = 1 -> disabled
+    // bit 1 (IRQ1 keyboard) = 0 -> enabled
+    // bit 2 (IRQ2 cascade) = 0 -> enabled (required for PIC2)
+    // bits 3-7 = 1 -> disabled
+    outb(PIC2_DATA, 0xEF); // 0xEF = 11101111 (IRQ12 enabled, others disabled)
 }
 
 /// Output byte to I/O port
@@ -461,6 +526,26 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Initialize mouse interrupt handler
+pub unsafe fn init_mouse_interrupts() -> Result<(), &'static str> {
+    // Get kernel code segment selector
+    let kernel_cs: u16;
+    core::arch::asm!(
+        "mov {0:x}, cs",
+        out(reg) kernel_cs,
+        options(nomem, nostack, preserves_flags)
+    );
+
+    // Set up IDT entry for IRQ12 (mouse) at vector 44
+    let mouse_handler = mouse_irq_stub as u64;
+    IDT[44] = IdtEntry::interrupt_gate(mouse_handler, kernel_cs);
+
+    // Initialize mouse driver
+    crate::mouse::init();
+
+    Ok(())
+}
+
 /// Default exception handler
 extern "C" fn default_exception_handler(_error_code: usize, rip: usize, _cs: usize, _rflags: usize) {
     // Write exception info to VGA
@@ -469,7 +554,7 @@ extern "C" fn default_exception_handler(_error_code: usize, rip: usize, _cs: usi
 
         // Clear top line and write exception message
         let msg = b"EXCEPTION! RIP=";
-        let mut ptr = vga_buffer;
+        let ptr = vga_buffer;
         for (i, &byte) in msg.iter().enumerate() {
             if i < 80 {
                 *ptr.add(i) = 0x4F00 | (byte as u16); // Red on white
@@ -477,9 +562,9 @@ extern "C" fn default_exception_handler(_error_code: usize, rip: usize, _cs: usi
         }
 
         // Write RIP in hex at end of message
-        let mut ptr = vga_buffer.add(msg.len());
+        let ptr = vga_buffer.add(msg.len());
         let hex = b"0123456789ABCDEF";
-        let mut rip_val = rip as u64;
+        let rip_val = rip as u64;
         for i in 0..16 {
             let nibble = (rip_val >> (60 - i * 4)) & 0xF;
             *ptr.add(i) = 0x4F00 | (hex[nibble as usize] as u16);
@@ -558,7 +643,7 @@ unsafe fn init_exception_handlers_impl() -> bool {
     // Write success message to VGA
     let vga_buffer = 0xB8000u64 as *mut u16;
     let msg = "IDT OK!";
-    let mut ptr = vga_buffer.add(70); // Column 70
+    let ptr = vga_buffer.add(70); // Column 70
     for (i, &byte) in msg.as_bytes().iter().enumerate() {
         if i < 10 {
             *ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
@@ -880,7 +965,7 @@ pub unsafe fn init_kernel_allocator_from_memory_map(
     // Write success message to VGA
     let vga_buffer = 0xB8000u64 as *mut u16;
     let msg = "ALLOC OK!";
-    let mut ptr = vga_buffer.add(40); // Start at column 40
+    let ptr = vga_buffer.add(40); // Start at column 40
     for (i, &byte) in msg.as_bytes().iter().enumerate() {
         if i < 10 {
             *ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
@@ -897,6 +982,44 @@ pub unsafe fn get_kernel_allocator() -> Option<&'static mut BumpAllocator> {
     } else {
         None
     }
+}
+
+/// Simplified kernel allocator initialization (for after ExitBootServices)
+///
+/// This function initializes the kernel bump allocator with a known
+/// memory region. It's called after ExitBootServices when we've already
+/// identified a suitable conventional memory region.
+///
+/// # Arguments
+/// * `start` - Physical start address of the memory region
+/// * `size` - Size of the memory region in bytes (must be >= 1MB)
+///
+/// # Safety
+/// Must be called exactly once after ExitBootServices.
+/// The memory region must be valid conventional memory.
+pub unsafe fn init_kernel_allocator_simple(start: u64, size: u64) -> Result<(), &'static str> {
+    if size < 1024 * 1024 {
+        return Err("Memory region too small (need at least 1MB)");
+    }
+
+    // Initialize the bump allocator with 1MB heap
+    let heap_start = start;
+    let heap_size = 1024 * 1024; // 1MB
+
+    KERNEL_ALLOCATOR_STORAGE = BumpAllocator::new(heap_start, heap_size);
+    KERNEL_ALLOCATOR_INITIALIZED = true;
+
+    // Write success message to VGA (optional, for debugging)
+    let vga_buffer = 0xB8000u64 as *mut u16;
+    let msg = "ALLOC OK!";
+    let ptr = vga_buffer.add(40); // Start at column 40
+    for (i, &byte) in msg.as_bytes().iter().enumerate() {
+        if i < 10 {
+            *ptr.add(i) = 0x0E00 | (byte as u16); // Yellow on black
+        }
+    }
+
+    Ok(())
 }
 
 /// Memory descriptor for kernel runtime (matches UEFI memory descriptor)
@@ -1364,7 +1487,7 @@ pub unsafe fn disable_uefi_services_permanently() -> Result<(), &'static str> {
     const VGA_BUFFER: u64 = 0xB8000;
     let vga_buffer = VGA_BUFFER as *mut u16;
     let msg = "UEFI DISABLED!";
-    let mut ptr = vga_buffer.add(130); // Column 130 (after KBD status)
+    let ptr = vga_buffer.add(130); // Column 130 (after KBD status)
     for (i, &byte) in msg.as_bytes().iter().enumerate() {
         if i < 15 {
             *ptr.add(i) = 0x0900 | (byte as u16); // Blue on black

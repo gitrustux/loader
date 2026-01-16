@@ -9,6 +9,8 @@
 //! This module provides native console output after ExitBootServices.
 //! It supports both framebuffer-based console and serial console fallback.
 
+#![allow(dead_code)] // Many items are for future features
+
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::ptr::NonNull;
 

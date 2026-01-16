@@ -18,6 +18,8 @@
 //! ## Syscall Numbers
 //! - sys_write: 1 (write to stdout)
 //! - sys_read: 2 (read from stdin)
+
+#![allow(dead_code)] // Many items are for future features
 //! - sys_exit: 60 (terminate process)
 //!
 //! ## Usage

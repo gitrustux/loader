@@ -252,9 +252,13 @@ unsafe fn keyboard_write(cmd: u8) {
 }
 
 /// Flush output buffer (read any pending data)
+///
+/// CRITICAL: This flushes stale scan codes from the keyboard buffer.
+/// If buffer has stale data (like repeated 0x20), all keys will show 'd'.
 unsafe fn flush_output_buffer() {
     let mut count = 0;
-    while controller_status() & 0x01 != 0 && count < 16 {
+    // Increased from 16 to 128 to handle more stale data
+    while controller_status() & 0x01 != 0 && count < 128 {
         let _ = read_data_port();
         count += 1;
     }
@@ -312,6 +316,13 @@ unsafe fn ps2_controller_init() {
 }
 
 /// Initialize PS/2 keyboard device
+///
+/// This performs the standard PS/2 keyboard initialization sequence:
+/// 1. Disable scanning
+/// 2. Wait for ACK
+/// 3. Flush buffer
+/// 4. Enable scanning
+/// 5. Wait for ACK
 unsafe fn ps2_keyboard_init() {
     // 1. Disable scanning
     keyboard_write(KBD_DISABLE_SCANNING);
@@ -319,12 +330,21 @@ unsafe fn ps2_keyboard_init() {
     // 2. Wait for ACK (0xFA)
     if let Some(resp) = keyboard_read_timeout() {
         if resp != KBD_ACK {
-            // No ACK, but continue anyway
+            // No ACK, but continue anyway - keyboard may not respond properly
         }
     }
 
-    // 3. Flush any remaining data
+    // 3. Flush any remaining data AND clear any stale scan codes
+    // This is CRITICAL - stale scan codes cause the "all keys show 'd'" bug
     flush_output_buffer();
+
+    // Additional flush - read up to 256 times to ensure buffer is completely clear
+    for _ in 0..256 {
+        if controller_status() & 0x01 == 0 {
+            break; // Buffer is empty
+        }
+        let _ = read_data_port();
+    }
 
     // 4. Enable scanning
     keyboard_write(KBD_ENABLE_SCANNING);
@@ -332,8 +352,14 @@ unsafe fn ps2_keyboard_init() {
     // 5. Wait for ACK (0xFA)
     if let Some(resp) = keyboard_read_timeout() {
         if resp != KBD_ACK {
-            // No ACK, but continue anyway
+            // No ACK, but continue anyway - keyboard may still work
         }
+    }
+
+    // 6. Give keyboard time to stabilize after enabling scanning
+    // This ensures IRQs start working properly
+    for _ in 0..100000 {
+        core::arch::asm!("nop", options(nomem, nostack));
     }
 }
 
@@ -347,6 +373,7 @@ unsafe fn ps2_keyboard_init() {
 /// 1. Resets input buffer and shift state
 /// 2. Initializes PS/2 controller (enables IRQ1)
 /// 3. Initializes keyboard device (enables scanning)
+/// 4. Flushes stale keyboard data
 pub fn init() {
     unsafe {
         // Reset state
@@ -358,6 +385,18 @@ pub fn init() {
 
         // Initialize keyboard device
         ps2_keyboard_init();
+
+        // CRITICAL: Flush any stale scan codes from keyboard buffer
+        // This prevents the "all keys show 'd'" bug on boot
+        flush_output_buffer();
+
+        // Additional thorough flush - clear any remaining stale data
+        for _ in 0..256 {
+            if controller_status() & 0x01 == 0 {
+                break; // Buffer is empty
+            }
+            let _ = read_data_port();
+        }
     }
 }
 
@@ -557,13 +596,16 @@ pub fn read_line(buffer: &mut [u8]) -> usize {
 ///
 /// This function polls the keyboard hardware for input, checking
 /// the controller status and filtering out invalid data.
+///
+/// IMPORTANT: We do NOT flush on every read to avoid clearing data we need.
+/// Only flush if we're seeing obviously invalid status.
 unsafe fn poll_read() -> Option<char> {
     // Check controller status
     let status = controller_status();
 
     // Check if data is available (bit 0)
     if status & 0x01 == 0 {
-        return None;
+        return None; // No data available yet
     }
 
     // Ignore mouse data (bit 5)
@@ -583,26 +625,20 @@ unsafe fn poll_read() -> Option<char> {
     // Read scan code from data port
     let scan_code = read_data_port();
 
-    // Check if this is a release code (0x80 prefix)
-    if scan_code & 0x80 != 0 {
-        return None; // Ignore release codes for polling
-    }
+    // Check if this is a release code (bit 7 set)
+    if scan_code & 0x80 == 0 {
+        // Make code (key press) - convert to ASCII
+        if (scan_code as usize) < SCAN_CODE_TO_ASCII.len() {
+            let ascii = SCAN_CODE_TO_ASCII[scan_code as usize];
 
-    // Convert scan code to ASCII
-    if (scan_code as usize) < SCAN_CODE_TO_ASCII.len() {
-        let mut ascii = SCAN_CODE_TO_ASCII[scan_code as usize];
-
-        // No shift handling in polling (keep it simple)
-        if ascii != 0 {
-            // Echo the character to screen
-            crate::framebuffer::write_str_color(
-                core::str::from_utf8_unchecked(&[ascii]),
-                crate::framebuffer::colors::encode(crate::framebuffer::colors::GREEN)
-            );
-
-            return Some(ascii as char);
+            // No shift handling in polling (keep it simple)
+            if ascii != 0 {
+                return Some(ascii as char);
+            }
         }
     }
+
+    // Break codes are ignored for polling (already handled above)
 
     None
 }
@@ -627,6 +663,9 @@ pub fn flush() {
 /// doesn't, then IRQ1 is not firing.
 pub fn try_read_char_direct() -> Option<char> {
     unsafe {
+        // First, flush any stale data that might be stuck in the buffer
+        flush_output_buffer();
+
         // Check controller status
         let status = controller_status();
 

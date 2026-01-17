@@ -250,6 +250,14 @@ fn main() -> Status {
     // Initialize runtime (IDT, PIC, etc)
     framebuffer::write_str("Initializing interrupts...\n");
     unsafe {
+        // POST CODE 0x41: About to init exception handlers
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x41u8,
+            options(nomem, nostack)
+        );
+
         // Initialize exception handlers (IDT)
         if let Err(e) = runtime::init_exception_handlers() {
             framebuffer::write_str("Exception handler init FAILED: ");
@@ -259,6 +267,14 @@ fn main() -> Status {
                 core::arch::asm!("hlt");
             }
         }
+
+        // POST CODE 0x42: Exception handlers initialized
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x42u8,
+            options(nomem, nostack)
+        );
 
         // Initialize keyboard interrupts (IRQ1)
         if let Err(e) = runtime::init_keyboard_interrupts() {
@@ -270,10 +286,18 @@ fn main() -> Status {
             framebuffer::write_str("Keyboard initialized\n");
         }
 
+        // POST CODE 0x43: Keyboard initialized
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x80u16,
+            in("al") 0x43u8,
+            options(nomem, nostack)
+        );
+
         // Initialize mouse interrupts (IRQ12)
         // DISABLED: Keyboard-only for now (mouse driver needs further testing)
         /*
-        if let Err(e) = runtime::init_mouse_interrupts() {
+        if let Err(e) runtime::init_mouse_interrupts() {
             framebuffer::write_str("Mouse init FAILED: ");
             framebuffer::write_str(e);
             framebuffer::write_str("\n");
@@ -284,9 +308,54 @@ fn main() -> Status {
         */
 
         // Enable interrupts so IRQ handlers can work
+        // POST CODE 0x44: About to enable interrupts
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x80u16,
+                in("al") 0x44u8,
+                options(nomem, nostack)
+            );
+        }
+
         core::arch::asm!("sti");
+
+        // POST CODE 0x45: Interrupts enabled
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x80u16,
+                in("al")   0x45u8,
+                options(nomem, nostack)
+            );
+        }
     }
     framebuffer::write_str("Interrupts enabled\n");
+
+    // POST CODE 0x46: About to enter shell
+    unsafe {
+        core::arch::asm!(
+        "out dx, al",
+        in("dx") 0x80u16,
+        in("al") 0x46u8,
+        options(nomem, nostack)
+    );
+    }
+
+    // Jump into shell
+    framebuffer::write_str("Starting shell...\n");
+
+    // POST CODE 0x47: In shell
+    // POST CODE 0x48: About to run_shell()
+    // POST CODE 0x49: In run_shell
+    // POST CODE 0x4A: In run_shell loop
+    // POST CODE 0x4B: In read_line
+    // POST CODE 0x4C: In poll_read
+    // POST CODE 0x4D: In keyboard_irq_handler
+    // ... etc...
+
+    // Jump into shell
+    shell::run_shell();
 
     // Jump into shell
     framebuffer::write_str("Starting shell...\n");

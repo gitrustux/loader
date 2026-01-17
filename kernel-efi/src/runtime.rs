@@ -353,6 +353,11 @@ static EXCEPTION_STUBS: [unsafe extern "C" fn() -> !; 32] = [
 #[unsafe(naked)]
 unsafe extern "C" fn keyboard_irq_stub() -> ! {
     core::arch::naked_asm!(
+        // === IRQ1 ENTRY PROOF: Marker at column 1 (top line, second char) ===
+        // If this appears, IRQ1 IS reaching the CPU
+        "mov rax, 0xB8001",
+        "mov word ptr [rax], 0x4F21",  // '!' in red on white
+        // === END ENTRY PROOF ===
         // Save all general-purpose registers
         "push rax",
         "push rbx",
@@ -386,10 +391,12 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
         "pop rdx",
         "pop rcx",
         "pop rbx",
+        // Save rax before using it for APIC EOI
+        "push rax",
+        // Send EOI to Local APIC (EOI register at offset 0x40 from base 0xFEE00000)
+        "mov eax, 0xFEE00040",
+        "mov dword ptr [rax], 0",
         "pop rax",
-        // Send EOI to PIC
-        "mov al, 0x20",
-        "out 0x20, al",
         // Return from interrupt
         "iretq",
         handler = sym crate::keyboard::keyboard_irq_handler
@@ -470,6 +477,19 @@ unsafe fn init_pic() {
     // Note: No VGA write here - caller handles visual confirmation
 }
 
+/// Explicitly unmask IRQ1 on master PIC (keyboard enable)
+/// This is the critical step that enables IRQ1 delivery to CPU
+unsafe fn unmask_irq1() {
+    const PIC1_DATA: u16 = 0x21;
+    // 0xFD = 11111101: bit 1 (IRQ1 keyboard) = 0 -> enabled
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") PIC1_DATA,
+        in("al") 0xFDu8,
+        options(nomem, nostack)
+    );
+}
+
 /// Output byte to I/O port
 #[inline(always)]
 unsafe fn outb(port: u16, value: u8) {
@@ -521,29 +541,67 @@ pub unsafe fn pic_get_isr() -> (u8, u8) {
     (pic1_isr, pic2_isr)
 }
 
-/// Initialize keyboard interrupt handler
+/// Initialize keyboard interrupt handler for UEFI x86_64 (APIC mode)
+///
+/// UEFI firmware routes hardware interrupts through IOAPIC → Local APIC,
+/// not the legacy 8259 PIC. This function enables the Local APIC and
+/// configures the IOAPIC to route keyboard IRQ1 to vector 33.
 pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
-    // Initialize PIC (remap IRQs, unmask IRQ1)
-    init_pic();
+    // ================================================================
+    // UEFI APIC INTERRUPT SETUP
+    // ================================================================
+    // UEFI firmware uses IOAPIC + Local APIC for interrupt routing.
+    // Legacy PIC is NOT functional under UEFI.
 
-    // VISUAL CONFIRMATION: PIC init complete
-    // Write "PIC!" to VGA at column 60 (yellow on black)
+    // --- 1️⃣ Enable Local APIC ---
+    const LOCAL_APIC_BASE: u64 = 0xFEE0_0000;
+    const LAPIC_SVR_OFFSET: usize = 0x70; // Spurious Vector Register
+    const LAPIC_TPR_OFFSET: usize = 0x30; // Task Priority Register
+
+    let lapic_svr = (LOCAL_APIC_BASE + LAPIC_SVR_OFFSET as u64) as *mut u32;
+    let lapic_tpr = (LOCAL_APIC_BASE + LAPIC_TPR_OFFSET as u64) as *mut u32;
+
+    // Enable Local APIC (set bit 8) and set spurious vector to 0xFF
+    lapic_svr.write_volatile(0x100 | 0xFF);
+    // Allow all interrupts (TPR = 0)
+    lapic_tpr.write_volatile(0);
+
+    // --- 2️⃣ Initialize IOAPIC ---
+    const IOAPIC_BASE: u64 = 0xFEC0_0000;
+    const IOAPIC_IOREGSEL: u64 = 0x00;
+    const IOAPIC_IOWIN: u64 = 0x10;
+    const IRQ1_REDIR_OFFSET: u32 = 0x12; // Redirection table for IRQ1 (low dword)
+
+    let ioapic_sel = (IOAPIC_BASE + IOAPIC_IOREGSEL) as *mut u32;
+    let ioapic_win = (IOAPIC_BASE + IOAPIC_IOWIN) as *mut u32;
+
+    const IRQ1_VECTOR: u32 = 33; // Vector assigned to keyboard IRQ1
+    // Redirection entry: edge-triggered, active-high, not masked, fixed delivery
+    let low_dword = IRQ1_VECTOR; // Bits 0-7: vector 33, bits 8-10: fixed delivery (0), bit 16: not masked (0)
+    let high_dword = 0; // Destination CPU 0 (BSP)
+
+    // Write low dword of IRQ1 redirection entry
+    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET);
+    ioapic_win.write_volatile(low_dword);
+    // Write high dword of IRQ1 redirection entry
+    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET + 1);
+    ioapic_win.write_volatile(high_dword);
+
+    // --- VISUAL CONFIRMATION: IOAPIC init complete ---
     const VGA_BUFFER: u64 = 0xB8000;
     let vga = VGA_BUFFER as *mut u16;
-    let msg = b"PIC!";
+    let msg = b"IOAPIC!";
     for (i, &byte) in msg.iter().enumerate() {
-        *vga.add(60 + i) = 0x0E00 | (byte as u16);
+        *vga.add(58 + i) = 0x0E00 | (byte as u16);
     }
 
-    // Get kernel code segment selector
+    // --- 3️⃣ IDT entry for IRQ1 (vector 33) ---
     let kernel_cs: u16;
     core::arch::asm!(
         "mov {0:x}, cs",
         out(reg) kernel_cs,
         options(nomem, nostack, preserves_flags)
     );
-
-    // Set up IDT entry for IRQ1 (keyboard) at vector 33
     let keyboard_handler = keyboard_irq_stub as *const () as u64;
     IDT[33] = IdtEntry::interrupt_gate(keyboard_handler, kernel_cs);
 
@@ -554,7 +612,7 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     );
     load_idt(&idt_ptr);
 
-    // Initialize keyboard driver
+    // --- 4️⃣ Initialize keyboard driver ---
     crate::keyboard::init();
 
     Ok(())

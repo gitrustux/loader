@@ -80,6 +80,11 @@ const BUILT_IN_COMMANDS: &[Command] = &[
         description: "Show PIC configuration",
         handler: cmd_pic,
     },
+    Command {
+        name: "flush",
+        description: "Flush keyboard buffer (fixes stale keys)",
+        handler: cmd_flush,
+    },
 ];
 
 /// Run the Rustux CLI shell
@@ -356,6 +361,18 @@ fn cmd_pic_print_bits(value: u8) {
     let l = if hex_lo < 10 { b'0' + hex_lo } else { b'A' + hex_lo - 10 };
     framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[h, l]) });
     framebuffer::write_str(")");
+}
+
+/// Command: flush - Flush keyboard buffer
+fn cmd_flush(_args: &[&str]) {
+    framebuffer::write_str("Flushing keyboard buffer...\n");
+
+    // Call the keyboard flush function
+    keyboard::flush();
+
+    framebuffer::write_str_color("Keyboard buffer flushed!\n", framebuffer::colors::encode(framebuffer::colors::GREEN));
+    framebuffer::write_str("If keys still show wrong characters, IRQ1 may not be firing.\n");
+    framebuffer::write_str("Try typing to see if input works now.\n");
 }
 
 /// Simple integer to string conversion (for small numbers)

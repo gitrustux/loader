@@ -396,62 +396,6 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
     );
 }
 
-/// ============================================================================
-/// PHASE 10: Mouse Interrupt Handler (IRQ12)
-/// ============================================================================
-///
-/// IRQ12 is the mouse interrupt on x86_64.
-/// It corresponds to IDT vector 44 (32 + 12).
-///
-
-/// Mouse IRQ12 interrupt handler stub
-#[unsafe(naked)]
-unsafe extern "C" fn mouse_irq_stub() -> ! {
-    core::arch::naked_asm!(
-        // Save all general-purpose registers
-        "push rax",
-        "push rbx",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push rbp",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        // Call the mouse handler
-        "call {handler}",
-        // Restore registers
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rbp",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rbx",
-        "pop rax",
-        // Send EOI to both PICs (IRQ12 is on PIC2)
-        "mov al, 0x20",
-        "out 0xA0, al",
-        "out 0x20, al",
-        // Return from interrupt
-        "iretq",
-        handler = sym crate::mouse::mouse_irq_handler
-    );
-}
-
 /// PIC (Programmable Interrupt Controller) I/O ports
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -461,35 +405,69 @@ const PIC2_DATA: u16 = 0xA1;
 /// Initialize the PIC for IRQ handling
 ///
 /// This function remaps the PIC IRQs to vectors 32-47 and enables
-/// the keyboard IRQ (IRQ1) and mouse IRQ (IRQ12).
+/// the keyboard IRQ (IRQ1).
+///
+/// CRITICAL: The 8259 PIC requires I/O delays between writes.
+/// Each outb must be followed by a delay for the PIC to process.
+/// We use the canonical port 0x80 delay method for architectural serialization.
 unsafe fn init_pic() {
-    // ICW1: Initialize PIC, requires ICW4
+    /// Architecturally serializing I/O delay
+    ///
+    /// Port 0x80 is the legacy "debug" port used for POST codes.
+    /// Writing to it guarantees I/O serialization on all x86 CPUs.
+    /// This is the canonical delay mechanism for PIC operations.
+    #[inline(always)]
+    unsafe fn io_delay() {
+        // Dummy write to port 0x80 (POST code port)
+        // This serializes all I/O and is the standard PIC delay
+        outb(0x80, 0);
+    }
+
+    // ========== ICW1: Initialize PIC, requires ICW4 ==========
     outb(PIC1_COMMAND, 0x11);
+    io_delay();
     outb(PIC2_COMMAND, 0x11);
+    io_delay();
 
-    // ICW2: Vector offset (32 for PIC1, 40 for PIC2)
-    outb(PIC1_DATA, 0x20); // PIC1: IRQ0-7 -> vectors 32-39
-    outb(PIC2_DATA, 0x28); // PIC2: IRQ8-15 -> vectors 40-47
+    // ========== ICW2: Vector offset ==========
+    // PIC1: IRQ0-7 -> vectors 32-39
+    // PIC2: IRQ8-15 -> vectors 40-47
+    outb(PIC1_DATA, 0x20);
+    io_delay();
+    outb(PIC2_DATA, 0x28);
+    io_delay();
 
-    // ICW3: PIC wiring (PIC2 is at IRQ2 on PIC1)
+    // ========== ICW3: PIC wiring (cascading) ==========
+    // PIC2 is at IRQ2 on PIC1
     outb(PIC1_DATA, 0x04);
+    io_delay();
     outb(PIC2_DATA, 0x02);
+    io_delay();
 
-    // ICW4: 8086 mode
+    // ========== ICW4: 8086 mode ==========
     outb(PIC1_DATA, 0x01);
+    io_delay();
     outb(PIC2_DATA, 0x01);
+    io_delay();
 
-    // Enable IRQ1 (keyboard) on PIC1, IRQ2 (cascade) must be enabled
+    // ========== IRQ MASK: Enable only keyboard ==========
     // IRQ mask: 0 = enabled, 1 = disabled
     // We enable IRQ1 (keyboard) and IRQ2 (cascade to PIC2)
-    // IRQ0 (timer) is DISABLED to allow HLT to actually idle the CPU
-    outb(PIC1_DATA, 0xF9); // 0xF9 = 11111001 (IRQ0, IRQ1 disabled? wait let me recalculate)
-    // 0xF9 = 11111001: bits 0-7
-    // bit 0 (IRQ0 timer) = 1 -> disabled
-    // bit 1 (IRQ1 keyboard) = 0 -> enabled
-    // bit 2 (IRQ2 cascade) = 0 -> enabled (required for PIC2)
-    // bits 3-7 = 1 -> disabled
-    outb(PIC2_DATA, 0xEF); // 0xEF = 11101111 (IRQ12 enabled, others disabled)
+    // IRQ0 (timer) is DISABLED
+    //
+    // PIC1 mask 0xF9 = 11111001:
+    //   bit 0 (IRQ0 timer)   = 1 -> disabled
+    //   bit 1 (IRQ1 keyboard) = 0 -> ENABLED ✓
+    //   bit 2 (IRQ2 cascade) = 0 -> ENABLED (required for PIC2)
+    //   bits 3-7 = 1 -> disabled
+    outb(PIC1_DATA, 0xF9);
+    io_delay();
+
+    // PIC2 mask 0xFF = 11111111 (all disabled - no mouse/other devices)
+    outb(PIC2_DATA, 0xFF);
+    io_delay();
+
+    // Note: No VGA write here - caller handles visual confirmation
 }
 
 /// Output byte to I/O port
@@ -503,10 +481,59 @@ unsafe fn outb(port: u16, value: u8) {
     );
 }
 
+/// Input byte from I/O port
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    core::arch::asm!(
+        "in al, dx",
+        inlateout("dx") port => _,
+        out("al") value,
+        options(nomem, nostack)
+    );
+    value
+}
+
+/// Read PIC masks for debugging
+pub unsafe fn pic_get_masks() -> (u8, u8) {
+    let pic1_mask = inb(PIC1_DATA);
+    let pic2_mask = inb(PIC2_DATA);
+    (pic1_mask, pic2_mask)
+}
+
+/// Read PIC IRQ request register
+pub unsafe fn pic_get_irr() -> (u8, u8) {
+    // Read IRR requires sending OCW3 first
+    outb(PIC1_COMMAND, 0x0A); // OCW3: read IRR
+    outb(PIC2_COMMAND, 0x0A);
+    let pic1_irr = inb(PIC1_COMMAND);
+    let pic2_irr = inb(PIC2_COMMAND);
+    (pic1_irr, pic2_irr)
+}
+
+/// Read PIC in-service register
+pub unsafe fn pic_get_isr() -> (u8, u8) {
+    // Read ISR requires sending OCW3 first
+    outb(PIC1_COMMAND, 0x0B); // OCW3: read ISR
+    outb(PIC2_COMMAND, 0x0B);
+    let pic1_isr = inb(PIC1_COMMAND);
+    let pic2_isr = inb(PIC2_COMMAND);
+    (pic1_isr, pic2_isr)
+}
+
 /// Initialize keyboard interrupt handler
 pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
-    // Initialize PIC
+    // Initialize PIC (remap IRQs, unmask IRQ1)
     init_pic();
+
+    // VISUAL CONFIRMATION: PIC init complete
+    // Write "PIC!" to VGA at column 60 (yellow on black)
+    const VGA_BUFFER: u64 = 0xB8000;
+    let vga = VGA_BUFFER as *mut u16;
+    let msg = b"PIC!";
+    for (i, &byte) in msg.iter().enumerate() {
+        *vga.add(60 + i) = 0x0E00 | (byte as u16);
+    }
 
     // Get kernel code segment selector
     let kernel_cs: u16;
@@ -517,31 +544,18 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     );
 
     // Set up IDT entry for IRQ1 (keyboard) at vector 33
-    let keyboard_handler = keyboard_irq_stub as u64;
+    let keyboard_handler = keyboard_irq_stub as *const () as u64;
     IDT[33] = IdtEntry::interrupt_gate(keyboard_handler, kernel_cs);
+
+    // Reload IDT to ensure the keyboard IRQ entry is visible
+    let idt_ptr = IdtPointer::new(
+        &IDT as *const _ as u64,
+        (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16
+    );
+    load_idt(&idt_ptr);
 
     // Initialize keyboard driver
     crate::keyboard::init();
-
-    Ok(())
-}
-
-/// Initialize mouse interrupt handler
-pub unsafe fn init_mouse_interrupts() -> Result<(), &'static str> {
-    // Get kernel code segment selector
-    let kernel_cs: u16;
-    core::arch::asm!(
-        "mov {0:x}, cs",
-        out(reg) kernel_cs,
-        options(nomem, nostack, preserves_flags)
-    );
-
-    // Set up IDT entry for IRQ12 (mouse) at vector 44
-    let mouse_handler = mouse_irq_stub as u64;
-    IDT[44] = IdtEntry::interrupt_gate(mouse_handler, kernel_cs);
-
-    // Initialize mouse driver
-    crate::mouse::init();
 
     Ok(())
 }

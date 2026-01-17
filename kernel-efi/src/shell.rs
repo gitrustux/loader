@@ -23,7 +23,6 @@
 
 use crate::framebuffer;
 use crate::keyboard;
-use crate::mouse;
 use alloc::vec::Vec;
 
 /// Command buffer size
@@ -67,29 +66,50 @@ const BUILT_IN_COMMANDS: &[Command] = &[
         handler: cmd_mem,
     },
     Command {
-        name: "mouse",
-        description: "Show mouse status",
-        handler: cmd_mouse,
+        name: "irq",
+        description: "Show keyboard IRQ debug info",
+        handler: cmd_irq,
+    },
+    Command {
+        name: "kbd",
+        description: "Test keyboard input (non-blocking)",
+        handler: cmd_kbd,
+    },
+    Command {
+        name: "pic",
+        description: "Show PIC configuration",
+        handler: cmd_pic,
     },
 ];
 
 /// Run the Rustux CLI shell
 ///
 /// This function never returns. It continuously:
-/// 1. Prints the prompt "rustux> "
+/// 1. Prints the prompt with Dracula theme colors
 /// 2. Reads a line from the keyboard
 /// 3. Parses and executes the command
 /// 4. Repeats
 pub fn run_shell() -> ! {
-    // Print shell header
-    framebuffer::write_str("\n\n*** RUSTUX SHELL v0.1 ***\n");
-    framebuffer::write_str("Type 'help' for available commands.\n\n");
+    // Dracula theme colors
+    use framebuffer::colors;
+
+    // Print shell header with Dracula theme
+    framebuffer::write_str_color("\n\n*** RUSTUX SHELL v0.1 ***", colors::encode(colors::GREEN));
+    framebuffer::write_str("\n");
+    framebuffer::write_str_color("Type 'help' for available commands.", colors::encode(colors::COMMENT));
+    framebuffer::write_str("\n\n");
 
     let mut buffer = [0u8; COMMAND_BUFFER_SIZE];
 
     loop {
-        // Print prompt
-        framebuffer::write_str("rustux> ");
+        // Print Dracula-themed prompt: "> rustux> "
+        // Using ASCII-only characters for VGA font compatibility
+        // Arrow: Green (>)
+        framebuffer::write_str_color("> ", colors::encode(colors::GREEN));
+        // Username: Cyan (rustux)
+        framebuffer::write_str_color("rustux", colors::encode(colors::CYAN));
+        // Chevron: Purple (>)
+        framebuffer::write_str_color("> ", colors::encode(colors::PURPLE));
 
         // Read line from keyboard (blocks until Enter)
         let n = keyboard::read_line(&mut buffer);
@@ -124,9 +144,11 @@ pub fn run_shell() -> ! {
         }
 
         if !found {
-            framebuffer::write_str("Unknown command: ");
+            framebuffer::write_str_color("Unknown command: ", colors::encode(colors::RED));
             framebuffer::write_str(command_name);
-            framebuffer::write_str("\nType 'help' for available commands.\n");
+            framebuffer::write_str("\n");
+            framebuffer::write_str_color("Type 'help' for available commands.", colors::encode(colors::COMMENT));
+            framebuffer::write_str("\n");
         }
 
         // Always print newline after command
@@ -206,33 +228,134 @@ fn cmd_mem(_args: &[&str]) {
     }
 }
 
-/// Command: mouse - Show mouse status
-fn cmd_mouse(_args: &[&str]) {
-    framebuffer::write_str("Mouse Status:\n");
+/// Command: irq - Show keyboard IRQ debug info
+fn cmd_irq(_args: &[&str]) {
+    framebuffer::write_str("Keyboard IRQ Debug Info:\n");
 
-    let (x, y) = mouse::get_position();
-    let (left, middle, right) = mouse::get_buttons();
+    let irq_count = keyboard::get_irq_count();
+    framebuffer::write_str("  IRQ count: ");
+    if irq_count > 0 {
+        framebuffer::write_str("(IRQs firing!)\n");
+        // Show the actual count (0-15)
+        let digit = if irq_count <= 9 {
+            (b'0' + irq_count) as char
+        } else {
+            (b'A' + irq_count - 10) as char
+        };
+        framebuffer::write_str("  Count: ");
+        framebuffer::write_str_color(
+            unsafe { core::str::from_utf8_unchecked(&[digit as u8]) },
+            framebuffer::colors::encode(framebuffer::colors::GREEN)
+        );
+        framebuffer::write_str("\n");
+    } else {
+        framebuffer::write_str_color("0 (IRQ NOT firing!)\n", framebuffer::colors::encode(framebuffer::colors::RED));
+    }
 
-    framebuffer::write_str("  Position: X=");
-    framebuffer::write_str(format_int(x));
-    framebuffer::write_str(", Y=");
-    framebuffer::write_str(format_int(y));
-    framebuffer::write_str("\n");
+    // Try direct keyboard read
+    if let Some(c) = keyboard::try_read_char_direct() {
+        framebuffer::write_str("  Hardware: Key detected (");
+        framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[c as u8]) });
+        framebuffer::write_str(")\n");
+    } else {
+        framebuffer::write_str("  Hardware: No key pressed\n");
+    }
+}
 
-    framebuffer::write_str("  Buttons: ");
-    if left {
-        framebuffer::write_str("L");
+/// Command: kbd - Test keyboard input (non-blocking)
+fn cmd_kbd(_args: &[&str]) {
+    framebuffer::write_str("Testing keyboard (5 seconds, press any key)...\n");
+
+    let mut buffer = [0u8; 32];
+    let mut received = 0;
+
+    // Wait for input with timeout
+    for _ in 0..50000 {
+        if let Some(c) = keyboard::read_char() {
+            // Got input via IRQ
+            framebuffer::write_str_color("IRQ: ", framebuffer::colors::encode(framebuffer::colors::GREEN));
+            framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[c as u8]) });
+            framebuffer::write_str("\n");
+            received = 1;
+            break;
+        } else if let Some(c) = keyboard::try_read_char_direct() {
+            // Got input via direct polling
+            framebuffer::write_str_color("POLL: ", framebuffer::colors::encode(framebuffer::colors::YELLOW));
+            framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[c as u8]) });
+            framebuffer::write_str("\n");
+            received = 2;
+            break;
+        }
+
+        for _ in 0..100 {
+            unsafe { core::arch::asm!("nop", options(nomem, nostack)); }
+        }
     }
-    if middle {
-        framebuffer::write_str("M");
+
+    if received == 0 {
+        framebuffer::write_str_color("TIMEOUT - No input received\n", framebuffer::colors::encode(framebuffer::colors::RED));
+    } else if received == 1 {
+        framebuffer::write_str_color("SUCCESS - IRQ driver working!\n", framebuffer::colors::encode(framebuffer::colors::GREEN));
+    } else {
+        framebuffer::write_str_color("IRQ NOT working - polling works\n", framebuffer::colors::encode(framebuffer::colors::YELLOW));
     }
-    if right {
-        framebuffer::write_str("R");
+}
+
+/// Command: pic - Show PIC configuration
+fn cmd_pic(_args: &[&str]) {
+    use crate::runtime;
+
+    framebuffer::write_str("PIC Configuration:\n");
+
+    unsafe {
+        let (pic1_mask, pic2_mask) = runtime::pic_get_masks();
+        let (pic1_irr, pic2_irr) = runtime::pic_get_irr();
+        let (pic1_isr, pic2_isr) = runtime::pic_get_isr();
+
+        // PIC1 (IRQs 0-7)
+        framebuffer::write_str("  PIC1 (IRQ 0-7):\n");
+        framebuffer::write_str("    Mask: ");
+        cmd_pic_print_bits(pic1_mask);
+        framebuffer::write_str(if pic1_mask & 0x02 == 0 { " (IRQ1 enabled)\n" } else { " (IRQ1 DISABLED!)\n" });
+
+        framebuffer::write_str("    IRR:  ");
+        cmd_pic_print_bits(pic1_irr);
+        framebuffer::write_str(if pic1_irr & 0x02 != 0 { " (IRQ1 pending)\n" } else { " (no IRQ1)\n" });
+
+        framebuffer::write_str("    ISR:  ");
+        cmd_pic_print_bits(pic1_isr);
+        framebuffer::write_str(if pic1_isr & 0x02 != 0 { " (IRQ1 in-service)\n" } else { " (no IRQ1 active)\n" });
+
+        // PIC2 (IRQs 8-15)
+        framebuffer::write_str("  PIC2 (IRQ 8-15):\n");
+        framebuffer::write_str("    Mask: ");
+        cmd_pic_print_bits(pic2_mask);
+        framebuffer::write_str("\n");
+
+        framebuffer::write_str("    IRR:  ");
+        cmd_pic_print_bits(pic2_irr);
+        framebuffer::write_str("\n");
+
+        framebuffer::write_str("    ISR:  ");
+        cmd_pic_print_bits(pic2_isr);
+        framebuffer::write_str("\n");
     }
-    if !left && !middle && !right {
-        framebuffer::write_str("(none)");
+}
+
+/// Helper: Print 8 bits as binary
+fn cmd_pic_print_bits(value: u8) {
+    for i in (0..8).rev() {
+        let bit = if value & (1 << i) != 0 { b'1' } else { b'0' };
+        framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[bit]) });
     }
-    framebuffer::write_str("\n");
+    framebuffer::write_str(" (0x");
+    // Show hex
+    let hex_hi = (value >> 4) & 0x0F;
+    let hex_lo = value & 0x0F;
+    let h = if hex_hi < 10 { b'0' + hex_hi } else { b'A' + hex_hi - 10 };
+    let l = if hex_lo < 10 { b'0' + hex_lo } else { b'A' + hex_lo - 10 };
+    framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[h, l]) });
+    framebuffer::write_str(")");
 }
 
 /// Simple integer to string conversion (for small numbers)

@@ -1,8 +1,9 @@
 //! Framebuffer management (UEFI-safe, runtime-safe)
 //!
 //! - GOP queried ONLY during boot services
+//! - GOP explicitly CLOSED before ExitBootServices
 //! - Framebuffer info copied into static POD
-//! - Runtime uses pure MMIO writes
+//! - Runtime uses pure MMIO writes only
 //! - No UEFI calls after ExitBootServices
 
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -19,6 +20,37 @@ pub enum PixelFormat {
     Unknown,
 }
 
+/// Dracula theme colors (RGB values)
+pub mod colors {
+    /// Background: #282a36
+    pub const BACKGROUND: (u8, u8, u8) = (0x28, 0x2A, 0x36);
+    /// Current Line: #44475a
+    pub const CURRENT_LINE: (u8, u8, u8) = (0x44, 0x47, 0x5A);
+    /// Foreground: #f8f8f2
+    pub const FOREGROUND: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
+    /// Comment: #6272a4
+    pub const COMMENT: (u8, u8, u8) = (0x62, 0x72, 0xA4);
+    /// Cyan: #8be9fd
+    pub const CYAN: (u8, u8, u8) = (0x8B, 0xE9, 0xFD);
+    /// Green: #50fa7b
+    pub const GREEN: (u8, u8, u8) = (0x50, 0xFA, 0x7B);
+    /// Orange: #ffb86c
+    pub const ORANGE: (u8, u8, u8) = (0xFF, 0xB8, 0x6C);
+    /// Pink: #ff79c6
+    pub const PINK: (u8, u8, u8) = (0xFF, 0x79, 0xC6);
+    /// Purple: #bd93f9
+    pub const PURPLE: (u8, u8, u8) = (0xBD, 0x93, 0xF9);
+    /// Red: #ff5555
+    pub const RED: (u8, u8, u8) = (0xFF, 0x55, 0x55);
+    /// Yellow: #f1fa8c
+    pub const YELLOW: (u8, u8, u8) = (0xF1, 0xFA, 0x8C);
+
+    /// Encode a Dracula color as u32
+    pub fn encode(color: (u8, u8, u8)) -> u32 {
+        super::encode_color(color.0, color.1, color.2)
+    }
+}
+
 /// Plain-old-data framebuffer descriptor
 #[derive(Copy, Clone)]
 pub struct FramebufferInfo {
@@ -32,7 +64,7 @@ pub struct FramebufferInfo {
 
 /// Global framebuffer state (valid after init)
 static mut FB: Option<FramebufferInfo> = None;
-static mut INITIALIZED: AtomicU8 = AtomicU8::new(0);
+static INITIALIZED: AtomicU8 = AtomicU8::new(0);
 
 /// =========================================================
 /// BOOT SERVICES PHASE
@@ -41,6 +73,12 @@ static mut INITIALIZED: AtomicU8 = AtomicU8::new(0);
 /// Query GOP and store framebuffer metadata
 ///
 /// MUST be called before ExitBootServices.
+///
+/// This function:
+/// 1. Opens GOP protocol
+/// 2. Captures framebuffer info
+/// 3. EXPLICITLY CLOSES GOP protocol
+/// 4. Treats framebuffer as raw MMIO from then on
 pub fn init() {
     // Find GOP handle using uefi::boot API
     let gop_handles = uefi::boot::locate_handle_buffer(SearchType::ByProtocol(&gop::GraphicsOutput::GUID))
@@ -88,16 +126,46 @@ pub fn init() {
         });
         INITIALIZED.store(1, Ordering::SeqCst);
     }
+
+    // ============================================================
+    // CRITICAL: Drop GOP protocol before ExitBootServices
+    // ============================================================
+    //
+    // The framebuffer pointer we captured is now owned by us.
+    // UEFI firmware guarantees the framebuffer memory remains
+    // valid and identity-mapped after ExitBootServices.
+    //
+    // By explicitly dropping gop here, we:
+    // 1. Close the GOP protocol (uefi 0.36 uses RAII)
+    // 2. Release the protocol handle
+    // 3. Allow firmware to reclaim GOP-related memory
+    // 4. Prevent firmware from invalidating framebuffer access
+    //
+    // After this drop, we treat the framebuffer as pure MMIO.
+    // ============================================================
+    drop(gop);
+
+    // GOP CLOSED — framebuffer treated as raw MMIO from here on
 }
 
 /// Check if framebuffer was initialized
 pub fn is_initialized() -> bool {
-    unsafe { INITIALIZED.load(Ordering::SeqCst) == 1 }
+    INITIALIZED.load(Ordering::SeqCst) == 1
 }
 
 /// =========================================================
 /// RUNTIME PHASE (NO UEFI BELOW)
 /// =========================================================
+///
+// =========================================================
+// RUNTIME INVARIANTS
+// =========================================================
+// - NO UEFI protocols (all closed before ExitBootServices)
+// - NO heap usage
+// - Framebuffer is treated as raw MMIO memory
+// - Framebuffer pointer must remain identity-mapped
+// - All writes are volatile MMIO writes
+// =========================================================
 
 #[inline(always)]
 fn info() -> &'static FramebufferInfo {
@@ -486,3 +554,57 @@ pub fn write_str(s: &str) {
         }
     }
 }
+
+/// Write a string to the framebuffer console with a specific color
+pub fn write_str_color(s: &str, color: u32) {
+    let fg_color = color;
+    let (_, cols) = text_dimensions();
+
+    for b in s.bytes() {
+        match b {
+            b'\n' => unsafe {
+                CURSOR_X = 0;
+                CURSOR_Y += 1;
+            },
+            b'\r' => unsafe {
+                CURSOR_X = 0;
+            },
+            b'\t' => unsafe {
+                // Tab: advance to next multiple of 4
+                CURSOR_X = (CURSOR_X + 4) & !3;
+                if CURSOR_X >= cols {
+                    CURSOR_X = 0;
+                    CURSOR_Y += 1;
+                }
+            },
+            ascii_char if ascii_char >= 32 && ascii_char <= 126 => unsafe {
+                let (rows, _) = text_dimensions();
+
+                // Check if we need to scroll
+                if CURSOR_Y >= rows {
+                    scroll_up();
+                    CURSOR_Y = rows - 1;
+                }
+
+                // Check if we need to wrap to next line
+                if CURSOR_X >= cols {
+                    CURSOR_X = 0;
+                    CURSOR_Y += 1;
+                }
+
+                // Check if we need to scroll after wrapping
+                if CURSOR_Y >= rows {
+                    scroll_up();
+                    CURSOR_Y = rows - 1;
+                }
+
+                draw_glyph(ascii_char as char, CURSOR_X, CURSOR_Y, fg_color);
+                CURSOR_X += 1;
+            },
+            _ => {
+                // Skip unprintable characters
+            }
+        }
+    }
+}
+

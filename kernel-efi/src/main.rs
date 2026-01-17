@@ -17,7 +17,6 @@ mod framebuffer;
 mod runtime;
 mod theme;
 mod keyboard;
-mod mouse;
 mod shell;
 mod syscall;
 mod userspace_bin;
@@ -91,15 +90,35 @@ fn main() -> Status {
     framebuffer::init();
     console::write_line("Framebuffer available");
 
+    // ============================================================
+    // CRITICAL: Verify framebuffer initialization before ExitBootServices
+    // ============================================================
+    if !framebuffer::is_initialized() {
+        console::write_line("ERROR: Framebuffer not initialized!");
+        loop {
+            unsafe { core::arch::asm!("hlt") };
+        }
+    }
+
     // Capture memory map NOW (do not touch UEFI after this)
     console::write_line("Preparing to exit boot services...");
 
     // Switch console target BEFORE exit
     console::switch_to_framebuffer_console();
 
-    // =========================================================
-    // PHASE 2: FROZEN ZONE (NO UEFI CALLS)
-    // =========================================================
+    // ============================================================
+    // ==================== FROZEN ZONE ====================
+    // ============================================================
+    // CRITICAL: From this point until ExitBootServices completes:
+    //
+    // - NO allocations
+    // - NO logging
+    // - NO UEFI calls
+    // - ONLY ExitBootServices
+    //
+    // Any violation will cause the firmware to reclaim memory
+    // or corrupt the memory map, leading to undefined behavior.
+    // ============================================================
 
     // POST CODE 0x10: About to call ExitBootServices
     unsafe {
@@ -252,6 +271,8 @@ fn main() -> Status {
         }
 
         // Initialize mouse interrupts (IRQ12)
+        // DISABLED: Keyboard-only for now (mouse driver needs further testing)
+        /*
         if let Err(e) = runtime::init_mouse_interrupts() {
             framebuffer::write_str("Mouse init FAILED: ");
             framebuffer::write_str(e);
@@ -260,6 +281,7 @@ fn main() -> Status {
         } else {
             framebuffer::write_str("Mouse initialized\n");
         }
+        */
 
         // Enable interrupts so IRQ handlers can work
         core::arch::asm!("sti");

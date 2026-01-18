@@ -1,10 +1,12 @@
+# Rust
 /target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
 
-# EFI output
-*.efi
+# Build artifacts
+*.img
+*.iso
+rustux.img
 
 # IDE
 .vscode/
@@ -12,3 +14,10 @@ Cargo.lock
 *.swp
 *.swo
 *~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug logs
+*.log

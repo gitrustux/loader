@@ -512,12 +512,15 @@ unsafe fn handle_scancode(scan_code: u8) {
 /// IRQ1 keyboard interrupt handler
 ///
 /// This function is called by the IDT interrupt handler for IRQ1.
-/// It reads the scan code from the keyboard and converts it to ASCII.
+/// It reads ALL pending scan codes from the keyboard and converts them to ASCII.
+///
+/// CRITICAL: Must drain the entire PS/2 buffer before sending EOI!
+/// If any scancode remains unread, the controller will never raise another IRQ.
 #[no_mangle]
 pub extern "C" fn keyboard_irq_handler() {
     unsafe {
         // === IRQ1 PROOF: Draw visible pixel on framebuffer ===
-        // This proves the IRQ handler is being called even if shell is blocked
+        // This proves the IRQ handler is being called
         // Draw a pixel at the top-right corner that changes color with each IRQ
         static mut IRQ_COUNT: u8 = 0;
         IRQ_COUNT = IRQ_COUNT.wrapping_add(1);
@@ -538,32 +541,66 @@ pub extern "C" fn keyboard_irq_handler() {
         crate::framebuffer::put_pixel(crate::framebuffer::info().width - 1, 0, r, g, b);
         // === END IRQ1 PROOF ===
 
-        // Check controller status first
-        let status = controller_status();
+        // ================================================================
+        // CRITICAL: DRAIN THE ENTIRE PS/2 BUFFER BEFORE SENDING EOI
+        // ================================================================
+        // The PS/2 controller will NOT raise another IRQ until the buffer
+        // is completely empty. We must loop and read ALL pending scancodes.
+        //
+        // This is the classic "one IRQ only" bug - if we read only one byte
+        // and send EOI, the controller stops interrupting forever.
+        // ================================================================
 
-        // Bit 0: output buffer full
-        // Bit 5: mouse data (ignore)
-        // Bit 6: timeout error (ignore)
-        // Bit 7: parity error (ignore)
-        if status & 0x01 == 0 {
-            // No data available - shouldn't happen in IRQ handler
-            pic_send_eoi();
-            return;
+        let mut scancodes_read = 0u8;
+
+        loop {
+            // Check controller status
+            let status = controller_status();
+
+            // Bit 0: output buffer full
+            // If no data available, we're done draining
+            if status & 0x01 == 0 {
+                break;
+            }
+
+            // Ignore mouse data (bit 5 set)
+            if status & 0x20 != 0 {
+                // Read and discard mouse data
+                let _ = read_data_port();
+                continue;
+            }
+
+            // Ignore error conditions (timeout or parity error)
+            if status & 0xC0 != 0 {
+                // Read and discard error data
+                let _ = read_data_port();
+                continue;
+            }
+
+            // Read scan code from data port
+            let scan_code = read_data_port();
+
+            // Handle the scan code
+            handle_scancode(scan_code);
+
+            scancodes_read = scancodes_read.wrapping_add(1);
+
+            // Visual indicator: draw a pixel for each scancode read
+            // This helps diagnose if multiple scancodes are pending
+            let x = (crate::framebuffer::info().width - 2) as u8;
+            let y = scancodes_read;
+            let (sr, sg, sb) = match scancodes_read % 4 {
+                0 => (0xFF, 0xFF, 0xFF), // White
+                1 => (0x8B, 0xE9, 0xFD), // Cyan
+                2 => (0x50, 0xFA, 0x7B), // Green
+                _ => (0xBD, 0x93, 0xF9), // Purple
+            };
+            crate::framebuffer::put_pixel(x as usize, y as usize, sr, sg, sb);
         }
 
-        // Ignore mouse data (bit 5 set)
-        if status & 0x20 != 0 {
-            pic_send_eoi();
-            return;
-        }
-
-        // Read scan code from data port
-        let scan_code = read_data_port();
-
-        // Handle the scan code
-        handle_scancode(scan_code);
-
-        // Send EOI to PIC (CRITICAL!)
+        // ================================================================
+        // ONLY send EOI AFTER buffer is completely drained
+        // ================================================================
         pic_send_eoi();
     }
 }

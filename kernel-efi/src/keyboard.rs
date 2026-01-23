@@ -284,6 +284,34 @@ unsafe fn keyboard_read_timeout() -> Option<u8> {
 // PS/2 CONTROLLER INITIALIZATION
 // =============================================================
 
+/// Detect if PS/2 controller is present and responding
+///
+/// Returns true if the controller appears to be functioning.
+/// Draws visual indicators for diagnostic purposes.
+unsafe fn detect_ps2_controller() -> bool {
+    // Try to read status register multiple times
+    let mut valid_reads = 0;
+    for _ in 0..10 {
+        let status = controller_status();
+        // Status register should have bit 3 (command/data flag) set or clear
+        // Bit 4 = 1 for keyboard data in buffer, 0 for mouse data
+        // Any value other than 0xFF or 0x00 suggests the controller is responding
+        if status != 0xFF && status != 0x00 {
+            valid_reads += 1;
+        }
+        for _ in 0..100 {
+            core::arch::asm!("nop", options(nomem, nostack));
+        }
+    }
+
+    // Draw diagnostic pixel: white = controller detected, black = not detected
+    let detected = valid_reads >= 5;
+    let color = if detected { (0xF8, 0xF8, 0xF2) } else { (0x00, 0x00, 0x00) };
+    crate::framebuffer::put_pixel(14, 1, color.0, color.1, color.2);
+
+    detected
+}
+
 /// Initialize PS/2 controller for keyboard operation
 unsafe fn ps2_controller_init() {
     // 1. Disable keyboard port
@@ -297,17 +325,37 @@ unsafe fn ps2_controller_init() {
     let config = if let Some(c) = keyboard_read_timeout() {
         c
     } else {
-        // Default config if read fails
+        // Default config if read fails - UEFI may have left IRQs disabled
         0b0100_0001 // IRQ1 disabled, system flag set
     };
 
-    // 4. Enable IRQ1 (bit 0) and clear IRQ2 (bit 1) for keyboard
-    let new_config = config | 0x01; // Set bit 0 to enable IRQ1
+    // 4. CRITICAL: Explicitly enable IRQ1 (bit 0) in controller config
+    // UEFI firmware often leaves PS/2 IRQs disabled
+    let new_config = (config & 0b1111_1110) | 0x01; // Clear bit 0, then set it to enable IRQ1
     controller_write(CMD_WRITE_CONFIG);
     keyboard_write(new_config);
 
-    // 5. Enable keyboard port
+    // 5. Verify the write by reading back
+    controller_write(CMD_READ_CONFIG);
+    if let Some(verify) = keyboard_read_timeout() {
+        let irq1_enabled = (verify & 0x01) != 0;
+        // Draw visual indicator: green = IRQ1 enabled, red = disabled
+        let color = if irq1_enabled { (0x50, 0xFA, 0x7B) } else { (0xFF, 0x55, 0x55) };
+        crate::framebuffer::put_pixel(13, 1, color.0, color.1, color.2);
+    }
+
+    // 6. Enable keyboard port
     controller_write(CMD_ENABLE_KEYBOARD);
+
+    // 7. Additional explicit enable sequence for some stubborn controllers
+    // Some UEFI firmware requires this specific sequence
+    controller_write(CMD_READ_CONFIG);
+    if let Some(config2) = keyboard_read_timeout() {
+        // Make absolutely sure IRQ1 is enabled
+        let final_config = config2 | 0x01;
+        controller_write(CMD_WRITE_CONFIG);
+        keyboard_write(final_config);
+    }
 
     // Small delay to let commands take effect
     for _ in 0..10000 {
@@ -370,15 +418,36 @@ unsafe fn ps2_keyboard_init() {
 /// Initialize the PS/2 keyboard driver
 ///
 /// This function performs full PS/2 controller and keyboard initialization:
-/// 1. Resets input buffer and shift state
-/// 2. Initializes PS/2 controller (enables IRQ1)
-/// 3. Initializes keyboard device (enables scanning)
-/// 4. Flushes stale keyboard data
+/// 1. Detects if PS/2 controller is present
+/// 2. Resets input buffer and shift state
+/// 3. Initializes PS/2 controller (enables IRQ1)
+/// 4. Initializes keyboard device (enables scanning)
+/// 5. Flushes stale keyboard data
+///
+/// VISUAL DIAGNOSTICS (row 1 of screen):
+/// - (10,1) Yellow: PS/2 status shows data available
+/// - (11,1) Cyan: Valid scancode read
+/// - (12,1) Green: ASCII character produced
+/// - (13,1) Green: IRQ1 enabled in config, Red: disabled
+/// - (14,1) White: PS/2 controller detected, Black: not detected
 pub fn init() {
     unsafe {
         // Reset state
         INPUT_BUFFER = InputBuffer::new();
         SHIFT_PRESSED = false;
+
+        // Detect PS/2 controller presence
+        let controller_present = detect_ps2_controller();
+
+        if !controller_present {
+            // PS/2 controller not detected - keyboard may be USB only
+            // Draw a red X to indicate failure
+            for i in 0..5 {
+                crate::framebuffer::put_pixel(15 + i, 1, 0xFF, 0x55, 0x55); // Red
+                crate::framebuffer::put_pixel(15 + i, 2, 0xFF, 0x55, 0x55); // Red
+            }
+            return; // Don't continue with PS/2 initialization
+        }
 
         // Initialize PS/2 controller
         ps2_controller_init();
@@ -611,6 +680,11 @@ pub fn read_line(buffer: &mut [u8]) -> usize {
 ///
 /// IMPORTANT: We do NOT flush on every read to avoid clearing data we need.
 /// Only flush if we're seeing obviously invalid status.
+///
+/// VISUAL DEBUG: Draws pixels to show polling state
+/// - Yellow pixel (10,1): Status shows data available
+/// - Cyan pixel (11,1): Valid scancode read
+/// - Green pixel (12,1): ASCII character produced
 unsafe fn poll_read() -> Option<char> {
     // Check controller status
     let status = controller_status();
@@ -619,6 +693,9 @@ unsafe fn poll_read() -> Option<char> {
     if status & 0x01 == 0 {
         return None; // No data available yet
     }
+
+    // VISUAL: Data is available at port 0x60 - draw yellow pixel
+    crate::framebuffer::put_pixel(10, 1, 0xF1, 0xFA, 0x8C); // Yellow
 
     // Ignore mouse data (bit 5)
     if status & 0x20 != 0 {
@@ -640,11 +717,16 @@ unsafe fn poll_read() -> Option<char> {
     // Check if this is a release code (bit 7 set)
     if scan_code & 0x80 == 0 {
         // Make code (key press) - convert to ASCII
+        // VISUAL: Valid make code - draw cyan pixel
+        crate::framebuffer::put_pixel(11, 1, 0x8B, 0xE9, 0xFD); // Cyan
+
         if (scan_code as usize) < SCAN_CODE_TO_ASCII.len() {
             let ascii = SCAN_CODE_TO_ASCII[scan_code as usize];
 
             // No shift handling in polling (keep it simple)
             if ascii != 0 {
+                // VISUAL: ASCII character produced - draw green pixel
+                crate::framebuffer::put_pixel(12, 1, 0x50, 0xFA, 0x7B); // Green
                 return Some(ascii as char);
             }
         }

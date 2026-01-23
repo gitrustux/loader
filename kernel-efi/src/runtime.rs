@@ -591,10 +591,11 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     lapic_tpr.write_volatile(0);
 
     // --- DIAGNOSTIC: Test IDT entry 33 with int 33 instruction ---
-    // This directly invokes the keyboard IRQ handler to verify IDT is correct
+    // NOTE: This test must be AFTER IDT entry 33 is set up (see below)
+    // The int 33 was causing a hang because it was called before IDT setup
     // If pixel changes = IDT/handler works, problem is IOAPIC/routing
     // If nothing happens = IDT/gate type/selector is broken
-    core::arch::asm!("int 33", options(nostack, preserves_flags));
+    // core::arch::asm!("int 33", options(nostack, preserves_flags));
 
     // --- 2️⃣ Initialize IOAPIC ---
     const IOAPIC_BASE: u64 = 0xFEC0_0000;

@@ -1,121 +1,104 @@
-# Rustux OS
+# Rustux EFI Loader
 
-A hobby operating system written in Rust, featuring a native UEFI kernel with an interactive shell and Dracula-themed interface.
+**IMPORTANT: This is a TRANSITION KERNEL for live boot validation.**
 
-## Current Status
+This directory contains a monolithic UEFI kernel (`kernel-efi/`) used to validate Phase 6 features before integration into the canonical microkernel.
 
-**Phase 6 COMPLETE: Interactive Shell** 🟢
+## Purpose
 
-The system boots to a fully interactive command-line shell with:
-- PS/2 keyboard input
-- Framebuffer text console
-- Process management with round-robin scheduler
-- Embedded ramdisk filesystem
-- Dracula theme (mandatory invariant)
+The `kernel-efi/` transition kernel serves as:
+- **Live boot validation** - Single UEFI application for USB testing
+- **Hardware testing** - PS/2 keyboard, framebuffer, UEFI GOP
+- **Feature validation** - Process management, syscalls, shell interaction
 
-**Boot Flow:**
+**This is NOT the canonical Rustux kernel.** The real kernel is in `/var/www/rustux.com/prod/rustux/` (microkernel architecture).
+
+## Migration Plan
+
+Phase 6D will migrate validated subsystems from this transition kernel into the canonical microkernel:
+- PS/2 keyboard driver → `rustux/src/drivers/keyboard/`
+- Framebuffer console → `rustux/src/drivers/display/`
+- Live boot tooling → `rustux/src/boot/uefi/`
+
+The monolithic `kernel-efi/` will be retired after migration is complete.
+
+## Directory Structure
+
 ```
-UEFI Firmware → BOOTX64.EFI → Kernel → Init (PID 1) → Shell (PID 2)
+loader/
+├── kernel-efi/           # Monolithic UEFI transition kernel
+│   ├── src/              # Kernel source (single-binary architecture)
+│   ├── build.rs          # Embeds ramdisk with userspace binaries
+│   └── target/           # Built kernel.efi
+├── uefi-loader/          # UEFI bootloader (loads kernel.efi)
+├── build-live-image.sh   # Live USB image creation script
+├── README.md             # This file
+└── .gitignore            # Git ignore patterns
 ```
 
-## Quick Start
-
-### Download Live Image
-
-Visit https://rustux.com/rustica/ to download the latest live USB image.
-
-### Write to USB
+## Building the Transition Kernel
 
 ```bash
-# Identify your USB device
+cd /var/www/rustux.com/prod/loader/kernel-efi
+
+# Build UEFI kernel
+cargo build --release --target x86_64-unknown-uefi
+
+# Build userspace programs
+cd /var/www/rustux.com/prod/rustica/test-userspace
+x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector shell.c -o shell.elf
+x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector init.c -o init.elf
+```
+
+## Creating Live USB Image
+
+```bash
+cd /var/www/rustux.com/prod/loader
+
+# Make script executable
+chmod +x build-live-image.sh
+
+# Build image
+./build-live-image.sh
+
+# Or with custom version
+RUSTUX_VERSION=1.0.0 ./build-live-image.sh
+```
+
+**Output:** `/var/www/rustux.com/html/rustica/rustica-live-amd64-{VERSION}.img`
+
+## Writing to USB
+
+```bash
+# Identify USB device
 lsblk
 
-# Write the image (replace /dev/sdX with your device)
+# Write image (replace /dev/sdX)
 sudo dd if=rustica-live-amd64-0.1.0.img of=/dev/sdX bs=4M status=progress conv=fsync
 sudo sync
 ```
 
-### Boot
+## Booting
 
-1. Insert USB and restart your computer
-2. Enter boot menu (F12, F2, F10, Del, or Esc key)
-3. Select the USB drive (look for "UEFI: USB...")
-4. System boots directly to the Rustux shell
+1. Insert USB and restart computer
+2. Enter boot menu (F12, F2, F10, Del, or Esc)
+3. Select USB drive (look for "UEFI: USB...")
+4. System boots to Rustux shell
 
-## Project Structure
+## Validated Features (Phase 6)
 
-This is a monorepo containing the complete Rustux OS:
-
-```
-/var/www/rustux.com/prod/
-├── rustux/                 # Kernel (UEFI application)
-│   ├── src/               # Kernel source code
-│   ├── test-userspace/    # C programs (shell, init, tests)
-│   ├── build.rs           # Embed ramdisk with userspace binaries
-│   ├── build-live-image.sh# Live USB build script
-│   └── README.md          # Kernel documentation
-├── rustica/               # Userspace OS distribution
-│   ├── docs/             # Documentation (BUILD.md, IMAGE.md, PLAN.md)
-│   └── shell/            # Rust shell implementation (reference)
-└── apps/                  # Userspace applications
-    └── cli/              # Command-line tools
-```
-
-## What's Working (Phase 6)
-
-| Component | Description | Status |
-|-----------|-------------|--------|
-| **Direct UEFI Boot** | No GRUB, no Linux kernel - standalone UEFI application | ✅ |
-| **PS/2 Keyboard** | Scancode set 1 to ASCII conversion, modifier tracking | ✅ |
-| **Framebuffer Console** | PSF2 font (8x16), scrolling, Dracula theme colors | ✅ |
-| **Process Management** | Process table (256 slots), round-robin scheduler | ✅ |
-| **Syscall Interface** | read, write, open, close, lseek, spawn, exit, getpid, getppid, yield | ✅ |
-| **VFS + Ramdisk** | Virtual filesystem abstraction, embedded ELF binaries | ✅ |
-| **Interactive Shell** | C shell with built-in commands, Dracula theme | ✅ |
-
-### Shell Commands
-
-```
-rustux> help
-rustux> clear
-rustux> echo hello world
-rustux> ps
-rustux> hello
-rustux> counter
-rustux> exit
-```
-
-## Planned Features (Phase 7)
-
-| Component | Description | Timeline |
-|-----------|-------------|----------|
-| **USB HID Driver** | Keyboard + mouse support via USB | Phase 7A |
-| **Framebuffer Mapping** | Map framebuffer into userspace for direct drawing | Phase 7A |
-| **GUI Server** | Single-process window manager (early Mac OS style) | Phase 7B |
-| **GUI Client Library** | librustica_gui for building GUI applications | Phase 7C |
-
-## System Requirements
-
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **Architecture** | x86_64 (AMD64) | x86_64 (AMD64) |
-| **Boot** | UEFI 2.0 | UEFI 2.3+ |
-| **RAM** | 512 MB | 1 GB |
-| **Storage** | 128 MB (USB) | 4 GB |
-| **Input** | PS/2 Keyboard | PS/2 or USB HID* |
-
-\* USB HID support planned for Phase 7
+| Feature | Status | Notes |
+|---------|--------|-------|
+| UEFI Direct Boot | ✅ | No GRUB, standalone BOOTX64.EFI |
+| PS/2 Keyboard | ✅ | IRQ1, scancode set 1, modifiers |
+| Framebuffer Console | ✅ | RGB565, PSF2 font (8x16), scrolling |
+| Process Management | ✅ | 256-slot table, round-robin scheduler |
+| Syscall Interface | ✅ | read, write, spawn, exit, getpid, yield |
+| VFS + Ramdisk | ✅ | Embedded ELF binaries (init, shell, hello) |
+| Interactive Shell | ✅ | C shell with Dracula theme |
 
 ## Dracula Theme (MANDATORY INVARIANT)
 
-The Dracula color palette is the default system theme and must survive:
-
-- Kernel rebuilds
-- CLI refactors
-- Framebuffer rewrites
-- GUI introduction later
-
-**Canonical Dracula Colors:**
 ```
 FG_DEFAULT = #F8F8F2  (r: 248, g: 248, b: 242)
 BG_DEFAULT = #282A36  (r: 40, g: 42, b: 54)
@@ -127,33 +110,29 @@ ORANGE     = #FFB86C  (r: 255, g: 184, b: 108)
 YELLOW     = #F1FA8C  (r: 241, g: 250, b: 140)
 ```
 
-## Documentation
+## System Requirements
 
-- **[BUILD.md](rustica/docs/BUILD.md)** - Live USB build instructions
-- **[IMAGE.md](rustica/docs/IMAGE.md)** - System architecture and boot flow
-- **[PLAN.md](rustica/docs/PLAN.md)** - Development roadmap with detailed phase specs
-- **[rustux/README.md](rustux/README.md)** - Kernel-specific documentation
-- **[rustica/README.md](rustica/README.md)** - OS distribution documentation
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Architecture | x86_64 (AMD64) | x86_64 (AMD64) |
+| Boot | UEFI 2.0 | UEFI 2.3+ |
+| RAM | 512 MB | 1 GB |
+| Storage | 128 MB (USB) | 4 GB |
+| Input | PS/2 Keyboard | PS/2 or USB HID* |
 
-## Contributing
+\* USB HID support planned for Phase 7
 
-See PLAN.md for:
-- Coding standards
-- Development workflow
-- Phase specifications
-- Technical decisions
+## Repository
+
+- **Git:** https://github.com/gitrustux/rustux-efi
+- **Main Project:** https://github.com/gitrustux/rustux
+- **Website:** https://rustux.com
 
 ## License
 
-MIT License - See LICENSE file for details.
-
-## Links
-
-- **Repository:** https://github.com/gitrustux/rustux
-- **Website:** https://rustux.com
-- **Issue Tracker:** https://github.com/gitrustux/rustux/issues
+MIT License - See LICENSE file in root directory.
 
 ---
 
 **Last Updated:** January 23, 2025
-**Status:** Phase 6 COMPLETE - Interactive shell running with Dracula theme
+**Status:** Phase 6 COMPLETE - Transition kernel validated, awaiting microkernel migration

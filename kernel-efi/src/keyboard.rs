@@ -599,27 +599,7 @@ pub extern "C" fn keyboard_irq_handler() {
         }
 
         // ================================================================
-        // DIAGNOSTIC: Read back IOAPIC entry to check if it got masked
-        // ================================================================
-        // After first IRQ, check if IOAPIC entry is still unmasked
-        const IOAPIC_BASE: u64 = 0xFEC0_0000;
-        const IOAPIC_IOREGSEL: u64 = 0x00;
-        const IOAPIC_IOWIN: u64 = 0x10;
-        const IRQ1_REDIR_OFFSET: u32 = 0x12;
-
-        let ioapic_sel = (IOAPIC_BASE + IOAPIC_IOREGSEL) as *mut u32;
-        let ioapic_win = (IOAPIC_BASE + IOAPIC_IOWIN) as *mut u32;
-
-        ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET);
-        let ioapic_value = ioapic_win.read_volatile();
-
-        // Draw red pixel at (20, 2) if masked, green if not
-        let is_masked = (ioapic_value & (1 << 16)) != 0;
-        let color = if is_masked { (0xFF, 0x55, 0x55) } else { (0x50, 0xFA, 0x7B) };
-        crate::framebuffer::put_pixel(20, 2, color.0, color.1, color.2);
-
-        // ================================================================
-        // ONLY send EOI AFTER buffer is completely drained
+        // Send EOI to Local APIC AFTER fully draining PS/2 buffer
         // ================================================================
         pic_send_eoi();
     }

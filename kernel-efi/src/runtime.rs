@@ -576,9 +576,26 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     let ioapic_win = (IOAPIC_BASE + IOAPIC_IOWIN) as *mut u32;
 
     const IRQ1_VECTOR: u32 = 33; // Vector assigned to keyboard IRQ1
-    // Redirection entry: edge-triggered, active-high, not masked, fixed delivery
-    // Bit 16: Interrupt Mask (0 = not masked, 1 = masked) - CRITICAL: must be 0 for IRQs to work!
-    let low_dword = IRQ1_VECTOR; // Bits 0-7: vector 33, bits 8-10: fixed delivery (0), bit 16: not masked (0)
+
+    // ================================================================
+    // CRITICAL: PS/2 Keyboard IRQ must be LEVEL-TRIGGERED + ACTIVE-LOW
+    // ================================================================
+    // PS/2 keyboard is different from typical edge-triggered IRQs:
+    // - Bit 13 (Polarity): 1 = Active low (PS/2 keyboard IRQ line is normally high, goes low when data ready)
+    // - Bit 15 (Trigger): 1 = Level triggered (keyboard holds IRQ low until data read)
+    // - Bit 16 (Mask): 0 = Not masked (MUST be 0 for IRQs to fire!)
+    //
+    // Edge-triggered config causes "one IRQ only" symptom because:
+    // - First keypress generates edge → IRQ fires
+    // - Keyboard holds IRQ line low (level)
+    // - IOAPIC never sees another edge (it's already low)
+    // - No more IRQs ever
+    // ================================================================
+    const IOAPIC_POLARITY_LOW: u32 = 1 << 13;  // Active low
+    const IOAPIC_TRIGGER_LEVEL: u32 = 1 << 15; // Level triggered
+    // Bit 16 (mask) = 0 means NOT masked
+
+    let low_dword = IRQ1_VECTOR | IOAPIC_POLARITY_LOW | IOAPIC_TRIGGER_LEVEL;
     let high_dword = 0; // Destination CPU 0 (BSP)
 
     // Write low dword of IRQ1 redirection entry

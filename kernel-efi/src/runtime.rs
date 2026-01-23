@@ -553,10 +553,34 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     // UEFI firmware uses IOAPIC + Local APIC for interrupt routing.
     // Legacy PIC is NOT functional under UEFI.
 
+    // --- 0️⃣ CRITICAL: Enable Local APIC via IA32_APIC_BASE MSR ---
+    // The LAPIC must be explicitly enabled via MSR 0x1B bit 11.
+    // Without this, the CPU silently drops all external interrupts!
+    const IA32_APIC_BASE: u32 = 0x1B;
+    const APIC_ENABLE_BIT: u64 = 1 << 11;
+
+    let mut msr_value: u64;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") IA32_APIC_BASE,
+        out("rax") msr_value,
+        options(nostack, preserves_flags, readonly)
+    );
+
+    // Set bit 11 to enable the APIC (preserve other bits like base address)
+    msr_value |= APIC_ENABLE_BIT;
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") IA32_APIC_BASE,
+        in("eax") (msr_value as u32),
+        in("edx") ((msr_value >> 32) as u32),
+        options(nomem, nostack, preserves_flags)
+    );
+
     // --- 1️⃣ Enable Local APIC ---
     const LOCAL_APIC_BASE: u64 = 0xFEE0_0000;
-    const LAPIC_SVR_OFFSET: usize = 0x70; // Spurious Vector Register
-    const LAPIC_TPR_OFFSET: usize = 0x30; // Task Priority Register
+    const LAPIC_SVR_OFFSET: usize = 0xF0; // Spurious Vector Register (corrected offset)
+    const LAPIC_TPR_OFFSET: usize = 0x80; // Task Priority Register (corrected offset)
 
     let lapic_svr = (LOCAL_APIC_BASE + LAPIC_SVR_OFFSET as u64) as *mut u32;
     let lapic_tpr = (LOCAL_APIC_BASE + LAPIC_TPR_OFFSET as u64) as *mut u32;
@@ -565,6 +589,12 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     lapic_svr.write_volatile(0x100 | 0xFF);
     // Allow all interrupts (TPR = 0)
     lapic_tpr.write_volatile(0);
+
+    // --- DIAGNOSTIC: Test IDT entry 33 with int 33 instruction ---
+    // This directly invokes the keyboard IRQ handler to verify IDT is correct
+    // If pixel changes = IDT/handler works, problem is IOAPIC/routing
+    // If nothing happens = IDT/gate type/selector is broken
+    core::arch::asm!("int 33", options(nostack, preserves_flags));
 
     // --- 2️⃣ Initialize IOAPIC ---
     const IOAPIC_BASE: u64 = 0xFEC0_0000;

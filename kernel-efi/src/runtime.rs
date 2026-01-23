@@ -577,6 +577,7 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
 
     const IRQ1_VECTOR: u32 = 33; // Vector assigned to keyboard IRQ1
     // Redirection entry: edge-triggered, active-high, not masked, fixed delivery
+    // Bit 16: Interrupt Mask (0 = not masked, 1 = masked) - CRITICAL: must be 0 for IRQs to work!
     let low_dword = IRQ1_VECTOR; // Bits 0-7: vector 33, bits 8-10: fixed delivery (0), bit 16: not masked (0)
     let high_dword = 0; // Destination CPU 0 (BSP)
 
@@ -587,12 +588,23 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
     ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET + 1);
     ioapic_win.write_volatile(high_dword);
 
-    // --- VISUAL CONFIRMATION: IOAPIC init complete ---
-    const VGA_BUFFER: u64 = 0xB8000;
-    let vga = VGA_BUFFER as *mut u16;
-    let msg = b"IOAPIC!";
-    for (i, &byte) in msg.iter().enumerate() {
-        *vga.add(58 + i) = 0x0E00 | (byte as u16);
+    // Verify the write by reading it back (debug confirmation)
+    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET);
+    let read_low = ioapic_win.read_volatile();
+    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET + 1);
+    let read_high = ioapic_win.read_volatile();
+
+    // Draw visual confirmation of IOAPIC configuration
+    // Green line = IOAPIC configured, Red line = masked (bad)
+    if crate::framebuffer::is_initialized() {
+        let is_masked = (read_low & (1 << 16)) != 0;
+        let color = if is_masked { (0xFF, 0x55, 0x55) } else { (0x50, 0xFA, 0x7B) }; // Red if masked, Green if OK
+        // Draw a 3-pixel tall line at the top-left corner
+        for y in 0..3 {
+            for x in 0..20 {
+                crate::framebuffer::put_pixel(x, y, color.0, color.1, color.2);
+            }
+        }
     }
 
     // --- 3️⃣ IDT entry for IRQ1 (vector 33) ---

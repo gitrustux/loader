@@ -447,17 +447,26 @@ unsafe fn handle_scancode(scan_code: u8) {
 #[no_mangle]
 pub extern "C" fn keyboard_irq_handler() {
     unsafe {
-        // === IRQ1 PROOF: Write visible marker to VGA ===
+        // === IRQ1 PROOF: Draw visible pixel on framebuffer ===
         // This proves the IRQ handler is being called even if shell is blocked
-        const VGA_BUFFER: u64 = 0xB8000;
-        let vga = VGA_BUFFER as *mut u16;
-        // Write 'K' (Keyboard) in green on black at column 79 (far right of top line)
-        // Increment position each time to show activity
+        // Draw a pixel at the top-right corner that changes color with each IRQ
         static mut IRQ_COUNT: u8 = 0;
         IRQ_COUNT = IRQ_COUNT.wrapping_add(1);
-        // Display count as hex digit 0-F at top-right corner
-        let hex_digit = if IRQ_COUNT < 10 { b'0' + IRQ_COUNT } else { b'A' + IRQ_COUNT - 10 };
-        *vga.add(79) = 0x0F00 | (hex_digit as u16); // White on black
+
+        // Use different colors to show IRQ activity
+        // Cycle through bright colors: cyan, green, purple, red, yellow, orange, pink
+        let (r, g, b) = match IRQ_COUNT % 7 {
+            0 => (0x8B, 0xE9, 0xFD), // Cyan
+            1 => (0x50, 0xFA, 0x7B), // Green
+            2 => (0xBD, 0x93, 0xF9), // Purple
+            3 => (0xFF, 0x55, 0x55), // Red
+            4 => (0xF1, 0xFA, 0x8C), // Yellow
+            5 => (0xFF, 0xB8, 0x6C), // Orange
+            _ => (0xFF, 0x79, 0xC6), // Pink
+        };
+
+        // Draw pixel at top-right corner (width-1, 0) to show IRQ fired
+        crate::framebuffer::put_pixel(crate::framebuffer::info().width - 1, 0, r, g, b);
         // === END IRQ1 PROOF ===
 
         // Check controller status first
@@ -490,16 +499,19 @@ pub extern "C" fn keyboard_irq_handler() {
     }
 }
 
-/// Send End of Interrupt (EOI) to the PIC
+/// Send End of Interrupt (EOI) to the Local APIC
 ///
 /// This is CRITICAL - without EOI, no further IRQs will be delivered.
+///
+/// In UEFI APIC mode, EOI must be sent to the Local APIC, NOT the legacy PIC.
+/// The Local APIC EOI register is at offset 0xB0 from the LAPIC base.
 unsafe fn pic_send_eoi() {
-    // Send EOI to PIC1
-    core::arch::asm!(
-        "mov al, 0x20",
-        "out 0x20, al",
-        options(nomem, nostack)
-    );
+    const LOCAL_APIC_BASE: u64 = 0xFEE0_0000;
+    const LAPIC_EOI_OFFSET: usize = 0xB0;
+
+    let lapic_eoi = (LOCAL_APIC_BASE + LAPIC_EOI_OFFSET as u64) as *mut u32;
+    // Write any value to EOI register to signal interrupt completion
+    lapic_eoi.write_volatile(0);
 }
 
 /// Read a single character from the keyboard buffer

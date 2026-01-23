@@ -168,7 +168,7 @@ pub fn is_initialized() -> bool {
 // =========================================================
 
 #[inline(always)]
-fn info() -> &'static FramebufferInfo {
+pub fn info() -> &'static FramebufferInfo {
     unsafe { FB.as_ref().expect("Framebuffer not initialized") }
 }
 
@@ -198,6 +198,27 @@ pub fn draw_scanline(y: usize, color: u32) {
     for x in 0..fb.width {
         unsafe {
             write_volatile(row.add(offset + x), color);
+        }
+    }
+}
+
+/// Draw a single pixel (interrupt-safe, for debugging)
+///
+/// # Safety
+/// Must only be called after framebuffer is initialized.
+/// x must be < width, y must be < height.
+#[inline(always)]
+pub unsafe fn put_pixel(x: usize, y: usize, r: u8, g: u8, b: u8) {
+    if let Some(fb) = FB.as_ref() {
+        if x < fb.width && y < fb.height {
+            let color = match fb.pixel_format {
+                PixelFormat::Rgb => ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
+                PixelFormat::Bgr => ((b as u32) << 16) | ((g as u32) << 8) | (r as u32),
+                PixelFormat::Unknown => 0xFFFFFF,
+            };
+            let ptr = fb.base as *mut u32;
+            let offset = y * fb.stride + x;
+            write_volatile(ptr.add(offset), color);
         }
     }
 }

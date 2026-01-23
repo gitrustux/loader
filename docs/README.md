@@ -1,624 +1,347 @@
-# Rustux Microkernel - Feature Documentation
+# Rustux OS - UEFI Kernel
+
+**Current Status:** Phase 6 COMPLETE - Interactive Shell Running
 
 ## Overview
 
-Rustux is a **microkernel** operating system written in Rust, designed for embedded systems, virtualization, and security-focused applications. It follows a capability-based security model with minimal trusted computing base (TCB).
+Rustux is a hobby operating system written in Rust. It boots directly as a UEFI application (no GRUB, no Linux kernel) and provides an interactive shell with a Dracula-themed interface.
 
-### Design Principles
+### Current State (January 2025)
 
-- **Microkernel Architecture**: Only essential services run in kernel mode
-- **Capability-Based Security**: All kernel objects accessed via capabilities
-- **Memory Safety**: Leverages Rust's type system for memory safety
-- **no_std**: Bare metal kernel without standard library dependencies
-- **Multi-Architecture**: Support for x86-64, ARM64, and RISC-V
+- **Phase 6 Complete:** Interactive shell with PS/2 keyboard and framebuffer console
+- **Direct UEFI Boot:** Standalone BOOTX64.EFI, no external bootloader
+- **Multi-process:** Round-robin scheduler with process table
+- **Syscalls:** read, write, open, close, lseek, spawn, exit, getpid, getppid, yield
+- **Filesystem:** VFS abstraction with embedded ramdisk
 
----
+### Boot Flow
 
-## Core Features
-
-### 1. Memory Management
-
-#### 1.1 Physical Memory Manager (PMM)
-
-**Location**: `src/kernel/pmm.rs`
-
-The Physical Memory Manager provides efficient allocation and deallocation of physical memory pages using a bitmap-based arena allocator.
-
-**Key Features**:
-- **Bitmap-based Allocation**: Tracks free/used pages with bitmap
-- **Arena Management**: Multiple memory arenas for different memory regions
-- **Atomic Operations**: Thread-safe allocation with atomic CAS operations
-- **Contiguous Allocation**: Allocate physically contiguous pages with alignment support
-
-**API**:
-```rust
-// Allocate a single page
-pmm::alloc_page() -> Result<PAddr>
-
-// Allocate contiguous pages
-pmm::pmm_alloc_contiguous(count: usize, flags: u32, align_log2: u8) -> Result<PAddr>
-
-// Free a single page
-pmm::free_page(paddr: PAddr)
-
-// Free contiguous pages
-pmm::pmm_free_contiguous(paddr: PAddr, count: usize)
+```
+UEFI Firmware → BOOTX64.EFI → Kernel → Init (PID 1) → Shell (PID 2)
 ```
 
-**Status**: ✅ **Implemented** - Production Ready
+---
+
+## Core Features (Phase 6)
+
+### 1. UEFI Boot
+
+**Location:** `src/main.rs`, `src/arch/amd64/uefi.rs`
+
+The kernel is a standalone UEFI application that:
+- Calls `ExitBootServices()` to take full hardware control
+- Sets up x86_64 page tables with proper isolation
+- Configures IDT for interrupt handling
+- Initializes scheduler and process management
+
+**Status:** ✅ Complete
 
 ---
 
-#### 1.2 Virtual Memory Manager (VMM)
+### 2. Process Management
 
-**Location**: `src/kernel/vm/`
+**Location:** `src/process/mod.rs`, `src/process/table.rs`, `src/sched/round_robin.rs`
 
-The Virtual Memory Manager provides virtual address space management with demand paging, copy-on-write, and memory mapping capabilities.
+- **Process Table:** 256 slots, indexed by PID
+- **Round-Robin Scheduler:** Time-sliced context switching
+- **Context Switch:** Assembly switch.S for saving/restoring CPU state
+- **Init Process:** PID 1 auto-spawns shell on boot
 
-##### 1.2.1 Page Tables
-
-**Location**: `src/kernel/vm/page_table.rs`
-
-Provides unified page table management across architectures with trait-based abstraction.
-
-**Key Features**:
-- **Multi-Architecture Support**: x86-64 (MMU & EPT), ARM64, RISC-V
-- **Large Page Support**: 4KB, 2MB, and 1GB page sizes
-- **Page Splitting**: Dynamically split large pages into smaller pages
-- **Page Table Traits**: 11 standardized methods for page table operations
-
-**Page Table Methods**:
-```rust
-trait PageTableOps {
-    // Create page table
-    fn new(arch: PageTableArch) -> Result<Self>;
-
-    // Map pages
-    fn map(&mut self, vaddr: VAddr, paddr: PAddr, flags: PageTableFlags) -> Result;
-    fn map_range(&mut self, start: VAddr, end: VAddr, phys_start: PAddr, flags: PageTableFlags) -> Result;
-
-    // Unmap pages
-    fn unmap(&mut self, vaddr: VAddr) -> Result;
-    fn unmap_range(&mut self, start: VAddr, end: VAddr) -> Result;
-
-    // Query mappings
-    fn query(&mut self, vaddr: VAddr) -> Result<PageTableEntry>;
-    fn translate(&mut self, vaddr: VAddr) -> Result<PAddr>;
-
-    // Page protection
-    fn protect(&mut self, vaddr: VAddr, flags: PageTableFlags) -> Result;
-
-    // Large page operations
-    fn split_large_page(&mut self, level: PageTableLevel, vaddr: VAddr, pte: *mut PtEntry) -> Result;
-
-    // Physical address
-    fn phys(&self) -> PAddr;
-}
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-##### 1.2.2 Demand Paging
+### 3. Memory Management
 
-**Location**: `src/kernel/vm/pager.rs`, `src/kernel/vm/fault.rs`
+**Location:** `src/mm/pmm.rs`, `src/arch/amd64/mmu.rs`
 
-Implements lazy allocation of pages on first access, reducing memory usage and improving startup time.
+- **Physical Memory Manager:** Bitmap-based page allocation
+- **Virtual Memory:** 4-level page tables (PML4 → PDPT → PD → PT)
+- **Page Table Isolation:** Separate kernel/userspace page tables per process
+- **Address Spaces:** Per-process virtual address spaces with 64MB heap
 
-**Key Features**:
-- **Lazy Allocation**: Pages allocated on first access
-- **Zero Page Optimization**: Shared zero-filled page for read-only accesses
-- **Page Fault Handling**: Seamless handling of page faults
-- **Page Pinning**: Prevent critical pages from being evicted
-
-**API**:
-```rust
-// Pager trait for handling page faults
-trait Pager {
-    fn fault(&self, vmo_id: u64, offset: usize, flags: PageFaultFlags) -> Result<Frame>;
-    fn supply_pages(&self, vmo_id: u64, offset: usize, len: usize) -> Result;
-    fn pin(&self, vmo_id: u64, offset: usize, len: usize) -> Result;
-    fn unpin(&self, vmo_id: u64, offset: usize, len: usize) -> Result;
-}
-
-// Handle page fault
-handle_page_fault(vmo_id: u64, offset: usize, flags: PageFaultFlags) -> Result<Frame>
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-##### 1.2.3 Page Eviction Policies
+### 4. Syscall Interface
 
-**Location**: `src/kernel/vm/pager.rs`
+**Location:** `src/syscall/mod.rs`, `src/arch/amd64/syscall.rs`
 
-Advanced page replacement algorithms for managing limited physical memory.
+- **int 0x80 Interface:** Software interrupt for userspace→kernel transitions
+- **Syscall Table:** Dispatches to kernel functions
+- **Implemented Syscalls:**
+  - `sys_read()` - Read from file descriptor
+  - `sys_write()` - Write to file descriptor
+  - `sys_open()` - Open file from ramdisk
+  - `sys_close()` - Close file descriptor
+  - `sys_lseek()` - Seek in file
+  - `sys_spawn()` - Spawn new process from ELF
+  - `sys_exit()` - Terminate process
+  - `sys_getpid()` - Get process ID
+  - `sys_getppid()` - Get parent process ID
+  - `sys_yield()` - Yield CPU to scheduler
 
-**Supported Policies**:
-1. **LRU (Least Recently Used)**: Evicts pages that haven't been accessed for the longest time
-2. **ARC (Adaptive Replacement Cache)**: Balances between recency and frequency
-3. **Clock Algorithm**: Approximation of LRU with lower overhead
-
-**API**:
-```rust
-pub enum EvictionPolicy {
-    None = 0,
-    LRU = 1,
-    ARC = 2,
-    Clock = 3,
-}
-
-// Track page accesses
-tracker.track_page(vmo_id: u64, offset: usize, paddr: PAddr);
-tracker.record_access(vmo_id: u64, offset: usize);
-tracker.record_dirty(vmo_id: u64, offset: usize);
-
-// Find eviction candidate
-candidate = tracker.find_eviction_candidate() -> Option<(u64, usize, PAddr)>
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-##### 1.2.4 Copy-on-Write (COW)
+### 5. ELF Loading
 
-**Location**: `src/kernel/vm/fault.rs`, `src/kernel/vm/pager.rs`
+**Location:** `src/exec/elf.rs`, `src/exec/process_loader.rs`
 
-Efficient memory sharing with deferred copying on write access.
+- **ELF64 Parser:** Loads 64-bit ELF binaries
+- **Segment Mapping:** Maps LOAD segments into process address space
+- **Entry Point:** Jumps to ELF entry point in userspace
+- **Dynamic Loading:** Static linking only (no dynamic loader yet)
 
-**Key Features**:
-- **COW Page Splitting**: Automatically splits shared pages on write
-- **COW Tracking**: Tracks which pages are COW'd
-- **Zero Copy**: Shares pages until modification is needed
-- **COW Fault Handler**: Handles write faults on COW pages
-
-**API**:
-```rust
-// COW Tracker
-pub struct CowTracker {
-    cow_pages: BTreeSet<usize>,
-    pinned_pages: BTreeSet<usize>,
-}
-
-impl CowTracker {
-    pub fn is_cow(&self, offset: usize) -> bool;
-    pub fn mark_cow(&mut self, offset: usize);
-    pub fn pin(&mut self, offset: usize);
-    pub fn unpin(&mut self, offset: usize);
-}
-
-// Check if fault is COW
-is_cow_fault(info: PageFaultInfo) -> bool
-
-// Handle COW allocation
-try_cow_allocation(addr: VAddr, aspace: &Arc<AddressSpace>, info: PageFaultInfo) -> Result
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-##### 1.2.5 Memory Debugging
+### 6. VFS + Ramdisk
 
-**Location**: `src/kernel/vm/debug.rs`
+**Location:** `src/fs/vfs.rs`, `src/fs/ramdisk.rs`
 
-Tools for debugging virtual memory configurations.
+- **VFS Abstraction:** File operations (read, write, open, close, seek)
+- **Ramdisk:** Embedded filesystem with ELF binaries
+- **File Types:** Regular files (no directories yet)
+- **Build Integration:** `build.rs` embeds userspace binaries
 
-**Features**:
-- **VA→PA Translation**: Walk page tables to translate virtual to physical addresses
-- **Page Table Dumps**: Dump entire page table hierarchy
-- **Mapping Inspection**: Inspect page table entries and flags
-
-**API**:
-```rust
-// Translate virtual address to physical
-vm_translate_virt_to_phys(vaddr: VAddr) -> Result<PAddr>
-
-// Dump page tables
-vm_dump_page_tables(vaddr: VAddr) -> Result
-vm_dump_page_table_recursive(paddr: PAddr, level: u8, vaddr: VAddr) -> Result
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-#### 1.3 Virtual Memory Objects (VMO)
+### 7. PS/2 Keyboard Driver
 
-**Location**: `src/kernel/object/vmo.rs`
+**Location:** `src/drivers/keyboard/`
 
-VMOs represent contiguous regions of virtual memory that can be mapped into address spaces.
+- **Hardware:** IRQ1, ports 0x60 (data) and 0x64 (command/status)
+- **Scancode Set 1:** Converts scancodes to ASCII
+- **Modifier Keys:** Shift, Ctrl, Alt, Caps Lock tracking
+- **Circular Buffer:** Lock-free ring buffer for keyboard events
+- **Blocking Read:** sys_read() blocks on stdin until character available
 
-**Key Features**:
-- **Page-Based Memory**: Memory managed in 4KB page chunks
-- **COW Clones**: Efficient copy-on-write for memory sharing
-- **Resizable VMOs**: Dynamic resizing with RESIZABLE flag
-- **Cache Policy Control**: Uncached, write-combining, write-through
-
-**API**:
-```rust
-// Create VMO
-Vmo::create(size: usize, flags: VmoFlags) -> Result<Vmo>
-
-// Read/Write
-vmo.read(offset: usize, buf: &mut [u8]) -> Result<usize>;
-vmo.write(offset: usize, buf: &[u8]) -> Result<usize>;
-
-// Clone (COW)
-vmo.clone(offset: usize, size: usize) -> Result<Vmo>
-
-// Resize (if RESIZABLE flag set)
-vmo.resize(new_size: usize) -> Result
-
-// Cache policy
-vmo.set_cache_policy(policy: CachePolicy)
-vmo.cache_policy() -> CachePolicy
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-#### 1.4 Shared Memory
+### 8. Framebuffer Console
 
-**Location**: `src/kernel/object/vmo.rs`
+**Location:** `src/drivers/display/`
 
-Track VMO mappings across multiple address spaces for shared memory support.
+- **UEFI GOP:** Gets framebuffer from UEFI Graphics Output Protocol
+- **PSF2 Fonts:** 8x16 pixel bitmap font
+- **Text Console:** Character grid with scrolling
+- **Colors:** RGB565 pixel format, Dracula theme colors
+- **sys_write Routing:** stdout/stderr writes to framebuffer
 
-**Key Features**:
-- **Mapping Tracking**: Track which address spaces have a VMO mapped
-- **Share Count**: Determine if a VMO is shared across processes
-- **Add/Remove Mappings**: Update mapping list on map/unmap operations
-
-**API**:
-```rust
-// Add mapping to address space
-vmo.add_mapping(aspace_id: u64)
-
-// Remove mapping
-vmo.remove_mapping(aspace_id: u64)
-
-// Check if shared
-vmo.is_shared() -> bool
-vmo.share_count() -> u32
-```
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
-### 2. Thread Management
+### 9. Interactive Shell
 
-#### 2.1 Thread Entry Point
+**Location:** `test-userspace/shell/shell.c`
 
-**Location**: `src/kernel/thread.rs`
+- **C Implementation:** Statically linked, no stdlib
+- **Built-in Commands:** help, clear, echo, ps, exit
+- **Command Parser:** Tokenizes input and executes
+- **Program Spawning:** Uses sys_spawn() to run ELF binaries
+- **Dracula Theme:** ANSI color codes for styling
 
-Provides standardized thread entry point handling with proper cleanup.
-
-**Key Features**:
-- **Entry Point Wrapper**: Standard `thread_entry()` function
-- **Argument Passing**: Pass typed arguments to threads
-- **Clean Exit**: Proper cleanup on thread exit
-- **Result Reporting**: Threads can return results
-
-**API**:
-```rust
-pub type ThreadEntryPoint = fn(*const u8) -> i32;
-
-pub extern "C" fn thread_entry(arg: *const u8) -> i32 {
-    // Call actual thread function
-    // Handle exit
-}
-```
-
-**Status**: ✅ **Implemented** - Production Ready
-
----
-
-#### 2.2 Per-Thread Kernel Stacks
-
-**Location**: `src/kernel/thread.rs`
-
-Each thread gets its own kernel stack for kernel-mode execution.
-
-**Key Features**:
-- **Guard Pages**: Protected pages to detect stack overflow
-- **Stack Allocation**: Automatic stack allocation on thread creation
-- **Stack Size Configuration**: Configurable stack sizes
-- **Stack Switching**: Proper context switching between thread stacks
-
-**Status**: ✅ **Implemented** - Production Ready
-
----
-
-#### 2.3 Idle Threads
-
-**Location**: `src/kernel/thread.rs`
-
-Per-CPU idle threads that run when no other work is available.
-
-**Key Features**:
-- **Halt on Idle**: CPU halts when idle to save power
-- **Wake on Interrupt**: Interrupts wake the idle thread
-- **Low Priority**: Lowest scheduling priority
-- **One Per CPU**: Each CPU has its own idle thread
-
-**Status**: ✅ **Implemented** - Production Ready
-
----
-
-### 3. Interrupt Handling
-
-#### 3.1 ARM64 GIC Support
-
-**Location**: `src/kernel/arch/arm64/gic.rs`
-
-Support for ARM Generic Interrupt Controller (GIC) v2/v3.
-
-**Key Features**:
-- **GICv2 and GICv3 Support**: Support for both GIC versions
-- **IRQ Routing**: Proper interrupt routing to CPUs
-- **Priority Handling**: Interrupt priority and masking
-- **SGI/PPI/SPI**: Support for all GIC interrupt types
-
-**Status**: ✅ **Implemented** - Production Ready
-
----
-
-### 4. Memory Allocators
-
-#### 4.1 Linked List Allocator
-
-**Location**: `src/kernel/allocator.rs`
-
-Heap allocator using linked list of free blocks.
-
-**Key Features**:
-- **First-Fit Allocation**: Fast allocation with first-fit strategy
-- **Coalescing**: Merge adjacent free blocks
-- **Splitting**: Split large blocks to satisfy small allocations
-- **no_std Compatible**: Works without standard library
-
-**Status**: ✅ **Implemented** - Production Ready
-
----
-
-#### 4.2 Bump Allocator (Replaced)
-
-**Status**: ❌ **Removed** - Replaced by Linked List Allocator
-
-The bump allocator was replaced with the more efficient linked list allocator that supports deallocation.
-
----
-
-### 5. Kernel Initialization
-
-#### 5.1 Kernel Initialization Completion
-
-**Location**: `src/kernel/init.rs`
-
-Proper initialization sequence for all kernel subsystems.
-
-**Initialization Order**:
-1. Console (early output)
-2. Physical Memory Manager (PMM)
-3. Virtual Memory Manager (VMM)
-4. Page Tables
-5. Heap Allocator
-6. Interrupt Controller
-7. Scheduler
-8. Idle Threads
-9. System Calls
-
-**Status**: ✅ **Implemented** - Production Ready
+**Status:** ✅ Complete
 
 ---
 
 ## Architecture Support
 
-### x86-64 (AMD64)
+### x86_64 (AMD64) - ✅ Primary Target
 
-**Location**: `src/kernel/arch/amd64/`
+- UEFI boot
+- 4-level page tables
+- Interrupt handling (IDT, IRQ, exceptions)
+- Context switching
+- All drivers implemented
 
-- **Page Tables**: MMU and EPT support
-- **Large Pages**: 4KB, 2MB, 1GB
-- **Page Splitting**: Dynamic large page splitting
+### ARM64 - ⏳ Planned
 
-**Status**: ✅ **Implemented** - Production Ready
+Cross-architecture design ready, hardware testing needed.
 
----
+### RISC-V - ⏳ Planned
 
-### ARM64 (AArch64)
-
-**Location**: `src/kernel/arch/arm64/`
-
-- **Page Tables**: 4-level translation tables
-- **Large Pages**: 4KB, 2MB, 1GB
-- **GIC Support**: GICv2/v3 interrupt controller
-
-**Status**: ✅ **Implemented** - Production Ready
+Cross-architecture design ready, hardware testing needed.
 
 ---
 
-### RISC-V
+## What's NOT Implemented Yet
 
-**Location**: `src/kernel/arch/riscv/`
+### Phase 7 - Minimal GUI (Planned)
 
-- **Page Tables**: Sv39/Sv48 support
-- **Large Pages**: 4KB, 2MB, 1GB
-- **PLIC/CLINT**: Interrupt controller support
+- USB HID driver (keyboard + mouse)
+- Framebuffer mapping into userspace
+- GUI server process
+- GUI client library
 
-**Status**: ✅ **Implemented** - Production Ready
+### Missing Features
 
----
-
-## Feature Status Summary
-
-| Feature | Status | Priority | Notes |
-|---------|--------|----------|-------|
-| Thread Entry Point | ✅ Complete | P1 | Production Ready |
-| Per-Thread Kernel Stacks | ✅ Complete | P1 | Production Ready |
-| Kernel Initialization | ✅ Complete | P1 | Production Ready |
-| VA→PA Walker | ✅ Complete | P1 | Production Ready |
-| VM Debugging | ✅ Complete | P1 | Production Ready |
-| COW Implementation | ✅ Complete | P2 | Production Ready |
-| Shared Memory Support | ✅ Complete | P2 | Production Ready |
-| ARM64 GIC Support | ✅ Complete | P2 | Production Ready |
-| Page Tables Trait | ✅ Complete | P3 | 11 Methods Implemented |
-| Replace Bump Allocator | ✅ Complete | P3 | Linked List Allocator |
-| Linked List Allocator | ✅ Complete | P3 | Production Ready |
-| Contiguous Allocation | ✅ Complete | P4 | Production Ready |
-| Large Page Support | ✅ Complete | P4 | With Page Splitting |
-| Demand Paging | ✅ Complete | P4 | With Zero Page Optimization |
-| Page Eviction Policies | ✅ Complete | P4 | LRU, ARC, Clock |
+- USB HID driver (PS/2 only currently)
+- Networking stack
+- Persistent filesystem (Ext2/3)
+- Dynamic linking
+- Multi-threading (single-threaded processes only)
+- Signal handling
+- Pipes and IPC
+- Directories in VFS (flat filesystem only)
 
 ---
 
-## Usage Examples
-
-### Creating a VMO
-
-```rust
-use kernel::object::vmo::{Vmo, VmoFlags};
-
-// Create a 16KB VMO
-let vmo = Vmo::create(0x4000, VmoFlags::empty())
-    .expect("Failed to create VMO");
-
-// Write data
-let data = b"Hello, World!";
-vmo.write(0, data).expect("Failed to write");
-
-// Read data
-let mut buf = [0u8; 13];
-vmo.read(0, &mut buf).expect("Failed to read");
-assert_eq!(&buf, data);
-```
-
-### COW Clone
-
-```rust
-// Create parent VMO
-let parent = Vmo::create(0x1000, VmoFlags::empty())?;
-
-// Clone with COW
-let child = parent.clone(0, 0x1000)?;
-
-// Writing to child creates new pages (copy-on-write)
-child.write(0, b"Modified data")?;
-// Parent still has original data
-```
-
-### Handling Page Faults
-
-```rust
-use kernel::vm::fault::{handle_page_fault, PageFaultInfo};
-
-let info = PageFaultInfo::new(
-    0x1000,        // faulting address
-    0x01,          // write fault
-    0x4000,        // instruction pointer
-    true,          // from user mode
-);
-
-let aspace = get_current_address_space();
-match handle_page_fault(info, &aspace) {
-    PageFaultResult::Handled => { /* Resume execution */ }
-    PageFaultResult::UserSpace => { /* Deliver signal */ }
-    PageFaultResult::Fatal => { /* Kill process */ }
-    PageFaultResult::Retry => { /* Retry instruction */ }
-}
-```
-
-### Page Eviction
-
-```rust
-use kernel::vm::pager::{EvictionPolicy, PageEvictionTracker};
-
-// Create eviction tracker with LRU policy
-let tracker = PageEvictionTracker::new(EvictionPolicy::LRU);
-
-// Track page accesses
-tracker.track_page(vmo_id, offset, paddr);
-tracker.record_access(vmo_id, offset);
-
-// Find page to evict
-if let Some((victim_vmo, victim_offset, victim_paddr)) = tracker.find_eviction_candidate() {
-    // Evict the page
-    free_physical_page(victim_paddr);
-}
-```
-
----
-
-## Building
+## Build Instructions
 
 ### Prerequisites
 
-- Rust nightly toolchain
-- QEMU (for testing)
-- Target-specific toolchains (optional)
+```bash
+# Rust toolchain (UEFI target)
+rustup target add x86_64-unknown-uefi
 
-### Build Commands
+# GCC for cross-compiling userspace C programs
+apt install gcc-x86-64-linux-gnu
+
+# Image creation tools
+apt install parted dosfstools coreutils
+```
+
+### Build
 
 ```bash
-# Build for x86-64
-cargo build --target x86_64-unknown-none
+cd /var/www/rustux.com/prod/rustux
 
-# Build for ARM64
-cargo build --target aarch64-unknown-none
+# Build kernel (UEFI application)
+cargo build --release --target x86_64-unknown-uefi
 
-# Build for RISC-V
-cargo build --target riscv64gc-unknown-none
+# Build userspace C programs
+cd test-userspace
+x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector \
+    shell.c -o shell.elf
+x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector \
+    init.c -o init.elf
 
-# Run tests
-cargo test
-
-# Build release version
-cargo build --release
+# Build live USB image
+./build-live-image.sh
 ```
 
 ---
 
-## Testing
+## System Requirements
 
-### QEMU Testing
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| **Architecture** | x86_64 (AMD64) | x86_64 (AMD64) |
+| **Boot** | UEFI 2.0 | UEFI 2.3+ |
+| **RAM** | 512 MB | 1 GB |
+| **Storage** | 128 MB (USB) | 4 GB |
+| **Input** | PS/2 Keyboard | PS/2 or USB HID* |
 
-```bash
-# Test x86-64
-qemu-system-x86_64 -kernel target/x86_64-unknown-none/release/rustux
+\* USB HID support planned for Phase 7
 
-# Test ARM64
-qemu-system-aarch64 -kernel target/aarch64-unknown-none/release/rustux -M virt
+---
 
-# Test RISC-V
-qemu-system-riscv64 -kernel target/riscv64gc-unknown-none/release/rustux
+## Dracula Theme (MANDATORY INVARIANT)
+
+The Dracula color palette is the default system theme and must survive:
+
+- Kernel rebuilds
+- CLI refactors
+- Framebuffer rewrites
+- GUI introduction later
+
+**Canonical Dracula Colors:**
+```
+FG_DEFAULT = #F8F8F2  (r: 248, g: 248, b: 242)
+BG_DEFAULT = #282A36  (r: 40, g: 42, b: 54)
+CYAN       = #8BE9FD  (r: 139, g: 233, b: 253)
+PURPLE     = #BD93F9  (r: 189, g: 147, b: 249)
+GREEN      = #50FA7B  (r: 80, g: 250, b: 123)
+RED        = #FF5555  (r: 255, g: 85, b: 85)
+ORANGE     = #FFB86C  (r: 255, g: 184, b: 108)
+YELLOW     = #F1FA8C  (r: 241, g: 250, b: 140)
 ```
 
 ---
 
-## Documentation Structure
+## Development Roadmap
 
-- **architecture.md**: Overall architecture design
-- **phase_a_boot_bringup.md**: Boot and bringup procedures
-- **phase_b_virtual_memory.md**: Virtual memory implementation
-- **phase_c_threads_syscalls.md**: Thread and syscall handling
-- **phase_d_kernel_objects.md**: Kernel object design
-- **phase_e_memory_features.md**: Advanced memory features
-- **phase_f_multiplatform.md**: Multi-platform support
-- **phase_g_userspace_sdk.md**: Userspace SDK
-- **phase_h_qa_testing.md**: QA and testing procedures
-- **phase_i_docs_governance.md**: Documentation governance
-- **todo.md**: Current TODO list
+### Phase 4: Userspace & Process Execution ✅ COMPLETE
+- ELF loading with segment mapping
+- Per-process address spaces
+- Page table isolation
+- int 0x80 syscall interface
+- First userspace instruction execution
+
+### Phase 5: Process Management & Essential Syscalls ✅ COMPLETE
+- Process table with 256 slots
+- Round-robin scheduler with context switching
+- Ramdisk for embedded files
+- sys_spawn() for spawning from paths
+- Init process (PID 1) auto-loads on boot
+
+### Phase 6: Input, Display, Interactive Shell ✅ COMPLETE
+- PS/2 keyboard driver (IRQ1, ports 0x60/0x64)
+- Scancode to ASCII conversion with modifier tracking
+- Framebuffer driver with PSF2 fonts
+- Text console with scrolling
+- Interactive C shell with Dracula theme
+
+### Phase 7: Minimal GUI 🚧 PLANNED
+- USB HID driver (keyboard + mouse)
+- Framebuffer mapping syscall
+- GUI server process (rustica-gui)
+- GUI client library (librustica_gui)
+
+---
+
+## Documentation
+
+- **[BUILD.md](docs/BUILD.md)** - Live USB build instructions
+- **[IMAGE.md](docs/IMAGE.md)** - System architecture and boot flow
+- **[PLAN.md](docs/PLAN.md)** - Development roadmap with detailed phase specs
+
+---
+
+## Project Structure
+
+```
+/var/www/rustux.com/prod/rustux/
+├── src/
+│   ├── arch/amd64/       # Architecture-specific code
+│   ├── drivers/          # Device drivers (keyboard, display)
+│   ├── exec/             # ELF loading, process creation
+│   ├── fs/               # VFS, ramdisk
+│   ├── init.rs           # Kernel initialization
+│   ├── lib.rs            # Library entry point
+│   ├── main.rs           # UEFI entry point
+│   ├── mm/               # Physical memory manager
+│   ├── process/          # Process table, context switching
+│   ├── sched/            # Round-robin scheduler
+│   └── syscall/          # System call handlers
+├── test-userspace/       # C programs (shell, init, hello, counter)
+│   ├── init.c            # First userspace process (PID 1)
+│   └── shell/
+│       └── shell.c       # Interactive shell
+├── build.rs              # Embed ramdisk with userspace binaries
+├── build-live-image.sh   # Live USB build script
+└── PLAN.md               # Development roadmap
+```
 
 ---
 
 ## Contributing
 
-See `phase_i_docs_governance.md` for contribution guidelines and coding standards.
+See PLAN.md for:
+- Coding standards
+- Development workflow
+- Phase specifications
+- Technical decisions
 
 ---
 
@@ -628,12 +351,13 @@ MIT License - See LICENSE file for details.
 
 ---
 
-## Contact
+## Links
 
-For questions or issues, please refer to the project documentation.
+- **Repository:** https://github.com/gitrustux/rustux
+- **Website:** https://rustux.com
+- **Issue Tracker:** https://github.com/gitrustux/rustux/issues
 
 ---
 
-*Last Updated: January 6, 2026*
-*Kernel Version: 0.1.0*
-*Status: Production Ready (Basic Embedded/Microkernel Use Cases)*
+**Last Updated:** January 23, 2025
+**Status:** Phase 6 COMPLETE - Interactive shell running with Dracula theme

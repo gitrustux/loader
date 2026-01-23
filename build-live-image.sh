@@ -13,8 +13,8 @@ set -e
 VERSION="0.1.0"
 IMAGE_NAME="rustica-live-amd64-${VERSION}.img"
 SYMLINK_NAME="rustica-live-amd64.img"
-KERNEL_DIR="/var/www/rustux.com/prod/kernel/kernel-efi"
-LOADER_DIR="/var/www/rustux.com/prod/kernel/uefi-loader"
+KERNEL_DIR="/var/www/rustux.com/prod/kernel-efi"
+LOADER_DIR="/var/www/rustux.com/prod/uefi-loader"
 OUTPUT_DIR="/var/www/rustux.com/html/rustica"
 MOUNT_POINT="/tmp/rustica-mount"
 

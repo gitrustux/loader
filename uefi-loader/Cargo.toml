@@ -1,0 +1,24 @@
+[package]
+name = "rustux-uefi-loader"
+version = "0.1.0"
+edition = "2021"
+authors = ["The Rustux Authors"]
+
+[dependencies]
+uefi = { version = "0.36", features = ["alloc", "logger"] }
+uefi-raw = "0.13"
+log = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[[bin]]
+name = "rustux-uefi-loader"
+test = false
+bench = false

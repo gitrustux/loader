@@ -1,0 +1,16 @@
+# Rust
+target/
+**/target/
+
+# QEMU / images
+*.img
+*.iso
+
+# Mount points
+/tmp/*
+/mnt/*
+
+# Editor junk
+*.swp
+*.bak
+.DS_Store

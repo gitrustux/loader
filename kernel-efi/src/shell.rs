@@ -257,22 +257,15 @@ fn cmd_irq(_args: &[&str]) {
         framebuffer::write_str_color("0 (IRQ NOT firing!)\n", framebuffer::colors::encode(framebuffer::colors::RED));
     }
 
-    // Try direct keyboard read
-    if let Some(c) = keyboard::try_read_char_direct() {
-        framebuffer::write_str("  Hardware: Key detected (");
-        framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[c as u8]) });
-        framebuffer::write_str(")\n");
-    } else {
-        framebuffer::write_str("  Hardware: No key pressed\n");
-    }
+    // Note: Direct hardware polling removed - honest architecture only
+    framebuffer::write_str("  Hardware: Use IRQ-driven input only\n");
 }
 
 /// Command: kbd - Test keyboard input (non-blocking)
 fn cmd_kbd(_args: &[&str]) {
     framebuffer::write_str("Testing keyboard (5 seconds, press any key)...\n");
 
-    let mut buffer = [0u8; 32];
-    let mut received = 0;
+    let mut received = false;
 
     // Wait for input with timeout
     for _ in 0..50000 {
@@ -281,14 +274,7 @@ fn cmd_kbd(_args: &[&str]) {
             framebuffer::write_str_color("IRQ: ", framebuffer::colors::encode(framebuffer::colors::GREEN));
             framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[c as u8]) });
             framebuffer::write_str("\n");
-            received = 1;
-            break;
-        } else if let Some(c) = keyboard::try_read_char_direct() {
-            // Got input via direct polling
-            framebuffer::write_str_color("POLL: ", framebuffer::colors::encode(framebuffer::colors::YELLOW));
-            framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&[c as u8]) });
-            framebuffer::write_str("\n");
-            received = 2;
+            received = true;
             break;
         }
 
@@ -297,12 +283,10 @@ fn cmd_kbd(_args: &[&str]) {
         }
     }
 
-    if received == 0 {
-        framebuffer::write_str_color("TIMEOUT - No input received\n", framebuffer::colors::encode(framebuffer::colors::RED));
-    } else if received == 1 {
+    if received {
         framebuffer::write_str_color("SUCCESS - IRQ driver working!\n", framebuffer::colors::encode(framebuffer::colors::GREEN));
     } else {
-        framebuffer::write_str_color("IRQ NOT working - polling works\n", framebuffer::colors::encode(framebuffer::colors::YELLOW));
+        framebuffer::write_str_color("TIMEOUT - No input received (IRQ may not be working)\n", framebuffer::colors::encode(framebuffer::colors::RED));
     }
 }
 

@@ -23,6 +23,8 @@ mod userspace_bin;
 mod filesystem;
 mod vga_console;
 mod native_console;
+mod acpi;
+mod usb;
 
 /// Exit UEFI boot services with frozen zone enforcement
 ///
@@ -99,6 +101,38 @@ fn main() -> Status {
             unsafe { core::arch::asm!("hlt") };
         }
     }
+
+    // ============================================================
+    // CRITICAL: Read ACPI tables BEFORE exiting boot services
+    // ============================================================
+    // ACPI tables contain interrupt routing information including
+    // interrupt source overrides that may remap IRQ1 (keyboard)
+    console::write_line("Reading ACPI tables for IRQ routing...");
+
+    // Find RSDP and parse MADT for IRQ1 override
+    // This MUST be done before ExitBootServices because we need
+    // to access UEFI configuration tables
+    let irq1_override = unsafe {
+        match acpi::find_rsdp() {
+            Some(rsdp) => {
+                console::write_line("  ACPI RSDP found");
+                let override_info = acpi::find_irq1_override(rsdp);
+                if override_info == acpi::Irq1Override::DEFAULT {
+                    console::write_line("  IRQ1: No override (default GSI=1)");
+                } else {
+                    console::write_line("  IRQ1: Override found!");
+                }
+                override_info
+            }
+            None => {
+                console::write_line("  ACPI RSDP not found, using defaults");
+                acpi::Irq1Override::DEFAULT
+            }
+        }
+    };
+
+    // Store IRQ1 override in runtime module for later use
+    unsafe { runtime::set_irq1_override(irq1_override); }
 
     // Capture memory map NOW (do not touch UEFI after this)
     console::write_line("Preparing to exit boot services...");
@@ -307,25 +341,14 @@ fn main() -> Status {
         }
         */
 
-        // Enable interrupts so IRQ handlers can work
-        // POST CODE 0x44: About to enable interrupts
+        // NOTE: Interrupts already enabled by init_keyboard_interrupts()
+        // No need to call sti again here
+        // POST CODE 0x44: Interrupts already enabled
         unsafe {
             core::arch::asm!(
                 "out dx, al",
                 in("dx") 0x80u16,
                 in("al") 0x44u8,
-                options(nomem, nostack)
-            );
-        }
-
-        core::arch::asm!("sti");
-
-        // POST CODE 0x45: Interrupts enabled
-        unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") 0x80u16,
-                in("al")   0x45u8,
                 options(nomem, nostack)
             );
         }
@@ -353,9 +376,6 @@ fn main() -> Status {
     // POST CODE 0x4C: In poll_read
     // POST CODE 0x4D: In keyboard_irq_handler
     // ... etc...
-
-    // Jump into shell
-    shell::run_shell();
 
     // Jump into shell
     framebuffer::write_str("Starting shell...\n");

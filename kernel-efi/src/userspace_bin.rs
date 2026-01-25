@@ -6,4 +6,6 @@
 #![allow(dead_code)]
 
 /// Embedded userspace test program binary
-pub const USERSPACE_BIN: &[u8] = include_bytes!("../../userspace/test/target/x86_64-unknown-none/release/rustux-userspace-test");
+// TODO: Re-enable after fixing userspace build
+// pub const USERSPACE_BIN: &[u8] = include_bytes!("../../userspace/test/target/x86_64-unknown-none/release/rustux-userspace-test");
+pub const USERSPACE_BIN: &[u8] = &[];

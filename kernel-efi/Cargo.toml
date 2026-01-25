@@ -4,14 +4,15 @@ version = "0.1.0"
 edition = "2021"
 authors = ["The Rustux Authors"]
 
+[dependencies]
+# UEFI dependencies
+uefi = { version = "0.36", features = ["alloc"] }
+uefi-raw = "0.13"
+log = "0.4"
+
 [features]
 default = []
 early-uefi-console-only = []
-
-[dependencies]
-uefi = { version = "0.36", features = ["alloc", "logger"] }
-uefi-raw = "0.13"
-log = "0.4"
 
 [profile.release]
 opt-level = "z"
@@ -24,5 +25,6 @@ panic = "abort"
 
 [[bin]]
 name = "rustux-kernel-efi"
+path = "src/main.rs"
 test = false
 bench = false

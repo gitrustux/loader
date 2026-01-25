@@ -93,6 +93,12 @@ const NUM_EXCEPTION_VECTORS: usize = 32;
 /// Exception handler table
 static mut EXCEPTION_HANDLERS: [Option<ExceptionHandler>; NUM_EXCEPTION_VECTORS] = [None; NUM_EXCEPTION_VECTORS];
 
+/// IRQ1 override information from ACPI MADT
+///
+/// This is set by main() before exiting boot services
+/// and read by init_keyboard_interrupts() when configuring IOAPIC
+static mut IRQ1_OVERRIDE: Option<crate::acpi::Irq1Override> = None;
+
 /// x86_64 IDT Entry (Interrupt Descriptor Table Entry)
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +180,20 @@ impl IdtPointer {
     fn new(base: u64, limit: u16) -> Self {
         Self { limit, base }
     }
+}
+
+/// Set IRQ1 override information from ACPI
+///
+/// Called by main() before exiting boot services
+pub unsafe fn set_irq1_override(override_info: crate::acpi::Irq1Override) {
+    IRQ1_OVERRIDE = Some(override_info);
+}
+
+/// Get IRQ1 override information
+///
+/// Called by init_keyboard_interrupts() when configuring IOAPIC
+pub unsafe fn get_irq1_override() -> Option<crate::acpi::Irq1Override> {
+    IRQ1_OVERRIDE
 }
 
 /// Interrupt Descriptor Table (256 entries for x86_64)
@@ -350,15 +370,15 @@ static EXCEPTION_STUBS: [unsafe extern "C" fn() -> !; 32] = [
 ///
 
 /// Keyboard IRQ1 interrupt handler stub
+///
+/// CRITICAL: Save ALL registers BEFORE doing anything else.
+/// The CPU pushes RIP, CS, RFLAGS, RSP, SS on interrupt entry.
+/// We must preserve the interrupt frame and all caller-saved registers.
 #[unsafe(naked)]
 unsafe extern "C" fn keyboard_irq_stub() -> ! {
     core::arch::naked_asm!(
-        // === IRQ1 ENTRY PROOF: Marker at column 1 (top line, second char) ===
-        // If this appears, IRQ1 IS reaching the CPU
-        "mov rax, 0xB8001",
-        "mov word ptr [rax], 0x4F21",  // '!' in red on white
-        // === END ENTRY PROOF ===
-        // Save all general-purpose registers
+        // === STEP 1: Save ALL registers FIRST ===
+        // Do NOTHING before this - rax, rcx, rdx, r8-r11 are caller-saved!
         "push rax",
         "push rbx",
         "push rcx",
@@ -374,9 +394,23 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
         "push r13",
         "push r14",
         "push r15",
-        // Call the keyboard handler
+
+        // === STEP 2: NOW it's safe to debug/use rax ===
+        // IRQ1 ENTRY PROOF: VGA text mode marker
+        "mov rax, 0xB8000",
+        "mov word ptr [rax], 0x4F21",  // '!' in red on white
+
+        // === CRITICAL: Read PS/2 data port to ACKNOWLEDGE the device ===
+        // The PS/2 controller will NOT deassert IRQ1 until we read port 0x60.
+        // Without this read, the IRQ line stays high and NO FURTHER IRQs will fire.
+        // This is NON-NEGOTIABLE for PS/2 interrupt operation.
+        "mov dx, 0x60",    // PS/2 data port
+        "in al, dx",       // Read scancode (this ACKs the device)
+
+        // === STEP 3: Call the keyboard handler ===
         "call {handler}",
-        // Restore registers
+
+        // === STEP 4: Restore registers in reverse order ===
         "pop r15",
         "pop r14",
         "pop r13",
@@ -391,13 +425,15 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
         "pop rdx",
         "pop rcx",
         "pop rbx",
-        // Save rax before using it for APIC EOI
-        "push rax",
-        // Send EOI to Local APIC (EOI register at offset 0x40 from base 0xFEE00000)
-        "mov eax, 0xFEE00040",
-        "mov dword ptr [rax], 0",
         "pop rax",
-        // Return from interrupt
+
+        // === STEP 5: Send EOI to Local APIC ===
+        // CRITICAL: EOI register is at offset 0xB0, NOT 0x40!
+        // 0xFEE00040 is NOT the EOI register - that's a critical bug
+        "mov rax, 0xFEE000B0",  // Correct EOI offset (0xB0 from base)
+        "mov dword ptr [rax], 0",
+
+        // === STEP 6: Return from interrupt ===
         "iretq",
         handler = sym crate::keyboard::keyboard_irq_handler
     );
@@ -543,119 +579,98 @@ pub unsafe fn pic_get_isr() -> (u8, u8) {
 
 /// Initialize keyboard interrupt handler for UEFI x86_64 (APIC mode)
 ///
-/// UEFI firmware routes hardware interrupts through IOAPIC → Local APIC,
-/// not the legacy 8259 PIC. This function enables the Local APIC and
-/// configures the IOAPIC to route keyboard IRQ1 to vector 33.
+/// This function sets up APIC-based interrupt routing for keyboard input.
+/// It configures both Local APIC and IOAPIC to enable IRQ1 delivery.
 pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
-    // ================================================================
-    // UEFI APIC INTERRUPT SETUP
-    // ================================================================
-    // UEFI firmware uses IOAPIC + Local APIC for interrupt routing.
-    // Legacy PIC is NOT functional under UEFI.
-
-    // --- 0️⃣ CRITICAL: Enable Local APIC via IA32_APIC_BASE MSR ---
-    // The LAPIC must be explicitly enabled via MSR 0x1B bit 11.
-    // Without this, the CPU silently drops all external interrupts!
+    // Disable x2APIC mode and ensure APIC is enabled for MMIO access
     const IA32_APIC_BASE: u32 = 0x1B;
+    const X2APIC_ENABLE_BIT: u64 = 1 << 10;
     const APIC_ENABLE_BIT: u64 = 1 << 11;
 
-    let mut msr_value: u64;
+    let mut eax: u32;
+    let mut edx: u32;
     core::arch::asm!(
         "rdmsr",
         in("ecx") IA32_APIC_BASE,
-        out("rax") msr_value,
+        out("eax") eax,
+        out("edx") edx,
         options(nostack, preserves_flags, readonly)
     );
+    let mut msr_value = (edx as u64) << 32 | (eax as u64);
 
-    // Set bit 11 to enable the APIC (preserve other bits like base address)
-    msr_value |= APIC_ENABLE_BIT;
-    core::arch::asm!(
-        "wrmsr",
-        in("ecx") IA32_APIC_BASE,
-        in("eax") (msr_value as u32),
-        in("edx") ((msr_value >> 32) as u32),
-        options(nomem, nostack, preserves_flags)
-    );
+    // Disable x2APIC if enabled and ensure APIC is on
+    if (msr_value & X2APIC_ENABLE_BIT) != 0 {
+        msr_value &= !X2APIC_ENABLE_BIT;
+        msr_value |= APIC_ENABLE_BIT;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_APIC_BASE,
+            in("eax") (msr_value as u32),
+            in("edx") ((msr_value >> 32) as u32),
+            options(nomem, nostack, preserves_flags)
+        );
+        // Re-read to verify
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_APIC_BASE,
+            out("eax") eax,
+            out("edx") edx,
+            options(nostack, preserves_flags, readonly)
+        );
+        msr_value = (edx as u64) << 32 | (eax as u64);
+    }
 
-    // --- 1️⃣ Enable Local APIC ---
+    // Verify APIC is enabled and x2APIC is disabled
+    if (msr_value & X2APIC_ENABLE_BIT) != 0 {
+        return Err("x2APIC mode could not be disabled - MMIO will not work");
+    }
+    if (msr_value & APIC_ENABLE_BIT) == 0 {
+        return Err("APIC could not be enabled");
+    }
+
+    // Enable Local APIC
     const LOCAL_APIC_BASE: u64 = 0xFEE0_0000;
-    const LAPIC_SVR_OFFSET: usize = 0xF0; // Spurious Vector Register (corrected offset)
-    const LAPIC_TPR_OFFSET: usize = 0x80; // Task Priority Register (corrected offset)
+    const LAPIC_SVR_OFFSET: usize = 0xF0;
+    const LAPIC_TPR_OFFSET: usize = 0x80;
+    const LAPIC_ID_OFFSET: usize = 0x20;
 
     let lapic_svr = (LOCAL_APIC_BASE + LAPIC_SVR_OFFSET as u64) as *mut u32;
     let lapic_tpr = (LOCAL_APIC_BASE + LAPIC_TPR_OFFSET as u64) as *mut u32;
+    let lapic_id_ptr = (LOCAL_APIC_BASE + LAPIC_ID_OFFSET as u64) as *const u32;
 
-    // Enable Local APIC (set bit 8) and set spurious vector to 0xFF
+    // Enable Local APIC and allow all interrupts
     lapic_svr.write_volatile(0x100 | 0xFF);
-    // Allow all interrupts (TPR = 0)
     lapic_tpr.write_volatile(0);
 
-    // --- DIAGNOSTIC: Test IDT entry 33 with int 33 instruction ---
-    // NOTE: This test must be AFTER IDT entry 33 is set up (see below)
-    // The int 33 was causing a hang because it was called before IDT setup
-    // If pixel changes = IDT/handler works, problem is IOAPIC/routing
-    // If nothing happens = IDT/gate type/selector is broken
-    // core::arch::asm!("int 33", options(nostack, preserves_flags));
+    // Read BSP APIC ID for IOAPIC destination
+    let lapic_id = lapic_id_ptr.read_volatile() >> 24;
 
-    // --- 2️⃣ Initialize IOAPIC ---
+    // Initialize IOAPIC
     const IOAPIC_BASE: u64 = 0xFEC0_0000;
     const IOAPIC_IOREGSEL: u64 = 0x00;
     const IOAPIC_IOWIN: u64 = 0x10;
-    const IRQ1_REDIR_OFFSET: u32 = 0x12; // Redirection table for IRQ1 (low dword)
+    const IRQ1_VECTOR: u32 = 0x41;
 
     let ioapic_sel = (IOAPIC_BASE + IOAPIC_IOREGSEL) as *mut u32;
     let ioapic_win = (IOAPIC_BASE + IOAPIC_IOWIN) as *mut u32;
 
-    const IRQ1_VECTOR: u32 = 33; // Vector assigned to keyboard IRQ1
+    // Get IRQ1 override from ACPI MADT
+    let irq1_override = get_irq1_override().unwrap_or(crate::acpi::Irq1Override::DEFAULT);
+    let gsi = irq1_override.gsi;
+    let redir_offset = 0x10 + (2 * gsi as u32);
 
-    // ================================================================
-    // CRITICAL: PS/2 Keyboard IRQ must be LEVEL-TRIGGERED + ACTIVE-LOW
-    // ================================================================
-    // PS/2 keyboard is different from typical edge-triggered IRQs:
-    // - Bit 13 (Polarity): 1 = Active low (PS/2 keyboard IRQ line is normally high, goes low when data ready)
-    // - Bit 15 (Trigger): 1 = Level triggered (keyboard holds IRQ low until data read)
-    // - Bit 16 (Mask): 0 = Not masked (MUST be 0 for IRQs to fire!)
-    //
-    // Edge-triggered config causes "one IRQ only" symptom because:
-    // - First keypress generates edge → IRQ fires
-    // - Keyboard holds IRQ line low (level)
-    // - IOAPIC never sees another edge (it's already low)
-    // - No more IRQs ever
-    // ================================================================
-    const IOAPIC_POLARITY_LOW: u32 = 1 << 13;  // Active low
-    const IOAPIC_TRIGGER_LEVEL: u32 = 1 << 15; // Level triggered
-    // Bit 16 (mask) = 0 means NOT masked
+    // Configure IOAPIC redirection entry for IRQ1
+    let polarity_bit = if irq1_override.active_low { 1 << 13 } else { 0 };
+    let trigger_bit = if irq1_override.level_triggered { 1 << 15 } else { 0 };
+    let low_dword = IRQ1_VECTOR | (0 << 8) | (0 << 11) | polarity_bit | trigger_bit | (0 << 16);
+    let high_dword = (lapic_id as u32) << 24;
 
-    let low_dword = IRQ1_VECTOR | IOAPIC_POLARITY_LOW | IOAPIC_TRIGGER_LEVEL;
-    let high_dword = 0; // Destination CPU 0 (BSP)
-
-    // Write low dword of IRQ1 redirection entry
-    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET);
+    ioapic_sel.write_volatile(redir_offset);
     ioapic_win.write_volatile(low_dword);
-    // Write high dword of IRQ1 redirection entry
-    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET + 1);
+    ioapic_sel.write_volatile(redir_offset + 1);
     ioapic_win.write_volatile(high_dword);
 
-    // Verify the write by reading it back (debug confirmation)
-    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET);
-    let read_low = ioapic_win.read_volatile();
-    ioapic_sel.write_volatile(IRQ1_REDIR_OFFSET + 1);
-    let read_high = ioapic_win.read_volatile();
-
-    // Draw visual confirmation of IOAPIC configuration
-    // Green line = IOAPIC configured, Red line = masked (bad)
-    if crate::framebuffer::is_initialized() {
-        let is_masked = (read_low & (1 << 16)) != 0;
-        let color = if is_masked { (0xFF, 0x55, 0x55) } else { (0x50, 0xFA, 0x7B) }; // Red if masked, Green if OK
-        // Draw a 3-pixel tall line at the top-left corner
-        for y in 0..3 {
-            for x in 0..20 {
-                crate::framebuffer::put_pixel(x, y, color.0, color.1, color.2);
-            }
-        }
-    }
-
-    // --- 3️⃣ IDT entry for IRQ1 (vector 33) ---
+    // Set up IDT entry for keyboard IRQ
     let kernel_cs: u16;
     core::arch::asm!(
         "mov {0:x}, cs",
@@ -663,17 +678,23 @@ pub unsafe fn init_keyboard_interrupts() -> Result<(), &'static str> {
         options(nomem, nostack, preserves_flags)
     );
     let keyboard_handler = keyboard_irq_stub as *const () as u64;
-    IDT[33] = IdtEntry::interrupt_gate(keyboard_handler, kernel_cs);
 
-    // Reload IDT to ensure the keyboard IRQ entry is visible
+    IDT[IRQ1_VECTOR as usize] = IdtEntry::interrupt_gate(keyboard_handler, kernel_cs);
+
+    // Reload IDT
     let idt_ptr = IdtPointer::new(
         &IDT as *const _ as u64,
         (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16
     );
     load_idt(&idt_ptr);
 
-    // --- 4️⃣ Initialize keyboard driver ---
+    // Initialize keyboard driver
     crate::keyboard::init();
+
+    // Enable CPU interrupts
+    core::arch::asm!("sti", options(nostack, preserves_flags));
+
+    crate::framebuffer::write_str("Interrupts initialized\n");
 
     Ok(())
 }
@@ -795,14 +816,14 @@ pub struct LocalApicRegisters {
     _reserved2: [u32; 4],           // 0x20-0x2F
     tpr: u32,                       // 0x30 - Task Priority Register
     _reserved3: [u32; 3],           // 0x34-0x3F
-    eoi: u32,                       // 0x40 - EOI Register
-    _reserved4: [u32; 3],           // 0x44-0x4F
+    _reserved4: [u32; 1],           // 0x40-0x43 (NOT EOI - EOI is at 0xB0!)
+    _reserved5: [u32; 2],           // 0x44-0x4B
     ldr: u32,                       // 0x50 - Logical Destination Register
-    _reserved5: [u32; 3],           // 0x54-0x5F
+    _reserved6: [u32; 3],           // 0x54-0x5F
     dfr: u32,                       // 0x60 - Destination Format Register
-    _reserved6: [u32; 3],           // 0x64-0x6F
+    _reserved7: [u32; 3],           // 0x64-0x6F
     svr: u32,                       // 0x70 - Spurious Interrupt Vector Register
-    _reserved7: [u32; 3],           // 0x74-0x7F
+    _reserved8: [u32; 3],           // 0x74-0x7F
     isr0: u32,                      // 0x80 - In-Service Register 0
     isr1: u32,                      // 0x84 - In-Service Register 1
     isr2: u32,                      // 0x88 - In-Service Register 2
@@ -815,35 +836,43 @@ pub struct LocalApicRegisters {
     tmr1: u32,                      // 0xA4 - Trigger Mode Register 1
     tmr2: u32,                      // 0xA8 - Trigger Mode Register 2
     tmr3: u32,                      // 0xAC - Trigger Mode Register 3
-    tmr4: u32,                      // 0xB0 - Trigger Mode Register 4
-    tmr5: u32,                      // 0xB4 - Trigger Mode Register 5
-    tmr6: u32,                      // 0xB8 - Trigger Mode Register 6
-    tmr7: u32,                      // 0xBC - Trigger Mode Register 7
-    irr0: u32,                      // 0xC0 - Interrupt Request Register 0
-    irr1: u32,                      // 0xC4 - Interrupt Request Register 1
-    irr2: u32,                      // 0xC8 - Interrupt Request Register 2
-    irr3: u32,                      // 0xCC - Interrupt Request Register 3
-    irr4: u32,                      // 0xD0 - Interrupt Request Register 4
-    irr5: u32,                      // 0xD4 - Interrupt Request Register 5
-    irr6: u32,                      // 0xD8 - Interrupt Request Register 6
-    irr7: u32,                      // 0xDC - Interrupt Request Register 7
-    error_status: u32,              // 0xE0 - Error Status Register
-    _reserved8: [u32; 5],           // 0xE4-0xF7
-    icr_low: u32,                   // 0xF0 - Interrupt Command Register Low
-    icr_high: u32,                  // 0xF4 - Interrupt Command Register High
-    _reserved9: [u32; 2],           // 0xF8-0xFF
-    timer_lvt: u32,                 // 0x100 - Timer Local Vector Table
-    thermal_lvt: u32,               // 0x110 - Thermal Monitor LVT
-    perf_lvt: u32,                  // 0x120 - Performance Counter LVT
-    lint0: u32,                     // 0x130 - Local Interrupt 0 (LINT0)
-    lint1: u32,                     // 0x140 - Local Interrupt 1 (LINT1)
-    error_lvt: u32,                 // 0x150 - Error LVT
-    _reserved10: [u32; 3],          // 0x160-0x16F
+    eoi: u32,                       // 0xB0 - End Of Interrupt Register (CORRECTED OFFSET!)
+    tmr4: u32,                      // 0xB4 - (was incorrectly labeled as EOI)
+    _reserved9: [u32; 1],           // 0xB8-0xBB
+    tmr5: u32,                      // 0xBC - Trigger Mode Register 5
+    _reserved10: [u32; 1],          // 0xC0-0xC3
+    irr0: u32,                      // 0xC4 - Interrupt Request Register 0 (padding for alignment)
+    _reserved11: [u32; 1],          // 0xC8-0xCB
+    irr1: u32,                      // 0xCC - Interrupt Request Register 1
+    _reserved12: [u32; 1],          // 0xD0-0xD3
+    irr2: u32,                      // 0xD4 - Interrupt Request Register 2
+    _reserved13: [u32; 1],          // 0xD8-0xDB
+    irr3: u32,                      // 0xDC - Interrupt Request Register 3
+    _reserved14: [u32; 1],          // 0xE0-0xE3
+    error_status: u32,              // 0xE4 - Error Status Register (shifted, see note)
+    _reserved15: [u32; 5],           // 0xE8-0xFF
+    icr_low: u32,                   // 0x100 - Interrupt Command Register Low
+    icr_high: u32,                  // 0x104 - Interrupt Command Register High
+    _reserved16: [u32; 2],           // 0x108-0x10F
+    timer_lvt: u32,                 // 0x110 - Timer Local Vector Table
+    _reserved17: [u32; 3],          // 0x114-0x11F
+    thermal_lvt: u32,               // 0x120 - Thermal Monitor LVT
+    _reserved18: [u32; 3],          // 0x124-0x12F
+    perf_lvt: u32,                  // 0x130 - Performance Counter LVT
+    _reserved19: [u32; 3],          // 0x134-0x13F
+    lint0: u32,                     // 0x140 - Local Interrupt 0 (LINT0)
+    _reserved20: [u32; 3],          // 0x144-0x14F
+    lint1: u32,                     // 0x150 - Local Interrupt 1 (LINT1)
+    _reserved21: [u32; 3],          // 0x154-0x15F
+    error_lvt: u32,                 // 0x160 - Error LVT
+    _reserved22: [u32; 3],          // 0x164-0x16F
     timer_initial: u32,             // 0x170 - Timer Initial Count
+    _reserved23: [u32; 2],          // 0x174-0x17B
     timer_current: u32,             // 0x180 - Timer Current Count
-    _reserved11: [u32; 2],          // 0x190-0x19F
-    timer_divide: u32,              // 0x1A0 - Timer Divide Configuration
-    _reserved12: [u32; 1],          // 0x1A4-0x1A7
+    _reserved24: [u32; 2],          // 0x184-0x18B
+    _reserved25: [u32; 1],          // 0x18C-0x18F
+    timer_divide: u32,              // 0x190 - Timer Divide Configuration
+    _reserved26: [u32; 1],          // 0x194-0x197
 }
 
 impl LocalApicRegisters {
@@ -928,8 +957,8 @@ impl InterruptController {
     /// Send End of Interrupt (EOI) to the APIC
     pub unsafe fn send_eoi(&self) {
         if let Some(ref apic) = LOCAL_APIC_ADDRESS {
-            // EOI register is at offset 0x40
-            apic.write_reg(0x40, 0);
+            // EOI register is at offset 0xB0 (NOT 0x40!)
+            apic.write_reg(0xB0, 0);
         }
     }
 }

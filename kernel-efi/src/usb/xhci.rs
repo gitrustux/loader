@@ -42,7 +42,7 @@ const USBSTS_PCD: u32 = 0x0000_0002; // Port Change Detect
 const USBSTS_HSE: u32 = 0x0000_0010; // Host System Error
 
 /// Port status register bits
-const PORTSC_CCS: u32 = 0x0000_0001; // Current Connect Status
+pub const PORTSC_CCS: u32 = 0x0000_0001; // Current Connect Status
 const PORTSC_CSC: u32 = 0x0000_0002; // Connect Status Change
 const PORTSC_PED: u32 = 0x0000_0002; // Port Enabled/Disabled
 const PORTSC_PEDC: u32 = 0x0000_0010; // Port Enabled/Disabled Change
@@ -181,8 +181,44 @@ impl XhciController {
     pub unsafe fn new(info: XhciInfo) -> Result<Self, UsbError> {
         let mmio_base = info.mmio_base as *mut u8;
 
+        crate::framebuffer::write_str("xHCI: Reading CAPLENGTH...\n");
+
         // Read CAPLENGTH to get capability register length
         let cap_length = mmio_base.add(REG_CAPLENGTH as usize).read_volatile() as u8;
+
+        // Verify MMIO is working - check for 0xFF (unmapped memory)
+        if cap_length == 0xFF {
+            crate::framebuffer::write_str("ERROR: CAPLENGTH = 0xFF - MMIO not mapped!\n");
+            return Err(UsbError::XhciInitFailed);
+        }
+
+        crate::framebuffer::write_str("xHCI: CAPLENGTH = ");
+        // Simple decimal print
+        if cap_length < 10 {
+            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + cap_length]).unwrap());
+        } else {
+            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + (cap_length / 10)]).unwrap());
+            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + (cap_length % 10)]).unwrap());
+        }
+        crate::framebuffer::write_str("\n");
+
+        // Read HCIVERSION (offset 0x02 in capability registers)
+        let hciversion = mmio_base.add(0x02).cast::<u16>().read_volatile();
+
+        crate::framebuffer::write_str("xHCI: HCIVERSION = 0x");
+        let mut version = hciversion;
+        for _ in 0..4 {
+            let nibble = (version & 0xF000) >> 12;
+            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
+            version <<= 4;
+        }
+        crate::framebuffer::write_str("\n");
+
+        if hciversion < 0x0100 {
+            crate::framebuffer::write_str("ERROR: Unsupported xHCI version (< 1.0)\n");
+            return Err(UsbError::XhciInitFailed);
+        }
 
         // Read RTSOFF to get runtime register offset (offset 0x18 in capability registers)
         // This is a 32-bit register, so we need to cast to u32 pointer
@@ -193,6 +229,18 @@ impl XhciController {
         // This is a 32-bit register, so we need to cast to u32 pointer
         let dboff = mmio_base.add(0x1C).cast::<u32>().read_volatile() & 0xFFFF_FFFE;
         let doorbell_offset = dboff as u64;
+
+        crate::framebuffer::write_str("xHCI: RTSOFF = 0x");
+        let mut rts = rts_offset;
+        for _ in 0..8 {
+            let nibble = (rts & 0xF0000000) >> 28;
+            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
+            rts <<= 4;
+        }
+        crate::framebuffer::write_str("\n");
+
+        crate::framebuffer::write_str("xHCI: Resetting controller...\n");
 
         let mut controller = Self {
             mmio_base: info.mmio_base,
@@ -206,6 +254,8 @@ impl XhciController {
         // Reset and initialize controller
         controller.reset()?;
         controller.init_operational()?;
+
+        crate::framebuffer::write_str("xHCI: Controller ready\n");
 
         Ok(controller)
     }
@@ -239,7 +289,7 @@ impl XhciController {
     }
 
     /// Read port status register
-    unsafe fn read_port_sc(&self, port: usize) -> u32 {
+    pub unsafe fn read_port_sc(&self, port: usize) -> u32 {
         self.read_op_reg(REG_PORTSC_BASE + (port * 0x10))
     }
 

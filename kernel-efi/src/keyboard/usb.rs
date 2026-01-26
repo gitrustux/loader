@@ -9,13 +9,10 @@
 ///
 /// Attempts to initialize the xHCI controller and find a USB HID keyboard.
 /// Returns Ok(()) if successful, Err if no USB keyboard found.
-pub fn init() -> Result<(), crate::usb::UsbError> {
+pub fn init() -> Result<(), &'static str> {
     unsafe {
-        // Initialize xHCI controller
-        crate::usb::xhci::init()?;
-
-        // Enumerate HID keyboard
-        let _keyboard = crate::usb::device::enumerate_hid_keyboard()?;
+        // Call top-level USB init (includes debug output)
+        crate::usb::init()?;
 
         Ok(())
     }

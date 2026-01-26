@@ -26,6 +26,9 @@ pub enum KeyboardBackend {
 /// Active keyboard backend
 static mut KEYBOARD_BACKEND: KeyboardBackend = KeyboardBackend::None;
 
+/// Flag to track if we've already shown the "no keyboard" warning
+static mut NO_KEYBOARD_WARNING_SHOWN: bool = false;
+
 /// Circular input buffer
 struct InputBuffer {
     data: [u8; INPUT_BUFFER_SIZE],
@@ -82,6 +85,9 @@ static mut INPUT_BUFFER: InputBuffer = InputBuffer::new();
 /// Prints [PS/2] if PS/2 detected, [USB KBD] if USB detected, [NO KEYBOARD] if none found.
 pub fn init() {
     unsafe {
+        // Reset the warning flag on init
+        NO_KEYBOARD_WARNING_SHOWN = false;
+
         // First try USB (Tier-1 input for modern systems)
         if let Ok(()) = usb::init() {
             KEYBOARD_BACKEND = KeyboardBackend::Usb;
@@ -130,9 +136,13 @@ pub fn read_line(buffer: &mut [u8]) -> usize {
             KeyboardBackend::Ps2 => read_line_ps2(buffer),
             KeyboardBackend::Usb => read_line_usb(buffer),
             KeyboardBackend::None => {
-                crate::framebuffer::write_str_color("\n[No keyboard attached - CLI running in display-only mode]\n",
-                    crate::framebuffer::colors::encode(crate::framebuffer::colors::YELLOW));
-                crate::framebuffer::write_str("Commands: help | clear | mem | kbd | ps | exit\n");
+                // Only print the warning message once
+                if !NO_KEYBOARD_WARNING_SHOWN {
+                    crate::framebuffer::write_str_color("\n[No keyboard attached - CLI running in display-only mode]\n",
+                        crate::framebuffer::colors::encode(crate::framebuffer::colors::YELLOW));
+                    crate::framebuffer::write_str("Commands: help | clear | mem | kbd | ps | exit\n");
+                    NO_KEYBOARD_WARNING_SHOWN = true;
+                }
                 0  // Return empty - shell will continue without input
             }
         }

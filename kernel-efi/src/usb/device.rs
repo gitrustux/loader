@@ -5,6 +5,7 @@
 // This module handles USB device enumeration for HID keyboard detection.
 
 use crate::usb::{UsbError, trb::*};
+use crate::usb::xhci::PORTSC_CCS;
 
 /// USB HID Boot Protocol keyboard report size
 pub const HID_REPORT_SIZE: usize = 8;
@@ -86,22 +87,45 @@ pub fn get_hid_keyboard() -> Option<HidKeyboardInfo> {
 pub unsafe fn enumerate_hid_keyboard() -> Result<HidKeyboardInfo, UsbError> {
     use crate::usb::xhci;
 
+    crate::framebuffer::write_str("USB: Getting xHCI controller...\n");
+
     // Get xHCI controller
     let controller = xhci::controller().ok_or(UsbError::XhciNotFound)?;
+
+    crate::framebuffer::write_str("USB: Checking ports 1-4 for devices...\n");
 
     // Check ports 1-4 for a connected device
     let mut found_port = None;
     for port in 1..=4 {
-        if controller.check_port_connection(port) {
+        crate::framebuffer::write_str("USB: Port ");
+        // Simple decimal print
+        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + port as u8]).unwrap());
+        crate::framebuffer::write_str("... ");
+
+        let portsc = controller.read_port_sc(port);
+
+        // Check CCS (Current Connect Status) bit
+        if portsc & PORTSC_CCS != 0 {
+            crate::framebuffer::write_str("CONNECTED\n");
             found_port = Some(port);
             break;
+        } else {
+            crate::framebuffer::write_str("empty\n");
         }
     }
 
     let port = found_port.ok_or(UsbError::DeviceNotFound)?;
 
+    crate::framebuffer::write_str("USB: Resetting port ");
+    crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + port as u8]).unwrap());
+    crate::framebuffer::write_str("...\n");
+
     // Reset the port
     controller.reset_port(port)?;
+
+    crate::framebuffer::write_str("USB: Assuming HID keyboard on port ");
+    crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + port as u8]).unwrap());
+    crate::framebuffer::write_str("\n");
 
     // For QEMU testing, assume:
     // - Slot ID 1 (first device)

@@ -83,6 +83,9 @@ static mut INPUT_BUFFER: InputBuffer = InputBuffer::new();
 ///
 /// Detects available keyboard hardware and sets the appropriate backend.
 /// Prints [PS/2] if PS/2 detected, [USB KBD] if USB detected, [NO KEYBOARD] if none found.
+///
+/// CRITICAL: Once xHCI initializes successfully and a USB device is detected (CCS=1),
+/// PS/2 fallback is DISABLED to prevent incorrect fallback behavior.
 pub fn init() {
     unsafe {
         // Reset the warning flag on init
@@ -95,7 +98,15 @@ pub fn init() {
             return;
         }
 
-        // Fall back to PS/2 (legacy hardware)
+        // Check if xHCI succeeded with device detected (but USB init failed later)
+        // This prevents PS/2 fallback when USB hardware is present but enumeration failed
+        if crate::usb::device::xhci_succeeded_with_device() {
+            crate::framebuffer::write_str("[USB DETECTED - ENUM PENDING] ");
+            KEYBOARD_BACKEND = KeyboardBackend::Usb; // Keep USB backend for retry
+            return;
+        }
+
+        // Fall back to PS/2 (legacy hardware) - only if no USB hardware detected
         if ps2::controller_present() {
             KEYBOARD_BACKEND = KeyboardBackend::Ps2;
             crate::framebuffer::write_str("[PS/2] ");

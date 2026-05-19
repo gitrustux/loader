@@ -22,6 +22,9 @@ pub struct CommandRingStruct {
     pub enqueue: AtomicU32,
     pub dequeue: AtomicU32,
     pub cycle_state: AtomicU32,
+    // Padding to prevent overlap with next allocation
+    // Total size: 256 + 12 = 268 bytes, round up to 320 bytes (5 * 64)
+    _padding: [u8; 52],
 }
 
 /// Event Ring - must be 64-byte aligned
@@ -30,6 +33,9 @@ pub struct EventRingStruct {
     pub trbs: [EventTrb; TRB_RING_SIZE],
     pub dequeue: AtomicU32,
     pub cycle_state: AtomicU32,
+    // Padding to prevent overlap with next allocation
+    // Total size: 256 + 8 = 264 bytes, round up to 320 bytes (5 * 64)
+    _padding: [u8; 56],
 }
 
 /// ERST Entry
@@ -44,12 +50,16 @@ pub struct ErstEntry {
 #[repr(C, align(64))]
 pub struct ErstStruct {
     pub entries: [ErstEntry; 1],
+    // Padding to prevent overlap with next allocation
+    // Total size: 16 bytes, round up to 64 bytes
+    _padding: [u8; 48],
 }
 
 /// DCBAA - must be 64-byte aligned
 #[repr(C, align(64))]
 pub struct DcbaaStruct {
     pub data: [u64; 256],
+    // No padding needed - this is the last (largest) allocation
 }
 
 /// Static allocations
@@ -58,12 +68,14 @@ pub static mut COMMAND_RING_DATA: CommandRingStruct = CommandRingStruct {
     enqueue: AtomicU32::new(0),
     dequeue: AtomicU32::new(0),
     cycle_state: AtomicU32::new(1),
+    _padding: [0; 52],
 };
 
 pub static mut EVENT_RING_DATA: EventRingStruct = EventRingStruct {
     trbs: [EventTrb { trb_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
     dequeue: AtomicU32::new(0),
     cycle_state: AtomicU32::new(1),
+    _padding: [0; 56],
 };
 
 pub static mut ERST_DATA: ErstStruct = ErstStruct {
@@ -72,6 +84,7 @@ pub static mut ERST_DATA: ErstStruct = ErstStruct {
         segment_size: TRB_RING_SIZE as u32,
         _reserved: 0,
     }],
+    _padding: [0; 48],
 };
 
 pub static mut DCBAA_DATA: DcbaaStruct = DcbaaStruct {

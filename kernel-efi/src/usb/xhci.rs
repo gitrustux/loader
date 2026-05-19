@@ -465,6 +465,15 @@ impl XhciController {
         print_hex_u64(crcr);
         crate::framebuffer::write_str("\n");
 
+        // Check CRR (Command Ring Running) bit before writing
+        let crcr_before = self.read_op_reg(REG_CRCR);
+        crate::framebuffer::write_str("xHCI: CRCR before=0x");
+        print_hex_u32(crcr_before);
+        crate::framebuffer::write_str("\n");
+        if crcr_before & (1 << 3) != 0 {
+            crate::framebuffer::write_str("xHCI: WARNING - CRR bit set, ring running!\n");
+        }
+
         // Write CRCR as two 32-bit registers
         let crcr_lo: u32 = (crcr & 0xFFFFFFFF) as u32;
         let crcr_hi: u32 = ((crcr >> 32) & 0xFFFFFFFF) as u32;
@@ -476,14 +485,45 @@ impl XhciController {
         print_hex_u32(crcr_hi);
         crate::framebuffer::write_str("\n");
 
-        self.write_op_reg(REG_CRCR, crcr_lo);
+        // Calculate actual MMIO addresses for debugging
+        let mmio_base = self.mmio_base as *mut u8;
+        let op_base = mmio_base.add(self.cap_length as usize);
+        let crcr_lo_addr = op_base.add(REG_CRCR) as u64;
+        let crcr_hi_addr = op_base.add(REG_CRCR + 4) as u64;
+
+        crate::framebuffer::write_str("xHCI: MMIO base=0x");
+        print_hex_u64(self.mmio_base);
+        crate::framebuffer::write_str("\n");
+        crate::framebuffer::write_str("xHCI: Writing CRCR_LO to addr=0x");
+        print_hex_u64(crcr_lo_addr);
+        crate::framebuffer::write_str(" val=0x");
+        print_hex_u32(crcr_lo);
+        crate::framebuffer::write_str("\n");
+        crate::framebuffer::write_str("xHCI: Writing CRCR_HI to addr=0x");
+        print_hex_u64(crcr_hi_addr);
+        crate::framebuffer::write_str(" val=0x");
+        print_hex_u32(crcr_hi);
+        crate::framebuffer::write_str("\n");
+
+        // Write HI first (some xHCI controllers require this order)
         self.write_op_reg(REG_CRCR + 4, crcr_hi);
+        // Small delay between writes
+        for _ in 0..100 {
+            core::arch::asm!("nop", options(nomem, nostack));
+        }
+        self.write_op_reg(REG_CRCR, crcr_lo);
 
         // Verify CRCR was written correctly
         let crcr_lo_read = self.read_op_reg(REG_CRCR);
         let crcr_hi_read = self.read_op_reg(REG_CRCR + 4);
         let crcr_read: u64 = (crcr_hi_read as u64) << 32 | (crcr_lo_read as u64);
 
+        crate::framebuffer::write_str("xHCI: CRCR_LO readback=0x");
+        print_hex_u32(crcr_lo_read);
+        crate::framebuffer::write_str("\n");
+        crate::framebuffer::write_str("xHCI: CRCR_HI readback=0x");
+        print_hex_u32(crcr_hi_read);
+        crate::framebuffer::write_str("\n");
         crate::framebuffer::write_str("xHCI: CRCR readback=0x");
         print_hex_u64(crcr_read);
         if crcr_read == crcr {

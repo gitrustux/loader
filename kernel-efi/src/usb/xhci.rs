@@ -5,7 +5,7 @@
 // This module implements xHCI controller driver with transfer ring and event ring support.
 
 use crate::usb::{XhciInfo, UsbError, trb::*};
-use crate::usb::dma::{COMMAND_RING, EVENT_RING, ERST, DCBAA};
+use crate::usb::dma::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum number of USB devices
@@ -207,7 +207,7 @@ impl XhciController {
 
         // Initialize ERST with event ring address
         unsafe {
-            ERST.init(&EVENT_RING);
+            erst_init();
         }
 
         let mut controller = Self {
@@ -309,11 +309,11 @@ impl XhciController {
         // ============================================================
 
         // Command ring
-        let cmd_base = COMMAND_RING.trb_base();
+        let cmd_base = command_ring_base();
         crate::framebuffer::write_str("xHCI: Command ring virt=phys=0x");
         print_hex_u64(cmd_base);
         crate::framebuffer::write_str(" align=");
-        if COMMAND_RING.is_aligned() {
+        if command_ring_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
@@ -321,11 +321,11 @@ impl XhciController {
         }
 
         // Event ring
-        let evt_base = EVENT_RING.trb_base();
+        let evt_base = event_ring_base();
         crate::framebuffer::write_str("xHCI: Event ring virt=phys=0x");
         print_hex_u64(evt_base);
         crate::framebuffer::write_str(" align=");
-        if EVENT_RING.is_aligned() {
+        if event_ring_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
@@ -333,11 +333,11 @@ impl XhciController {
         }
 
         // ERST entry
-        let erst_addr = ERST.base();
+        let erst_addr = erst_base();
         crate::framebuffer::write_str("xHCI: ERST entry virt=phys=0x");
         print_hex_u64(erst_addr);
         crate::framebuffer::write_str(" align=");
-        if ERST.is_aligned() {
+        if erst_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
@@ -345,11 +345,11 @@ impl XhciController {
         }
 
         // DCBAA
-        let dcbaa_ptr = DCBAA.base();
+        let dcbaa_ptr = dcbaa_base();
         crate::framebuffer::write_str("xHCI: DCBAA virt=phys=0x");
         print_hex_u64(dcbaa_ptr);
         crate::framebuffer::write_str(" align=");
-        if DCBAA.is_aligned() {
+        if dcbaa_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
@@ -441,9 +441,9 @@ impl XhciController {
         // Per xHCI spec 5.4.5: CRCR is initialized ONCE, then never modified
         // except for RCS bit toggling when ring wraps.
 
-        // FRESH read of command ring base - no variable shadowing!
-        let cmd_ring_base = COMMAND_RING.trb_base();
-        let cmd_cycle = COMMAND_RING.cycle();
+        // FRESH read of command ring base - use function call to ensure no caching
+        let cmd_ring_base: u64 = command_ring_base();
+        let cmd_cycle: u64 = command_ring_cycle();
 
         crate::framebuffer::write_str("xHCI: CRCR calculation:\n");
         crate::framebuffer::write_str("xHCI:   cmd_ring_base=0x");
@@ -459,15 +459,15 @@ impl XhciController {
             return Err(UsbError::XhciInitFailed);
         }
 
-        let crcr = cmd_ring_base | cmd_cycle;
+        let crcr: u64 = cmd_ring_base | cmd_cycle;
 
         crate::framebuffer::write_str("xHCI: CRCR calculated=0x");
         print_hex_u64(crcr);
         crate::framebuffer::write_str("\n");
 
         // Write CRCR as two 32-bit registers
-        let crcr_lo = (crcr & 0xFFFFFFFF) as u32;
-        let crcr_hi = ((crcr >> 32) & 0xFFFFFFFF) as u32;
+        let crcr_lo: u32 = (crcr & 0xFFFFFFFF) as u32;
+        let crcr_hi: u32 = ((crcr >> 32) & 0xFFFFFFFF) as u32;
 
         crate::framebuffer::write_str("xHCI: CRCR_LO=0x");
         print_hex_u32(crcr_lo);
@@ -482,7 +482,7 @@ impl XhciController {
         // Verify CRCR was written correctly
         let crcr_lo_read = self.read_op_reg(REG_CRCR);
         let crcr_hi_read = self.read_op_reg(REG_CRCR + 4);
-        let crcr_read = (crcr_hi_read as u64) << 32 | (crcr_lo_read as u64);
+        let crcr_read: u64 = (crcr_hi_read as u64) << 32 | (crcr_lo_read as u64);
 
         crate::framebuffer::write_str("xHCI: CRCR readback=0x");
         print_hex_u64(crcr_read);
@@ -565,7 +565,7 @@ impl XhciController {
     /// Poll for events
     pub unsafe fn poll_events(&self) -> Option<EventTrb> {
         // Update ERDP to clear events (use interrupter 0 registers)
-        let erdp = EVENT_RING.dequeue_ptr();
+        let erdp = event_ring_dequeue_ptr();
         self.write_runtime_reg(REG_ERDP_LO_0, (erdp & 0xFFFF_FFFF) as u32);
         self.write_runtime_reg(REG_ERDP_HI_0, ((erdp >> 32) & 0xFFFF_FFFF) as u32);
 
@@ -577,7 +577,7 @@ impl XhciController {
         }
 
         // Try to dequeue an event
-        EVENT_RING.dequeue()
+        event_ring_dequeue()
     }
 
     /// Issue Enable Slot command and wait for completion
@@ -599,8 +599,8 @@ impl XhciController {
         }
 
         // Show command ring state before enqueue
-        let enqueue_idx = COMMAND_RING.enqueue.load(Ordering::Acquire);
-        let cycle = COMMAND_RING.cycle();
+        let enqueue_idx = command_ring_enqueue_idx();
+        let cycle = command_ring_cycle_value();
 
         crate::framebuffer::write_str("xHCI: CMD idx=");
         crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + enqueue_idx as u8]).unwrap());
@@ -620,7 +620,7 @@ impl XhciController {
         crate::framebuffer::write_str("xHCI: TRB Type=9 (Enable Slot)\n");
 
         // Enqueue to command ring
-        COMMAND_RING.enqueue(&trb)?;
+        command_ring_enqueue(&trb)?;
 
         // Ring command doorbell (doorbell 0) to notify controller
         // NOTE: CRCR was already set during init, controller tracks dequeue internally
@@ -693,8 +693,7 @@ impl XhciController {
 
         // Try to dump event ring state even on timeout
         crate::framebuffer::write_str("xHCI: Event ring state:\n");
-        let evt_dequeue = EVENT_RING.dequeue.load(Ordering::Acquire);
-        let evt_cycle = EVENT_RING.cycle_state.load(Ordering::Acquire);
+        let (evt_dequeue, evt_cycle) = event_ring_state();
         crate::framebuffer::write_str("xHCI:  dequeue=");
         crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + evt_dequeue as u8]).unwrap());
         crate::framebuffer::write_str(" cycle=");
@@ -702,7 +701,7 @@ impl XhciController {
         crate::framebuffer::write_str("\n");
 
         // Dump first event TRB regardless of cycle state
-        let first_trb = EVENT_RING.data[0];
+        let first_trb = event_ring_first_trb();
         crate::framebuffer::write_str("xHCI:  First TRB: ");
         print_hex_u64(first_trb.trb_ptr);
         crate::framebuffer::write_str(" ");

@@ -5,6 +5,7 @@
 // This module implements xHCI controller driver with transfer ring and event ring support.
 
 use crate::usb::{XhciInfo, UsbError, trb::*};
+use crate::usb::dma::{COMMAND_RING, EVENT_RING, ERST, DCBAA};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum number of USB devices
@@ -128,168 +129,14 @@ impl TransferRing {
     }
 }
 
-/// Command Ring (64-byte aligned for xHCI DMA)
-#[repr(C, align(64))]
-pub struct CommandRing {
-    /// Command TRBs (16 bytes each)
-    pub trbs: [NormalTrb; TRB_RING_SIZE],
-    /// Enqueue pointer (index)
-    pub enqueue: AtomicU32,
-    /// Dequeue pointer (index)
-    pub dequeue: AtomicU32,
-    /// Cycle state (0 or 1)
-    pub cycle_state: AtomicU32,
-}
-
-impl CommandRing {
-    /// Create a new command ring
-    pub fn new() -> Self {
-        Self {
-            trbs: [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
-            enqueue: AtomicU32::new(0),
-            dequeue: AtomicU32::new(0),
-            cycle_state: AtomicU32::new(1),
-        }
-    }
-
-    /// Enqueue a command TRB
-    pub unsafe fn enqueue(&self, trb: &NormalTrb) -> Result<(), UsbError> {
-        let index = self.enqueue.load(Ordering::Acquire) as usize;
-        let cycle = self.cycle_state.load(Ordering::Acquire);
-
-        // Check if ring is full
-        let next_index = (index + 1) % TRB_RING_SIZE;
-        if next_index == self.dequeue.load(Ordering::Acquire) as usize {
-            return Err(UsbError::Timeout); // Ring full
-        }
-
-        // Write TRB
-        let trb_ptr = &self.trbs[index] as *const NormalTrb as *mut NormalTrb;
-        (*trb_ptr).data_ptr = trb.data_ptr;
-        (*trb_ptr).status = trb.status;
-        (*trb_ptr).control = trb.control | (cycle & 1);
-
-        // Update enqueue pointer
-        self.enqueue.store(next_index as u32, Ordering::Release);
-
-        // Toggle cycle bit if wrapping
-        if next_index == 0 {
-            let new_cycle = cycle ^ 1;
-            self.cycle_state.store(new_cycle, Ordering::Release);
-        }
-
-        Ok(())
-    }
-
-    /// Get enqueue pointer for CRCR
-    /// Returns the physical address for DMA
-    pub fn enqueue_ptr(&self) -> u64 {
-        let base = &self.trbs[0] as *const NormalTrb as u64;
-        let offset = self.enqueue.load(Ordering::Acquire) as u64 * 16;
-        base + offset
-    }
-
-    /// Get physical address of command ring base
-    pub fn physical_base(&self) -> u64 {
-        &self.trbs[0] as *const NormalTrb as u64
-    }
-}
-
-/// Event Ring Segment Table Entry (per xHCI spec 6.5)
-#[repr(C)]
-pub struct ErstEntry {
-    /// Segment base address (64-bit physical address)
-    pub segment_base: u64,
-    /// Segment size (number of TRBs)
-    pub segment_size: u32,
-    /// Reserved
-    _reserved: u32,
-}
-
-/// Event Ring
-#[repr(C, align(64))]
-pub struct EventRing {
-    /// Event TRBs (16 bytes each, aligned to 64-byte boundary)
-    pub trbs: [EventTrb; TRB_RING_SIZE],
-    /// Dequeue pointer (index)
-    pub dequeue: AtomicU32,
-    /// Cycle state (0 or 1)
-    pub cycle_state: AtomicU32,
-    /// ERST entry for this ring
-    pub erst_entry: ErstEntry,
-}
-
-impl EventRing {
-    /// Create a new event ring
-    pub fn new() -> Self {
-        Self {
-            trbs: [EventTrb { trb_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
-            dequeue: AtomicU32::new(0),
-            cycle_state: AtomicU32::new(1),
-            erst_entry: ErstEntry {
-                segment_base: 0,
-                segment_size: TRB_RING_SIZE as u32,
-                _reserved: 0,
-            },
-        }
-    }
-
-    /// Initialize ERST entry with physical address
-    pub unsafe fn init_erst(&mut self) {
-        // Get physical address of the event ring
-        let phys_addr = &self.trbs[0] as *const EventTrb as u64;
-        self.erst_entry.segment_base = phys_addr;
-        self.erst_entry.segment_size = TRB_RING_SIZE as u32;
-    }
-
-    /// Dequeue an event TRB
-    pub unsafe fn dequeue(&self) -> Option<EventTrb> {
-        let index = self.dequeue.load(Ordering::Acquire) as usize;
-        let cycle = self.cycle_state.load(Ordering::Acquire);
-
-        let trb = self.trbs[index];
-        let trb_cycle = (trb.control & TRB_CYCLE_BIT) as u32;
-
-        // Check if TRB is owned by controller (cycle bit mismatch)
-        if trb_cycle != (cycle & 1) {
-            return None; // No new events
-        }
-
-        // Update dequeue pointer
-        let next_index = (index + 1) % TRB_RING_SIZE;
-        self.dequeue.store(next_index as u32, Ordering::Release);
-
-        // Toggle cycle bit if wrapping
-        if next_index == 0 {
-            let new_cycle = cycle ^ 1;
-            self.cycle_state.store(new_cycle, Ordering::Release);
-        }
-
-        Some(trb)
-    }
-
-    /// Get dequeue pointer for ERDP
-    pub fn dequeue_ptr(&self) -> u64 {
-        let base = &self.trbs[0] as *const EventTrb as u64;
-        let offset = self.dequeue.load(Ordering::Acquire) as u64 * 16;
-        base + offset
-    }
-
-    /// Get physical address of ERST entry
-    pub fn erst_physical_addr(&self) -> u64 {
-        &self.erst_entry as *const ErstEntry as u64
-    }
-}
-
 /// xHCI controller state
 pub struct XhciController {
     mmio_base: u64,
     cap_length: u8,
     runtime_offset: u64,
     doorbell_offset: u64,
-    pub command_ring: CommandRing,
+    // Rings are now in the dma module, not owned here
     pub transfer_ring: TransferRing,
-    pub event_ring: EventRing,
 }
 
 impl XhciController {
@@ -358,14 +205,17 @@ impl XhciController {
 
         crate::framebuffer::write_str("xHCI: Resetting controller...\n");
 
+        // Initialize ERST with event ring address
+        unsafe {
+            ERST.init(&EVENT_RING);
+        }
+
         let mut controller = Self {
             mmio_base: info.mmio_base,
             cap_length,
             runtime_offset,
             doorbell_offset,
-            command_ring: CommandRing::new(),
             transfer_ring: TransferRing::new(),
-            event_ring: EventRing::new(),
         };
 
         // Reset and initialize controller
@@ -454,75 +304,74 @@ impl XhciController {
         // virtual addresses should equal physical addresses (identity mapping)
         crate::framebuffer::write_str("xHCI: Assuming identity mapping (virt=phys)\n");
 
-        // Initialize event ring ERST entry with physical address
-        // NOTE: In raw mode (no paging), virtual = physical
-        self.event_ring.init_erst();
+        // ============================================================
+        // STEP 1: Verify and print all DMA buffer addresses
+        // ============================================================
 
-        // Debug: Print ring addresses with virt/phys labels
+        // Command ring
+        let cmd_base = COMMAND_RING.trb_base();
         crate::framebuffer::write_str("xHCI: Command ring virt=phys=0x");
-        let cmd_base = self.command_ring.physical_base();
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (cmd_base >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
-        // Verify 64-byte alignment (lower 6 bits should be 0)
-        let alignment = cmd_base & 0x3F;
+        print_hex_u64(cmd_base);
         crate::framebuffer::write_str(" align=");
-        if alignment == 0 {
+        if COMMAND_RING.is_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
+            return Err(UsbError::XhciInitFailed);
         }
 
+        // Event ring
+        let evt_base = EVENT_RING.trb_base();
         crate::framebuffer::write_str("xHCI: Event ring virt=phys=0x");
-        let evt_base = self.event_ring.erst_entry.segment_base;
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (evt_base >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
-        let alignment = evt_base & 0x3F;
+        print_hex_u64(evt_base);
         crate::framebuffer::write_str(" align=");
-        if alignment == 0 {
+        if EVENT_RING.is_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
+            return Err(UsbError::XhciInitFailed);
         }
 
+        // ERST entry
+        let erst_addr = ERST.base();
         crate::framebuffer::write_str("xHCI: ERST entry virt=phys=0x");
-        let erst_addr = self.event_ring.erst_physical_addr();
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (erst_addr >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
-        crate::framebuffer::write_str("\n");
-
-        // Set up DCBAA (Device Context Base Address Array)
-        // DCBAA must be 64-byte aligned and contain pointers to device contexts
-        static mut DCBAA: [u64; 256] = [0; 256]; // 256 slots (max)
-        let dcbaa_ptr = &DCBAA[0] as *const u64 as u64;
-
-        // Verify DCBAA alignment
-        crate::framebuffer::write_str("xHCI: DCBAA virt=phys=0x");
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (dcbaa_ptr >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
+        print_hex_u64(erst_addr);
         crate::framebuffer::write_str(" align=");
-        if dcbaa_ptr & 0x3F == 0 {
+        if ERST.is_aligned() {
             crate::framebuffer::write_str("OK\n");
         } else {
             crate::framebuffer::write_str("BAD!\n");
+            return Err(UsbError::XhciInitFailed);
         }
 
-        self.write_op_reg(REG_DCBAAP, (dcbaa_ptr & 0xFFFFFFFF) as u32);
-        self.write_op_reg(REG_DCBAAP + 4, ((dcbaa_ptr >> 32) & 0xFFFFFFFF) as u32);
+        // DCBAA
+        let dcbaa_ptr = DCBAA.base();
+        crate::framebuffer::write_str("xHCI: DCBAA virt=phys=0x");
+        print_hex_u64(dcbaa_ptr);
+        crate::framebuffer::write_str(" align=");
+        if DCBAA.is_aligned() {
+            crate::framebuffer::write_str("OK\n");
+        } else {
+            crate::framebuffer::write_str("BAD!\n");
+            return Err(UsbError::XhciInitFailed);
+        }
 
-        // Set up Event Ring Segment Table (ERST) for interrupter 0
-        // First, set ERST size (number of segments)
+        // ============================================================
+        // STEP 2: Program DCBAAP (Device Context Base Address Array Pointer)
+        // ============================================================
+
+        let dcbaa_lo = (dcbaa_ptr & 0xFFFFFFFF) as u32;
+        let dcbaa_hi = ((dcbaa_ptr >> 32) & 0xFFFFFFFF) as u32;
+        self.write_op_reg(REG_DCBAAP, dcbaa_lo);
+        self.write_op_reg(REG_DCBAAP + 4, dcbaa_hi);
+
+        crate::framebuffer::write_str("xHCI: DCBAAP programmed\n");
+
+        // ============================================================
+        // STEP 3: Program ERST (Event Ring Segment Table)
+        // ============================================================
+
+        // Set ERST size (number of segments)
         self.write_runtime_reg(REG_ERSTSZ_0, 1); // 1 segment
 
         // Set ERST base address (pointer to ERST entries)
@@ -531,7 +380,7 @@ impl XhciController {
         self.write_runtime_reg(REG_ERSTBA_LO_0, erst_lo);
         self.write_runtime_reg(REG_ERSTBA_HI_0, erst_hi);
 
-        // Initialize ERDP to point to event ring start (clear EHB bit)
+        // Initialize ERDP to point to event ring start
         let erdp_lo = (evt_base & 0xFFFFFFFF) as u32;
         let erdp_hi = ((evt_base >> 32) & 0xFFFFFFFF) as u32;
         self.write_runtime_reg(REG_ERDP_LO_0, erdp_lo);
@@ -546,10 +395,13 @@ impl XhciController {
 
         crate::framebuffer::write_str("xHCI: ERST configured, interrupter enabled\n");
 
-        // Set max device slots
+        // ============================================================
+        // STEP 4: Set max device slots and start controller
+        // ============================================================
+
         self.write_op_reg(REG_CONFIG, 8); // Max slots = 8
 
-        // Start controller FIRST
+        // Start controller FIRST (before programming CRCR)
         self.write_op_reg(REG_USBCMD, USBCMD_RUN);
 
         // Wait for controller to be ready
@@ -579,27 +431,53 @@ impl XhciController {
         crate::framebuffer::write_str("xHCI: Controller running OK\n");
 
         // ============================================================
-        // CRITICAL: Initialize CRCR ONCE during controller setup
+        // STEP 5: Initialize CRCR ONCE during controller setup
         // ============================================================
-        // CRCR should be set once, not per-command
+        // CRITICAL: CRCR must point to command ring BASE, not enqueue position
         // Format: [63:6] Command Ring Base (64-byte aligned)
         //         [5:1] Reserved (must be 0)
         //         [0] RCS (Ring Cycle State)
+        //
+        // Per xHCI spec 5.4.5: CRCR is initialized ONCE, then never modified
+        // except for RCS bit toggling when ring wraps.
 
-        let cmd_cycle = self.command_ring.cycle_state.load(Ordering::Acquire) as u64;
-        let crcr = cmd_base | cmd_cycle;
+        // FRESH read of command ring base - no variable shadowing!
+        let cmd_ring_base = COMMAND_RING.trb_base();
+        let cmd_cycle = COMMAND_RING.cycle();
 
-        crate::framebuffer::write_str("xHCI: CRCR init=0x");
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (crcr >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
+        crate::framebuffer::write_str("xHCI: CRCR calculation:\n");
+        crate::framebuffer::write_str("xHCI:   cmd_ring_base=0x");
+        print_hex_u64(cmd_ring_base);
+        crate::framebuffer::write_str("\n");
+        crate::framebuffer::write_str("xHCI:   cmd_cycle=");
+        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + cmd_cycle as u8]).unwrap());
+        crate::framebuffer::write_str("\n");
+
+        // Verify alignment one more time before programming
+        if cmd_ring_base & 0x3F != 0 {
+            crate::framebuffer::write_str("xHCI: ERROR - Command ring not 64-byte aligned!\n");
+            return Err(UsbError::XhciInitFailed);
         }
+
+        let crcr = cmd_ring_base | cmd_cycle;
+
+        crate::framebuffer::write_str("xHCI: CRCR calculated=0x");
+        print_hex_u64(crcr);
         crate::framebuffer::write_str("\n");
 
         // Write CRCR as two 32-bit registers
-        self.write_op_reg(REG_CRCR, (crcr & 0xFFFFFFFF) as u32);
-        self.write_op_reg(REG_CRCR + 4, ((crcr >> 32) & 0xFFFFFFFF) as u32);
+        let crcr_lo = (crcr & 0xFFFFFFFF) as u32;
+        let crcr_hi = ((crcr >> 32) & 0xFFFFFFFF) as u32;
+
+        crate::framebuffer::write_str("xHCI: CRCR_LO=0x");
+        print_hex_u32(crcr_lo);
+        crate::framebuffer::write_str("\n");
+        crate::framebuffer::write_str("xHCI: CRCR_HI=0x");
+        print_hex_u32(crcr_hi);
+        crate::framebuffer::write_str("\n");
+
+        self.write_op_reg(REG_CRCR, crcr_lo);
+        self.write_op_reg(REG_CRCR + 4, crcr_hi);
 
         // Verify CRCR was written correctly
         let crcr_lo_read = self.read_op_reg(REG_CRCR);
@@ -607,15 +485,17 @@ impl XhciController {
         let crcr_read = (crcr_hi_read as u64) << 32 | (crcr_lo_read as u64);
 
         crate::framebuffer::write_str("xHCI: CRCR readback=0x");
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (crcr_read >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
+        print_hex_u64(crcr_read);
         if crcr_read == crcr {
             crate::framebuffer::write_str(" OK\n");
         } else {
             crate::framebuffer::write_str(" MISMATCH!\n");
+            // Print expected vs actual
+            crate::framebuffer::write_str("xHCI: Expected=0x");
+            print_hex_u64(crcr);
+            crate::framebuffer::write_str(" Got=0x");
+            print_hex_u64(crcr_read);
+            crate::framebuffer::write_str("\n");
         }
 
         Ok(())
@@ -685,7 +565,7 @@ impl XhciController {
     /// Poll for events
     pub unsafe fn poll_events(&self) -> Option<EventTrb> {
         // Update ERDP to clear events (use interrupter 0 registers)
-        let erdp = self.event_ring.dequeue_ptr();
+        let erdp = EVENT_RING.dequeue_ptr();
         self.write_runtime_reg(REG_ERDP_LO_0, (erdp & 0xFFFF_FFFF) as u32);
         self.write_runtime_reg(REG_ERDP_HI_0, ((erdp >> 32) & 0xFFFF_FFFF) as u32);
 
@@ -697,7 +577,7 @@ impl XhciController {
         }
 
         // Try to dequeue an event
-        self.event_ring.dequeue()
+        EVENT_RING.dequeue()
     }
 
     /// Issue Enable Slot command and wait for completion
@@ -719,8 +599,8 @@ impl XhciController {
         }
 
         // Show command ring state before enqueue
-        let enqueue_idx = self.command_ring.enqueue.load(Ordering::Acquire);
-        let cycle = self.command_ring.cycle_state.load(Ordering::Acquire);
+        let enqueue_idx = COMMAND_RING.enqueue.load(Ordering::Acquire);
+        let cycle = COMMAND_RING.cycle();
 
         crate::framebuffer::write_str("xHCI: CMD idx=");
         crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + enqueue_idx as u8]).unwrap());
@@ -740,7 +620,7 @@ impl XhciController {
         crate::framebuffer::write_str("xHCI: TRB Type=9 (Enable Slot)\n");
 
         // Enqueue to command ring
-        self.command_ring.enqueue(&trb)?;
+        COMMAND_RING.enqueue(&trb)?;
 
         // Ring command doorbell (doorbell 0) to notify controller
         // NOTE: CRCR was already set during init, controller tracks dequeue internally
@@ -756,23 +636,11 @@ impl XhciController {
 
                 // Dump raw event TRB for debugging
                 crate::framebuffer::write_str("xHCI: Event ");
-                for i in (0..64).step_by(8).rev() {
-                    let nibble = (event.trb_ptr >> i) & 0xF;
-                    let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-                    crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-                }
+                print_hex_u64(event.trb_ptr);
                 crate::framebuffer::write_str(" ");
-                for i in (0..32).step_by(8).rev() {
-                    let nibble = (event.status >> i) & 0xF;
-                    let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-                    crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-                }
+                print_hex_u32(event.status);
                 crate::framebuffer::write_str(" ");
-                for i in (0..32).step_by(8).rev() {
-                    let nibble = (event.control >> i) & 0xF;
-                    let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-                    crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-                }
+                print_hex_u32(event.control);
                 crate::framebuffer::write_str("\n");
 
                 // Check if this is a command completion event (Type 33)
@@ -825,8 +693,8 @@ impl XhciController {
 
         // Try to dump event ring state even on timeout
         crate::framebuffer::write_str("xHCI: Event ring state:\n");
-        let evt_dequeue = self.event_ring.dequeue.load(Ordering::Acquire);
-        let evt_cycle = self.event_ring.cycle_state.load(Ordering::Acquire);
+        let evt_dequeue = EVENT_RING.dequeue.load(Ordering::Acquire);
+        let evt_cycle = EVENT_RING.cycle_state.load(Ordering::Acquire);
         crate::framebuffer::write_str("xHCI:  dequeue=");
         crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + evt_dequeue as u8]).unwrap());
         crate::framebuffer::write_str(" cycle=");
@@ -834,25 +702,13 @@ impl XhciController {
         crate::framebuffer::write_str("\n");
 
         // Dump first event TRB regardless of cycle state
-        let first_trb = self.event_ring.trbs[0];
+        let first_trb = EVENT_RING.data[0];
         crate::framebuffer::write_str("xHCI:  First TRB: ");
-        for i in (0..64).step_by(8).rev() {
-            let nibble = (first_trb.trb_ptr >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
+        print_hex_u64(first_trb.trb_ptr);
         crate::framebuffer::write_str(" ");
-        for i in (0..32).step_by(8).rev() {
-            let nibble = (first_trb.status >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
+        print_hex_u32(first_trb.status);
         crate::framebuffer::write_str(" ");
-        for i in (0..32).step_by(8).rev() {
-            let nibble = (first_trb.control >> i) & 0xF;
-            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
+        print_hex_u32(first_trb.control);
         crate::framebuffer::write_str("\n");
 
         Err(UsbError::Timeout)
@@ -1002,6 +858,24 @@ impl XhciController {
 
         crate::framebuffer::write_str("xHCI: Control SET OK\n");
         Ok(())
+    }
+}
+
+/// Helper: Print 64-bit hex value
+unsafe fn print_hex_u64(value: u64) {
+    for i in (0..64).step_by(8).rev() {
+        let nibble = (value >> i) & 0xF;
+        let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+        crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
+    }
+}
+
+/// Helper: Print 32-bit hex value
+unsafe fn print_hex_u32(value: u32) {
+    for i in (0..32).step_by(8).rev() {
+        let nibble = (value >> i) & 0xF;
+        let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+        crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
     }
 }
 

@@ -11,6 +11,7 @@ pub mod ehci;
 pub mod device;
 pub mod hid;
 pub mod trb;
+pub mod dma;
 
 /// USB error type
 #[derive(Debug, Clone, Copy)]

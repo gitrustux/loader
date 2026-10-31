@@ -11,7 +11,7 @@ The `kernel-efi/` transition kernel serves as:
 - **Hardware testing** - PS/2 keyboard, framebuffer, UEFI GOP
 - **Feature validation** - Process management, syscalls, shell interaction
 
-**This is NOT the canonical Rustux kernel.** The real kernel is in `/var/www/rustux.com/prod/rustux/` (microkernel architecture).
+**This is NOT the canonical Rustux kernel.** The real kernel is [gitrustux/rustux](https://github.com/gitrustux/rustux) (microkernel architecture). The copy of it that used to live in `rustux/` here was merged into that repository and removed.
 
 ## Migration Plan
 

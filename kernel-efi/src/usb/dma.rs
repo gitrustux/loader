@@ -231,6 +231,219 @@ pub fn dcbaa_aligned() -> bool {
     dcbaa_base() & 0x3F == 0
 }
 
+// ============================================================
+// DEVICE/INPUT CONTEXT AND ENDPOINT TRANSFER RINGS
+// ============================================================
+
+/// xHCI Slot Context (32 bytes, per xHCI spec Table 6-2)
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct SlotContext {
+    /// Route String[19:0], Speed[23:20], Context Entries[31:27]
+    pub dword0: u32,
+    /// Max Exit Latency[15:0], Root Hub Port Number[23:16]
+    pub dword1: u32,
+    /// TT Hub Slot ID[7:0], TT Port Number[15:8], Interrupter Target[31:22]
+    pub dword2: u32,
+    /// USB Device Address[7:0], Slot State[31:27]
+    pub dword3: u32,
+    pub _reserved: [u32; 4],
+}
+
+/// xHCI Endpoint Context (32 bytes, per xHCI spec Table 6-8)
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct EndpointContext {
+    /// EP State[2:0], Interval[23:16]
+    pub dword0: u32,
+    /// CErr[2:1], EP Type[5:3], Max Burst Size[15:8], Max Packet Size[31:16]
+    pub dword1: u32,
+    /// TR Dequeue Pointer Lo[31:4], DCS[0]
+    pub deq_ptr_lo: u32,
+    /// TR Dequeue Pointer Hi[31:0]
+    pub deq_ptr_hi: u32,
+    /// Average TRB Length[15:0]
+    pub dword4: u32,
+    pub _reserved: [u32; 3],
+}
+
+/// xHCI Input Control Context (32 bytes, per xHCI spec Table 6-10)
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct InputControlContext {
+    /// Drop Context Flags: bit N = drop endpoint context DCI N
+    pub drop_flags: u32,
+    /// Add Context Flags: bit N = add/modify endpoint context DCI N
+    pub add_flags: u32,
+    pub _reserved: [u32; 6],
+}
+
+/// xHCI Input Context (1056 bytes, must be 64-byte aligned)
+/// Layout: Input Control Context (32) + Slot Context (32) + 31 EP Contexts (992)
+#[repr(C, align(64))]
+pub struct InputContextStruct {
+    pub control: InputControlContext,
+    pub slot: SlotContext,
+    /// ep[0] = DCI 1 (EP0 Control), ep[1] = DCI 2 (EP1 OUT), ep[2] = DCI 3 (EP1 IN), ...
+    pub ep: [EndpointContext; 31],
+}
+
+/// xHCI Device Context (1024 bytes, must be 64-byte aligned)
+/// Layout: Slot Context (32) + 31 EP Contexts (992)
+/// This is written by the xHCI controller after Address Device command.
+#[repr(C, align(64))]
+pub struct DeviceContextStruct {
+    pub slot: SlotContext,
+    /// ep[0] = DCI 1 (EP0), ep[1] = DCI 2 (EP1 OUT), ep[2] = DCI 3 (EP1 IN), ...
+    pub ep: [EndpointContext; 31],
+}
+
+/// EP0 Transfer Ring — Default Control Pipe for USB control transfers
+#[repr(C, align(64))]
+pub struct Ep0RingStruct {
+    pub trbs: [NormalTrb; TRB_RING_SIZE],
+    pub enqueue: AtomicU32,
+    pub dequeue: AtomicU32,
+    pub cycle_state: AtomicU32,
+    pub _pad: [u8; 52],
+}
+
+/// EP1 IN Transfer Ring — HID keyboard interrupt IN endpoint
+#[repr(C, align(64))]
+pub struct Ep1InRingStruct {
+    pub trbs: [NormalTrb; TRB_RING_SIZE],
+    pub enqueue: AtomicU32,
+    pub dequeue: AtomicU32,
+    pub cycle_state: AtomicU32,
+    pub _pad: [u8; 52],
+}
+
+const ZERO_SLOT: SlotContext = SlotContext {
+    dword0: 0, dword1: 0, dword2: 0, dword3: 0, _reserved: [0; 4],
+};
+const ZERO_EP: EndpointContext = EndpointContext {
+    dword0: 0, dword1: 0, deq_ptr_lo: 0, deq_ptr_hi: 0, dword4: 0, _reserved: [0; 3],
+};
+
+pub static mut INPUT_CONTEXT: InputContextStruct = InputContextStruct {
+    control: InputControlContext { drop_flags: 0, add_flags: 0, _reserved: [0; 6] },
+    slot: ZERO_SLOT,
+    ep: [ZERO_EP; 31],
+};
+
+pub static mut DEVICE_CONTEXT: DeviceContextStruct = DeviceContextStruct {
+    slot: ZERO_SLOT,
+    ep: [ZERO_EP; 31],
+};
+
+pub static mut EP0_RING: Ep0RingStruct = Ep0RingStruct {
+    trbs: [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
+    enqueue: AtomicU32::new(0),
+    dequeue: AtomicU32::new(0),
+    cycle_state: AtomicU32::new(1),
+    _pad: [0; 52],
+};
+
+pub static mut EP1_IN_RING: Ep1InRingStruct = Ep1InRingStruct {
+    trbs: [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
+    enqueue: AtomicU32::new(0),
+    dequeue: AtomicU32::new(0),
+    cycle_state: AtomicU32::new(1),
+    _pad: [0; 52],
+};
+
+/// Get Input Context physical address
+pub fn input_context_base() -> u64 {
+    unsafe { &INPUT_CONTEXT as *const InputContextStruct as u64 }
+}
+
+/// Get Device Context physical address
+pub fn device_context_base() -> u64 {
+    unsafe { &DEVICE_CONTEXT as *const DeviceContextStruct as u64 }
+}
+
+/// Get EP0 Transfer Ring base address
+pub fn ep0_ring_base() -> u64 {
+    unsafe { &EP0_RING.trbs[0] as *const NormalTrb as u64 }
+}
+
+/// Get EP0 ring initial cycle state
+pub fn ep0_ring_cycle() -> u64 {
+    unsafe { EP0_RING.cycle_state.load(Ordering::Acquire) as u64 }
+}
+
+/// Enqueue a TRB to the EP0 transfer ring
+pub unsafe fn ep0_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
+    let ring = &EP0_RING;
+    let index = ring.enqueue.load(Ordering::Acquire) as usize;
+    let cycle = ring.cycle_state.load(Ordering::Acquire);
+
+    let next_index = (index + 1) % TRB_RING_SIZE;
+    if next_index == ring.dequeue.load(Ordering::Acquire) as usize {
+        return Err(UsbError::Timeout);
+    }
+
+    let trb_ptr = &ring.trbs[index] as *const NormalTrb as *mut NormalTrb;
+    (*trb_ptr).data_ptr = trb.data_ptr;
+    (*trb_ptr).status = trb.status;
+    (*trb_ptr).control = trb.control | (cycle & 1);
+
+    ring.enqueue.store(next_index as u32, Ordering::Release);
+
+    if next_index == 0 {
+        ring.cycle_state.store(cycle ^ 1, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// Get EP1 IN Transfer Ring base address
+pub fn ep1_in_ring_base() -> u64 {
+    unsafe { &EP1_IN_RING.trbs[0] as *const NormalTrb as u64 }
+}
+
+/// Get EP1 IN ring initial cycle state
+pub fn ep1_in_ring_cycle() -> u64 {
+    unsafe { EP1_IN_RING.cycle_state.load(Ordering::Acquire) as u64 }
+}
+
+/// Enqueue a TRB to the EP1 IN transfer ring
+pub unsafe fn ep1_in_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
+    let ring = &EP1_IN_RING;
+    let index = ring.enqueue.load(Ordering::Acquire) as usize;
+    let cycle = ring.cycle_state.load(Ordering::Acquire);
+
+    let next_index = (index + 1) % TRB_RING_SIZE;
+    if next_index == ring.dequeue.load(Ordering::Acquire) as usize {
+        return Err(UsbError::Timeout);
+    }
+
+    let trb_ptr = &ring.trbs[index] as *const NormalTrb as *mut NormalTrb;
+    (*trb_ptr).data_ptr = trb.data_ptr;
+    (*trb_ptr).status = trb.status;
+    (*trb_ptr).control = trb.control | (cycle & 1);
+
+    ring.enqueue.store(next_index as u32, Ordering::Release);
+
+    if next_index == 0 {
+        ring.cycle_state.store(cycle ^ 1, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// Alignment check helpers
+pub fn input_context_aligned() -> bool {
+    input_context_base() & 0x3F == 0
+}
+pub fn device_context_aligned() -> bool {
+    device_context_base() & 0x3F == 0
+}
+pub fn ep0_ring_aligned() -> bool {
+    ep0_ring_base() & 0x3F == 0
+}
+pub fn ep1_in_ring_aligned() -> bool {
+    ep1_in_ring_base() & 0x3F == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +455,10 @@ mod tests {
             assert!(event_ring_aligned());
             assert!(erst_aligned());
             assert!(dcbaa_aligned());
+            assert!(input_context_aligned());
+            assert!(device_context_aligned());
+            assert!(ep0_ring_aligned());
+            assert!(ep1_in_ring_aligned());
         }
     }
 
@@ -250,5 +467,12 @@ mod tests {
         assert_eq!(TRB_RING_SIZE, 16);
         assert_eq!(core::mem::size_of::<NormalTrb>(), 16);
         assert_eq!(core::mem::size_of::<EventTrb>(), 16);
+    }
+
+    #[test]
+    fn test_context_sizes() {
+        assert_eq!(core::mem::size_of::<SlotContext>(), 32);
+        assert_eq!(core::mem::size_of::<EndpointContext>(), 32);
+        assert_eq!(core::mem::size_of::<InputControlContext>(), 32);
     }
 }

@@ -772,28 +772,28 @@ impl XhciController {
                       ((setup.w_index as u64) << 32) |
                       ((setup.w_length as u64) << 48),
             status: (data_length as u32) & 0x00FFFFFF,
-            control: (2 << 10) | (1 << 16) | (1 << 5) | (1 << 6), // TRB Type=2, Direction=IN, IOC, IMMED
+            control: (2 << 10) | (3 << 16) | (1 << 5) | (1 << 6), // TRB Type=2, TRT=3 (IN data), IOC, IDT
         };
 
-        self.transfer_ring.enqueue(&setup_trb)?;
+        ep0_ring_enqueue(&setup_trb)?;
 
-        // Step 2: Data Stage TRB (Normal TRB with data buffer)
+        // Step 2: Data Stage TRB
         let data_trb = NormalTrb {
             data_ptr,
             status: (data_length as u32) & 0x00FFFFFF,
-            control: (1 << 10) | (1 << 16) | (1 << 5), // TRB Type=1, Direction=IN, IOC
+            control: (3 << 10) | (1 << 16) | (1 << 5), // TRB Type=3 (Data Stage), DIR=IN, IOC
         };
 
-        self.transfer_ring.enqueue(&data_trb)?;
+        ep0_ring_enqueue(&data_trb)?;
 
         // Step 3: Status Stage TRB (Direction=OUT for control-IN)
         let status_trb = NormalTrb {
             data_ptr: 0,
             status: 0,
-            control: (4 << 10) | (1 << 5), // TRB Type=4, IOC
+            control: (4 << 10) | (1 << 5), // TRB Type=4 (Status Stage), IOC
         };
 
-        self.transfer_ring.enqueue(&status_trb)?;
+        ep0_ring_enqueue(&status_trb)?;
 
         // Ring doorbell for Default Control Endpoint (EP0)
         // DCI for control endpoint is always 1 (EP0 IN/OUT)
@@ -849,19 +849,19 @@ impl XhciController {
                       ((setup.w_index as u64) << 32) |
                       ((setup.w_length as u64) << 48),
             status: (setup.w_length as u32) & 0x00FFFFFF,
-            control: (2 << 10) | (1 << 5) | (1 << 6), // TRB Type=2, Direction=OUT, IOC, IMMED
+            control: (2 << 10) | (1 << 5) | (1 << 6), // TRB Type=2, TRT=0 (No Data), IOC, IDT
         };
 
-        self.transfer_ring.enqueue(&setup_trb)?;
+        ep0_ring_enqueue(&setup_trb)?;
 
         // Step 2: Status Stage TRB (Direction=IN for control-OUT)
         let status_trb = NormalTrb {
             data_ptr: 0,
             status: 0,
-            control: (4 << 10) | (1 << 16) | (1 << 5), // TRB Type=4, Direction=IN, IOC
+            control: (4 << 10) | (1 << 16) | (1 << 5), // TRB Type=4 (Status Stage), DIR=IN, IOC
         };
 
-        self.transfer_ring.enqueue(&status_trb)?;
+        ep0_ring_enqueue(&status_trb)?;
 
         // Ring doorbell for Default Control Endpoint (EP0)
         self.ring_doorbell(slot_id, 1, 0);
@@ -897,6 +897,105 @@ impl XhciController {
 
         crate::framebuffer::write_str("xHCI: Control SET OK\n");
         Ok(())
+    }
+
+    /// Issue Address Device command
+    /// Configures slot and EP0 using the Input Context; with BSR=false the controller
+    /// also sends SET_ADDRESS to the device (xHCI handles addressing, not software).
+    pub unsafe fn issue_address_device_command(
+        &mut self,
+        slot_id: u8,
+        input_context_ptr: u64,
+        bsr: bool,
+    ) -> Result<(), UsbError> {
+        crate::framebuffer::write_str("xHCI: Address Device command...\n");
+
+        let bsr_bit: u32 = if bsr { 1 << 9 } else { 0 };
+        let trb = NormalTrb {
+            data_ptr: input_context_ptr,
+            status: 0,
+            control: ((slot_id as u32) << 24) | (11 << 10) | bsr_bit,
+        };
+
+        command_ring_enqueue(&trb)?;
+        self.ring_doorbell(0, 0, 0);
+
+        let mut timeout = 100000u32;
+        while timeout > 0 {
+            if let Some(event) = self.poll_events() {
+                let event_type = ((event.control >> 10) & 0x3F) as u8;
+                let code = (event.status >> 24) as u8;
+                if event_type == 33 {
+                    if code == 1 {
+                        crate::framebuffer::write_str("xHCI: Address Device OK\n");
+                        return Ok(());
+                    } else {
+                        crate::framebuffer::write_str("xHCI: Address Device CC=");
+                        let hi = (code >> 4) & 0xF;
+                        let lo = code & 0xF;
+                        let c1 = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+                        let c2 = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+                        crate::framebuffer::write_str(core::str::from_utf8(&[c1, c2]).unwrap());
+                        crate::framebuffer::write_str("\n");
+                        return Err(UsbError::XhciInitFailed);
+                    }
+                }
+            }
+            timeout -= 1;
+            for _ in 0..100 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+        }
+        crate::framebuffer::write_str("xHCI: Address Device timeout\n");
+        Err(UsbError::Timeout)
+    }
+
+    /// Issue Configure Endpoint command
+    /// Configures additional endpoints after Address Device (e.g. EP1 IN for HID keyboard).
+    pub unsafe fn issue_configure_endpoint_command(
+        &mut self,
+        slot_id: u8,
+        input_context_ptr: u64,
+    ) -> Result<(), UsbError> {
+        crate::framebuffer::write_str("xHCI: Configure Endpoint command...\n");
+
+        let trb = NormalTrb {
+            data_ptr: input_context_ptr,
+            status: 0,
+            control: ((slot_id as u32) << 24) | (12 << 10),
+        };
+
+        command_ring_enqueue(&trb)?;
+        self.ring_doorbell(0, 0, 0);
+
+        let mut timeout = 100000u32;
+        while timeout > 0 {
+            if let Some(event) = self.poll_events() {
+                let event_type = ((event.control >> 10) & 0x3F) as u8;
+                let code = (event.status >> 24) as u8;
+                if event_type == 33 {
+                    if code == 1 {
+                        crate::framebuffer::write_str("xHCI: Configure Endpoint OK\n");
+                        return Ok(());
+                    } else {
+                        crate::framebuffer::write_str("xHCI: Configure Endpoint CC=");
+                        let hi = (code >> 4) & 0xF;
+                        let lo = code & 0xF;
+                        let c1 = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
+                        let c2 = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
+                        crate::framebuffer::write_str(core::str::from_utf8(&[c1, c2]).unwrap());
+                        crate::framebuffer::write_str("\n");
+                        return Err(UsbError::XhciInitFailed);
+                    }
+                }
+            }
+            timeout -= 1;
+            for _ in 0..100 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+        }
+        crate::framebuffer::write_str("xHCI: Configure Endpoint timeout\n");
+        Err(UsbError::Timeout)
     }
 }
 

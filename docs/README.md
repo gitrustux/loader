@@ -1,234 +1,344 @@
-# Rustux OS - UEFI Kernel
+# Rustux OS - UEFI Kernel with USB HID Keyboard
 
-**Current Status:** Phase 6 COMPLETE - Interactive Shell Running
+> **Legacy kernel.** This describes `kernel-efi`, the single-binary UEFI kernel used for the live USB image until the Rustux kernel (`gitrustux/rustux`) can replace it. It was previously kept as `rustica/docs/README.md`. The latest USB/xHCI work is on branch `wip/xhci-2026-08`; see the Rustux kernel's [`docs/usb-keyboard.md`](https://github.com/gitrustux/rustux/blob/main/docs/usb-keyboard.md) for status.
 
-## Overview
+**Status:** 🟡 Phase 7A IN PROGRESS | USB HID Keyboard with xHCI/EHCI Transfers (Polling-based)
 
-Rustux is a hobby operating system written in Rust. It boots directly as a UEFI application (no GRUB, no Linux kernel) and provides an interactive shell with a Dracula-themed interface.
+---
 
-### Current State (January 2025)
+## Project Overview
 
-- **Phase 6 Complete:** Interactive shell with PS/2 keyboard and framebuffer console
-- **Direct UEFI Boot:** Standalone BOOTX64.EFI, no external bootloader
-- **Multi-process:** Round-robin scheduler with process table
-- **Syscalls:** read, write, open, close, lseek, spawn, exit, getpid, getppid, yield
-- **Filesystem:** VFS abstraction with embedded ramdisk
+**Rustux OS** is a hobby operating system written in Rust, featuring a native UEFI microkernel with USB HID keyboard support and a Dracula-themed interactive shell.
 
-### Boot Flow
-
+**Boot Flow:**
 ```
-UEFI Firmware → BOOTX64.EFI → Kernel → Init (PID 1) → Shell (PID 2)
+UEFI Firmware → BOOTX64.EFI → USB Init (xHCI/EHCI) → USB HID Keyboard → Shell (CLI)
 ```
 
 ---
 
-## Core Features (Phase 6)
+## Current Status (January 26, 2026)
 
-### 1. UEFI Boot
+### ✅ Completed: Phase 7A - USB HID Keyboard Support
 
-**Location:** `src/main.rs`, `src/arch/amd64/uefi.rs`
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **xHCI Controller** | ✅ Complete | PCI scan, controller init, port reset |
+| **EHCI Controller** | ✅ Complete | USB 2.0 support for older laptops |
+| **USB Controller Detection** | ✅ Complete | xHCI > EHCI priority, graceful fallback |
+| **TRB Structures** | ✅ Complete | NormalTrb, SetupTrb, StatusTrb, EventTrb, LinkTrb |
+| **Transfer Rings** | ✅ Complete | 16-entry rings with cycle bit management |
+| **Event Rings** | ✅ Complete | 16-entry event ring with polling |
+| **USB Device Enumeration** | ✅ Complete | Port scanning, keyboard detection |
+| **Interrupt Transfers** | ✅ Complete | xHCI/EHCI polling implementation for HID data |
+| **HID Report Parsing** | ✅ Complete | 256-entry keycode table, shift handling |
+| **Keyboard Backend** | ✅ Complete | USB → PS/2 fallback, honest detection |
+| **No-Keyboard Warning Fix** | ✅ Complete | Warning message prints only once |
 
-The kernel is a standalone UEFI application that:
-- Calls `ExitBootServices()` to take full hardware control
-- Sets up x86_64 page tables with proper isolation
-- Configures IDT for interrupt handling
-- Initializes scheduler and process management
+### ✅ Completed: Phase 6A-6C (Interactive Shell)
 
-**Status:** ✅ Complete
-
----
-
-### 2. Process Management
-
-**Location:** `src/process/mod.rs`, `src/process/table.rs`, `src/sched/round_robin.rs`
-
-- **Process Table:** 256 slots, indexed by PID
-- **Round-Robin Scheduler:** Time-sliced context switching
-- **Context Switch:** Assembly switch.S for saving/restoring CPU state
-- **Init Process:** PID 1 auto-spawns shell on boot
-
-**Status:** ✅ Complete
-
----
-
-### 3. Memory Management
-
-**Location:** `src/mm/pmm.rs`, `src/arch/amd64/mmu.rs`
-
-- **Physical Memory Manager:** Bitmap-based page allocation
-- **Virtual Memory:** 4-level page tables (PML4 → PDPT → PD → PT)
-- **Page Table Isolation:** Separate kernel/userspace page tables per process
-- **Address Spaces:** Per-process virtual address spaces with 64MB heap
-
-**Status:** ✅ Complete
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Direct UEFI Boot** | ✅ Complete | No GRUB, standalone BOOTX64.EFI |
+| **PS/2 Keyboard Driver** | ✅ Complete | IRQ1, scancode-to-ASCII, modifiers |
+| **Framebuffer Console** | ✅ Complete | RGB565, PSF2 font (8x16), scrolling |
+| **Process Management** | ✅ Complete | 256-slot table, round-robin scheduler |
+| **Syscall Interface** | ✅ Complete | read, write, spawn, exit, getpid, yield |
+| **VFS + Ramdisk** | ✅ Complete | Embedded ELF binaries (init, shell, hello) |
+| **Interactive Shell** | ✅ Complete | C shell with Dracula theme, built-in commands |
 
 ---
 
-### 4. Syscall Interface
+## USB HID Keyboard Implementation
 
-**Location:** `src/syscall/mod.rs`, `src/arch/amd64/syscall.rs`
+### Architecture
 
-- **int 0x80 Interface:** Software interrupt for userspace→kernel transitions
-- **Syscall Table:** Dispatches to kernel functions
-- **Implemented Syscalls:**
-  - `sys_read()` - Read from file descriptor
-  - `sys_write()` - Write to file descriptor
-  - `sys_open()` - Open file from ramdisk
-  - `sys_close()` - Close file descriptor
-  - `sys_lseek()` - Seek in file
-  - `sys_spawn()` - Spawn new process from ELF
-  - `sys_exit()` - Terminate process
-  - `sys_getpid()` - Get process ID
-  - `sys_getppid()` - Get parent process ID
-  - `sys_yield()` - Yield CPU to scheduler
+The USB HID keyboard driver uses a **polling-based architecture** for Phase 7A:
 
-**Status:** ✅ Complete
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Keyboard Frontend                           │
+│  ┌────────────┐   ┌────────────┐   ┌──────────────────────────┐   │
+│  │    USB     │   │   PS/2      │   │     None (Halt)          │   │
+│  │  (Tier-1)  │   │ (Fallback)  │   │  (No keyboard error)    │   │
+│  └─────┬──────┘   └──────┬─────┘   └──────────────────────────┘   │
+│        │                 │                                            │
+└────────┼─────────────────┼────────────────────────────────────────┘
+         │                 │
+         ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     USB HID Stack                                 │
+│  ┌──────────┐  ┌──────────────────┐  ┌──────────┐  ┌───────────┐   │
+│  │   pci    │→ │  xhci or ehci    │→ │  device  │→ │    hid    │   │
+│  │ (scan)   │  │ (detect& init)   │  │ (enum)   │  │ (parse)   │   │
+│  └──────────┘  └──────────────────┘  └──────────┘  └───────────┘   │
+│       │              │                      │             │          │
+│       ▼              ▼                      ▼             ▼          │
+│   Scan PCI   xHCI/EHCI 2.0/3.0   Enumerate     Parse 8-byte       │
+│   for USB    controller init    HID device   keyboard report      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### File Structure
+
+```
+src/usb/
+├── mod.rs          # USB module declarations, error types
+├── pci.rs          # PCI configuration space scanning (xHCI, EHCI, UHCI, OHCI)
+├── xhci.rs         # xHCI controller (USB 3.0), transfer rings, event rings
+├── ehci.rs         # EHCI controller (USB 2.0), operational registers
+├── trb.rs          # TRB structures (Normal, Setup, Status, Link, Event)
+├── device.rs       # USB device enumeration, HID keyboard detection
+└── hid.rs          # HID Boot Protocol keyboard parsing
+
+src/keyboard/
+├── mod.rs          # Backend selection (USB → PS/2 → None), warning flag
+├── ps2.rs          # Legacy PS/2 driver (IRQ1)
+└── usb.rs          # USB keyboard adapter layer
+```
+
+### xHCI Interrupt Transfer Flow
+
+```rust
+// 1. Check if controller and keyboard are available
+let controller = xhci::controller()?;
+let keyboard = device::get_hid_keyboard()?;
+
+// 2. Create Normal TRB for interrupt IN transfer
+let trb = NormalTrb {
+    data_ptr: &HID_REPORT_BUFFER as *const u8 as u64,
+    status: 8,  // TRB length (8 bytes)
+    control: (1 << 10) | (1 << 16) | (1 << 5),  // Type=Normal, IOC, ISP
+};
+
+// 3. Enqueue TRB to transfer ring
+controller.transfer_ring.enqueue(&trb)?;
+
+// 4. Ring doorbell for endpoint
+controller.ring_doorbell(slot_id, dci, 0);
+
+// 5. Poll for event completion
+while timeout > 0 {
+    if let Some(event) = controller.poll_events() {
+        return event.status & 0x00FFFFFF;  // Transfer length
+    }
+}
+```
+
+### HID Keycode Translation
+
+256-entry translation table maps USB HID keycodes to ASCII:
+- 0x04-0x1D: a-z (lowercase)
+- 0x1E-0x27: 1-0, Enter, Esc, Backspace, Tab
+- 0x2D-0x38: Symbols (-, =, [, ], \, ;, ', `, ,, ., /)
+- Shift modifier handling for uppercase and shifted symbols
+
+### Keyboard Backend Selection
+
+```rust
+pub fn init() {
+    unsafe {
+        // Reset warning flag
+        NO_KEYBOARD_WARNING_SHOWN = false;
+
+        // First try USB (xHCI > EHCI priority)
+        if let Ok(()) = usb::init() {
+            KEYBOARD_BACKEND = KeyboardBackend::Usb;
+            crate::framebuffer::write_str("[USB KBD] ");
+            return;
+        }
+
+        // Fall back to PS/2 (legacy hardware)
+        if ps2::controller_present() {
+            KEYBOARD_BACKEND = KeyboardBackend::Ps2;
+            crate::framebuffer::write_str("[PS/2] ");
+        } else {
+            KEYBOARD_BACKEND = KeyboardBackend::None;
+            crate::framebuffer::write_str("[NO KEYBOARD] ");
+        }
+    }
+}
+```
 
 ---
 
-### 5. ELF Loading
+## Testing in QEMU
 
-**Location:** `src/exec/elf.rs`, `src/exec/process_loader.rs`
+### USB Keyboard Test (xHCI - USB 3.0)
 
-- **ELF64 Parser:** Loads 64-bit ELF binaries
-- **Segment Mapping:** Maps LOAD segments into process address space
-- **Entry Point:** Jumps to ELF entry point in userspace
-- **Dynamic Loading:** Static linking only (no dynamic loader yet)
+```bash
+qemu-system-x86_64 \
+  -bios /usr/share/OVMF/OVMF.fd \
+  -drive file=rustica-live-amd64-0.1.0.img,format=raw \
+  -m 512M \
+  -machine q35 \
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd,bus=xhci.0 \
+  -serial stdio \
+  -display gtk
+```
 
-**Status:** ✅ Complete
+**Important:** The `-device qemu-xhci` explicitly adds an xHCI controller, which is required for USB keyboard support in QEMU.
 
----
+### USB Keyboard Test (EHCI - USB 2.0)
 
-### 6. VFS + Ramdisk
+```bash
+qemu-system-x86_64 \
+  -bios /usr/share/OVMF/OVMF.fd \
+  -drive file=rustica-live-amd64-0.1.0.img,format=raw \
+  -m 512M \
+  -machine q35 \
+  -device usb-ehci,id=ehci \
+  -device usb-kbd,bus=ehci.0 \
+  -serial stdio \
+  -display gtk
+```
 
-**Location:** `src/fs/vfs.rs`, `src/fs/ramdisk.rs`
+### PS/2 Keyboard Test (Legacy)
 
-- **VFS Abstraction:** File operations (read, write, open, close, seek)
-- **Ramdisk:** Embedded filesystem with ELF binaries
-- **File Types:** Regular files (no directories yet)
-- **Build Integration:** `build.rs` embeds userspace binaries
-
-**Status:** ✅ Complete
-
----
-
-### 7. PS/2 Keyboard Driver
-
-**Location:** `src/drivers/keyboard/`
-
-- **Hardware:** IRQ1, ports 0x60 (data) and 0x64 (command/status)
-- **Scancode Set 1:** Converts scancodes to ASCII
-- **Modifier Keys:** Shift, Ctrl, Alt, Caps Lock tracking
-- **Circular Buffer:** Lock-free ring buffer for keyboard events
-- **Blocking Read:** sys_read() blocks on stdin until character available
-
-**Status:** ✅ Complete
-
----
-
-### 8. Framebuffer Console
-
-**Location:** `src/drivers/display/`
-
-- **UEFI GOP:** Gets framebuffer from UEFI Graphics Output Protocol
-- **PSF2 Fonts:** 8x16 pixel bitmap font
-- **Text Console:** Character grid with scrolling
-- **Colors:** RGB565 pixel format, Dracula theme colors
-- **sys_write Routing:** stdout/stderr writes to framebuffer
-
-**Status:** ✅ Complete
+```bash
+qemu-system-x86_64 \
+  -drive format=raw,file=fat:rw:esp,if=ide \
+  -bios /usr/share/OVMF/OVMF.fd \
+  -machine type=pc \
+  -device i8042
+```
 
 ---
 
-### 9. Interactive Shell
+## Phase 7B TODO (Future Work)
 
-**Location:** `test-userspace/shell/shell.c`
+The following features are stubs or simplified implementations that will be completed in Phase 7B:
 
-- **C Implementation:** Statically linked, no stdlib
-- **Built-in Commands:** help, clear, echo, ps, exit
-- **Command Parser:** Tokenizes input and executes
-- **Program Spawning:** Uses sys_spawn() to run ELF binaries
-- **Dracula Theme:** ANSI color codes for styling
+1. **Full USB Enumeration** - Currently assumes keyboard is on slot 1, endpoint 1
+   - Enable Slot command TRB
+   - GET_DESCRIPTOR control transfers
+   - SET_ADDRESS control transfers
+   - Configuration descriptor parsing
 
-**Status:** ✅ Complete
+2. **Endpoint Configuration** - Uses hardcoded endpoint address 0x81
+   - Parse interface descriptor
+   - Parse endpoint descriptor
+   - Configure transfer rings per endpoint
 
----
+3. **MSI/MSI-X Interrupts** - Currently polling only
+   - Configure MSI for xHCI
+   - Event-driven transfers instead of polling
 
-## Architecture Support
-
-### x86_64 (AMD64) - ✅ Primary Target
-
-- UEFI boot
-- 4-level page tables
-- Interrupt handling (IDT, IRQ, exceptions)
-- Context switching
-- All drivers implemented
-
-### ARM64 - ⏳ Planned
-
-Cross-architecture design ready, hardware testing needed.
-
-### RISC-V - ⏳ Planned
-
-Cross-architecture design ready, hardware testing needed.
+4. **HID Report Descriptor Parsing** - Uses Boot Protocol
+   - Full HID report descriptor parsing
+   - Support for non-standard keyboards
 
 ---
 
-## What's NOT Implemented Yet
+## Directory Structure
 
-### Phase 7 - Minimal GUI (Planned)
+```
+/var/www/rustux.com/prod/loader/kernel-efi/
+├── src/
+│   ├── main.rs           # Kernel entry point, boot phases
+│   ├── console.rs        # UEFI/framebuffer console abstraction
+│   ├── framebuffer.rs    # RGB565 framebuffer with PSF2 font
+│   ├── runtime.rs        # Interrupt handling, IDT, LAPIC, IOAPIC
+│   ├── keyboard/         # Keyboard drivers
+│   │   ├── mod.rs        # Backend selection, circular buffer
+│   │   ├── ps2.rs        # PS/2 driver (IRQ1, legacy)
+│   │   └── usb.rs        # USB keyboard adapter
+│   ├── usb/              # USB stack (NEW)
+│   │   ├── mod.rs        # Module declarations, error types
+│   │   ├── pci.rs        # PCI scanning (xHCI, EHCI)
+│   │   ├── xhci.rs       # xHCI controller (USB 3.0)
+│   │   ├── ehci.rs       # EHCI controller (USB 2.0)
+│   │   ├── trb.rs        # TRB structures
+│   │   ├── device.rs     # Device enumeration, HID detection
+│   │   └── hid.rs        # HID report parsing
+│   ├── acpi.rs           # ACPI table parsing (MADT for IRQ routing)
+│   ├── shell.rs          # Interactive shell
+│   └── syscall.rs         # System call handlers
+└── target/x86_64-unknown-uefi/release/
+    └── rustux-kernel-efi.efi   # UEFI application
+```
 
-- USB HID driver (keyboard + mouse)
-- Framebuffer mapping into userspace
-- GUI server process
-- GUI client library
+---
 
-### Missing Features
+## Keyboard Support Matrix
 
-- USB HID driver (PS/2 only currently)
-- Networking stack
-- Persistent filesystem (Ext2/3)
-- Dynamic linking
-- Multi-threading (single-threaded processes only)
-- Signal handling
-- Pipes and IPC
-- Directories in VFS (flat filesystem only)
+| Keyboard Type | Connection | Method | Status |
+|---------------|------------|--------|--------|
+| **PS/2** | Physical port 0x60/0x64 | IRQ1 (interrupt) | ✅ Works (QEMU + real HW) |
+| **USB HID** | xHCI controller (USB 3.0) | Polling | ✅ Works (QEMU) |
+| **USB HID** | EHCI controller (USB 2.0) | Polling | ✅ Basic support added |
+| **USB HID** | xHCI/EHCI | MSI/MSI-X | ⏳ Phase 7B |
+
+**Honest Detection:**
+- `[USB KBD]` - xHCI or EHCI controller found, USB keyboard detected
+- `[PS/2]` - PS/2 controller present, USB not found
+- `[NO KEYBOARD]` - Neither USB nor PS/2 detected (system continues in display-only mode)
+
+**Known Issues (January 26, 2026):**
+1. **No Repeated Warnings** - Fixed! The "No keyboard attached" message now prints only once
+2. **EHCI Support Added** - Basic EHCI controller detection and initialization for USB 2.0
+3. **QEMU Testing** - Use `-device qemu-xhci` for testing USB keyboard in QEMU
+4. **Display-Only CLI Mode** - When `[NO KEYBOARD]` is detected, the shell runs in display-only mode
+   - Commands: `help`, `clear`, `mem`, `kbd`, `ps`, `exit` work for viewing system state
+   - No interactive input possible without keyboard hardware
+
+---
+
+## Technical Details
+
+### xHCI Controller Registers
+
+| Register Offset | Name | Purpose |
+|-----------------|------|---------|
+| 0x00 | CAPLENGTH | Capability register length |
+| 0x18 | RTSOFF | Runtime register offset |
+| 0x1C | DBOFF | Doorbell offset |
+| 0x00 | USBCMD | USB command (RUN, HCRST) |
+| 0x04 | USBSTS | USB status (HCH, CNR) |
+| 0x30 | DCBAAP | Device context base array |
+| 0x38 | CONFIG | Max device slots |
+
+### TRB Types
+
+| Type | Value | Purpose |
+|------|-------|---------|
+| Normal | 1 | Bulk/interrupt transfers |
+| Setup Stage | 2 | Control setup |
+| Data Stage | 3 | Control data |
+| Status Stage | 4 | Control status |
+| Link | 6 | Ring segmentation |
+| Transfer Event | 32 | Transfer completion |
+| Command Completion | 33 | Command completion |
+
+### USB HID Boot Protocol Report
+
+```rust
+#[repr(C, packed)]
+pub struct KeyboardReport {
+    pub modifier: u8,      // Ctrl, Shift, Alt, Gui (L+R)
+    pub reserved: u8,
+    pub keycodes: [u8; 6], // Up to 6 simultaneous keys
+}
+```
 
 ---
 
 ## Build Instructions
 
-### Prerequisites
-
 ```bash
-# Rust toolchain (UEFI target)
-rustup target add x86_64-unknown-uefi
+cd /var/www/rustux.com/prod/loader/kernel-efi
 
-# GCC for cross-compiling userspace C programs
-apt install gcc-x86-64-linux-gnu
-
-# Image creation tools
-apt install parted dosfstools coreutils
-```
-
-### Build
-
-```bash
-cd /var/www/rustux.com/prod/rustux
-
-# Build kernel (UEFI application)
+# Build UEFI kernel
 cargo build --release --target x86_64-unknown-uefi
 
-# Build userspace C programs
-cd test-userspace
-x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector \
-    shell.c -o shell.elf
-x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector \
-    init.c -o init.elf
-
-# Build live USB image
-./build-live-image.sh
+# Output: target/x86_64-unknown-uefi/release/rustux-kernel-efi.efi
 ```
+
+**Requirements:**
+- Rust nightly
+- `x86_64-unknown-uefi` target
+- UEFI development environment
 
 ---
 
@@ -239,109 +349,22 @@ x86_64-linux-gnu-gcc -static -nostdlib -fno-stack-protector \
 | **Architecture** | x86_64 (AMD64) | x86_64 (AMD64) |
 | **Boot** | UEFI 2.0 | UEFI 2.3+ |
 | **RAM** | 512 MB | 1 GB |
-| **Storage** | 128 MB (USB) | 4 GB |
-| **Input** | PS/2 Keyboard | PS/2 or USB HID* |
-
-\* USB HID support planned for Phase 7
-
----
-
-## Dracula Theme (MANDATORY INVARIANT)
-
-The Dracula color palette is the default system theme and must survive:
-
-- Kernel rebuilds
-- CLI refactors
-- Framebuffer rewrites
-- GUI introduction later
-
-**Canonical Dracula Colors:**
-```
-FG_DEFAULT = #F8F8F2  (r: 248, g: 248, b: 242)
-BG_DEFAULT = #282A36  (r: 40, g: 42, b: 54)
-CYAN       = #8BE9FD  (r: 139, g: 233, b: 253)
-PURPLE     = #BD93F9  (r: 189, g: 147, b: 249)
-GREEN      = #50FA7B  (r: 80, g: 250, b: 123)
-RED        = #FF5555  (r: 255, g: 85, b: 85)
-ORANGE     = #FFB86C  (r: 255, g: 184, b: 108)
-YELLOW     = #F1FA8C  (r: 241, g: 250, b: 140)
-```
-
----
-
-## Development Roadmap
-
-### Phase 4: Userspace & Process Execution ✅ COMPLETE
-- ELF loading with segment mapping
-- Per-process address spaces
-- Page table isolation
-- int 0x80 syscall interface
-- First userspace instruction execution
-
-### Phase 5: Process Management & Essential Syscalls ✅ COMPLETE
-- Process table with 256 slots
-- Round-robin scheduler with context switching
-- Ramdisk for embedded files
-- sys_spawn() for spawning from paths
-- Init process (PID 1) auto-loads on boot
-
-### Phase 6: Input, Display, Interactive Shell ✅ COMPLETE
-- PS/2 keyboard driver (IRQ1, ports 0x60/0x64)
-- Scancode to ASCII conversion with modifier tracking
-- Framebuffer driver with PSF2 fonts
-- Text console with scrolling
-- Interactive C shell with Dracula theme
-
-### Phase 7: Minimal GUI 🚧 PLANNED
-- USB HID driver (keyboard + mouse)
-- Framebuffer mapping syscall
-- GUI server process (rustica-gui)
-- GUI client library (librustica_gui)
+| **Storage** | 128 MB | 4 GB |
+| **Input** | USB HID (xHCI) or PS/2 | Both supported |
 
 ---
 
 ## Documentation
 
-- **[BUILD.md](docs/BUILD.md)** - Live USB build instructions
-- **[IMAGE.md](docs/IMAGE.md)** - System architecture and boot flow
-- **[PLAN.md](docs/PLAN.md)** - Development roadmap with detailed phase specs
+- **BUILD.md** - Build instructions
+- **IMAGE.md** - System architecture
+- **PLAN.md** - Development roadmap
 
 ---
 
-## Project Structure
+## Git Repository
 
-```
-/var/www/rustux.com/prod/rustux/
-├── src/
-│   ├── arch/amd64/       # Architecture-specific code
-│   ├── drivers/          # Device drivers (keyboard, display)
-│   ├── exec/             # ELF loading, process creation
-│   ├── fs/               # VFS, ramdisk
-│   ├── init.rs           # Kernel initialization
-│   ├── lib.rs            # Library entry point
-│   ├── main.rs           # UEFI entry point
-│   ├── mm/               # Physical memory manager
-│   ├── process/          # Process table, context switching
-│   ├── sched/            # Round-robin scheduler
-│   └── syscall/          # System call handlers
-├── test-userspace/       # C programs (shell, init, hello, counter)
-│   ├── init.c            # First userspace process (PID 1)
-│   └── shell/
-│       └── shell.c       # Interactive shell
-├── build.rs              # Embed ramdisk with userspace binaries
-├── build-live-image.sh   # Live USB build script
-└── PLAN.md               # Development roadmap
-```
-
----
-
-## Contributing
-
-See PLAN.md for:
-- Coding standards
-- Development workflow
-- Phase specifications
-- Technical decisions
+- **https://github.com/gitrustux/rustux**
 
 ---
 
@@ -351,13 +374,6 @@ MIT License - See LICENSE file for details.
 
 ---
 
-## Links
-
-- **Repository:** https://github.com/gitrustux/rustux
-- **Website:** https://rustux.com
-- **Issue Tracker:** https://github.com/gitrustux/rustux/issues
-
----
-
-**Last Updated:** January 23, 2025
-**Status:** Phase 6 COMPLETE - Interactive shell running with Dracula theme
+*Last Updated: January 26, 2026*
+**Status:** Phase 7A IN PROGRESS - USB HID Keyboard with xHCI/EHCI Support (Polling)
+**Added:** EHCI controller support, no repeated keyboard warnings, QEMU testing instructions

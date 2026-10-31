@@ -105,33 +105,62 @@ pub fn command_ring_cycle() -> u64 {
     unsafe { COMMAND_RING_DATA.cycle_state.load(Ordering::Acquire) as u64 }
 }
 
+/// Enqueue a TRB on a producer ring (command ring or transfer ring).
+///
+/// The last slot of every producer ring holds a Link TRB that points back to
+/// the start of the ring with Toggle Cycle set, so the controller follows the
+/// ring around instead of running off the end of the array. Software does not
+/// track completions here, so there is no "ring full" check; the rings are
+/// only ever a few TRBs ahead of the controller.
+pub unsafe fn producer_ring_enqueue(
+    trbs: *mut NormalTrb,
+    enqueue: &AtomicU32,
+    cycle_state: &AtomicU32,
+    trb: &NormalTrb,
+) {
+    let mut index = enqueue.load(Ordering::Acquire) as usize;
+    let mut cycle = cycle_state.load(Ordering::Acquire) & 1;
+
+    if index >= TRB_RING_SIZE - 1 {
+        // Write the Link TRB in the last slot, hand it to the controller with
+        // the current cycle bit, then wrap and flip our cycle state.
+        write_trb(
+            trbs.add(TRB_RING_SIZE - 1),
+            trbs as u64,
+            0,
+            (6 << 10) | TRB_TOGGLE_CYCLE_BIT,
+            cycle,
+        );
+        index = 0;
+        cycle ^= 1;
+        cycle_state.store(cycle, Ordering::Release);
+    }
+
+    write_trb(trbs.add(index), trb.data_ptr, trb.status, trb.control, cycle);
+
+    enqueue.store((index + 1) as u32, Ordering::Release);
+}
+
+/// Write a TRB so that the controller only sees it once it is complete:
+/// first with the cycle bit the controller does NOT own, then flip the
+/// control word to the producer cycle state.
+unsafe fn write_trb(slot: *mut NormalTrb, data_ptr: u64, status: u32, control: u32, cycle: u32) {
+    let control = control & !TRB_CYCLE_BIT;
+    core::ptr::write_volatile(
+        slot,
+        NormalTrb { data_ptr, status, control: control | (cycle ^ 1) },
+    );
+    core::sync::atomic::fence(Ordering::SeqCst);
+    // The control dword sits at offset 12 of a 16-byte TRB in a 64-byte aligned ring
+    let control_ptr = core::ptr::addr_of_mut!((*slot).control);
+    core::ptr::write_volatile(control_ptr, control | cycle);
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
 /// Enqueue to command ring
 pub unsafe fn command_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
-    let ring = &COMMAND_RING_DATA;
-    let index = ring.enqueue.load(Ordering::Acquire) as usize;
-    let cycle = ring.cycle_state.load(Ordering::Acquire);
-
-    // Check if ring is full
-    let next_index = (index + 1) % TRB_RING_SIZE;
-    if next_index == ring.dequeue.load(Ordering::Acquire) as usize {
-        return Err(UsbError::Timeout);
-    }
-
-    // Write TRB
-    let trb_ptr = &ring.trbs[index] as *const NormalTrb as *mut NormalTrb;
-    (*trb_ptr).data_ptr = trb.data_ptr;
-    (*trb_ptr).status = trb.status;
-    (*trb_ptr).control = trb.control | (cycle & 1);
-
-    // Update enqueue pointer
-    ring.enqueue.store(next_index as u32, Ordering::Release);
-
-    // Toggle cycle bit if wrapping
-    if next_index == 0 {
-        let new_cycle = cycle ^ 1;
-        ring.cycle_state.store(new_cycle, Ordering::Release);
-    }
-
+    let ring = &mut COMMAND_RING_DATA;
+    producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
     Ok(())
 }
 
@@ -374,25 +403,8 @@ pub fn ep0_ring_cycle() -> u64 {
 
 /// Enqueue a TRB to the EP0 transfer ring
 pub unsafe fn ep0_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
-    let ring = &EP0_RING;
-    let index = ring.enqueue.load(Ordering::Acquire) as usize;
-    let cycle = ring.cycle_state.load(Ordering::Acquire);
-
-    let next_index = (index + 1) % TRB_RING_SIZE;
-    if next_index == ring.dequeue.load(Ordering::Acquire) as usize {
-        return Err(UsbError::Timeout);
-    }
-
-    let trb_ptr = &ring.trbs[index] as *const NormalTrb as *mut NormalTrb;
-    (*trb_ptr).data_ptr = trb.data_ptr;
-    (*trb_ptr).status = trb.status;
-    (*trb_ptr).control = trb.control | (cycle & 1);
-
-    ring.enqueue.store(next_index as u32, Ordering::Release);
-
-    if next_index == 0 {
-        ring.cycle_state.store(cycle ^ 1, Ordering::Release);
-    }
+    let ring = &mut EP0_RING;
+    producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
     Ok(())
 }
 
@@ -408,26 +420,70 @@ pub fn ep1_in_ring_cycle() -> u64 {
 
 /// Enqueue a TRB to the EP1 IN transfer ring
 pub unsafe fn ep1_in_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
-    let ring = &EP1_IN_RING;
-    let index = ring.enqueue.load(Ordering::Acquire) as usize;
-    let cycle = ring.cycle_state.load(Ordering::Acquire);
-
-    let next_index = (index + 1) % TRB_RING_SIZE;
-    if next_index == ring.dequeue.load(Ordering::Acquire) as usize {
-        return Err(UsbError::Timeout);
-    }
-
-    let trb_ptr = &ring.trbs[index] as *const NormalTrb as *mut NormalTrb;
-    (*trb_ptr).data_ptr = trb.data_ptr;
-    (*trb_ptr).status = trb.status;
-    (*trb_ptr).control = trb.control | (cycle & 1);
-
-    ring.enqueue.store(next_index as u32, Ordering::Release);
-
-    if next_index == 0 {
-        ring.cycle_state.store(cycle ^ 1, Ordering::Release);
-    }
+    let ring = &mut EP1_IN_RING;
+    producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
     Ok(())
+}
+
+/// Clear the per-device state (contexts and transfer rings) so a new device
+/// can be enumerated after a previous attempt was abandoned.
+pub unsafe fn reset_device_state() {
+    INPUT_CONTEXT.control = InputControlContext { drop_flags: 0, add_flags: 0, _reserved: [0; 6] };
+    INPUT_CONTEXT.slot = ZERO_SLOT;
+    INPUT_CONTEXT.ep = [ZERO_EP; 31];
+    DEVICE_CONTEXT.slot = ZERO_SLOT;
+    DEVICE_CONTEXT.ep = [ZERO_EP; 31];
+    EP0_RING.trbs = [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE];
+    EP0_RING.enqueue.store(0, Ordering::Release);
+    EP0_RING.cycle_state.store(1, Ordering::Release);
+    EP1_IN_RING.trbs = [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE];
+    EP1_IN_RING.enqueue.store(0, Ordering::Release);
+    EP1_IN_RING.cycle_state.store(1, Ordering::Release);
+}
+
+/// ============================================================
+/// SCRATCHPAD BUFFERS
+/// ============================================================
+/// Many controllers (all recent Intel chipsets) require the OS to provide
+/// "scratchpad" pages (HCSPARAMS2). DCBAA[0] must point to an array of
+/// page addresses before any slot is enabled.
+
+/// Maximum scratchpad pages we can provide (4 KiB each)
+pub const MAX_SCRATCHPAD_PAGES: usize = 64;
+
+#[repr(C, align(4096))]
+pub struct ScratchpadPages {
+    pub pages: [[u8; 4096]; MAX_SCRATCHPAD_PAGES],
+}
+
+#[repr(C, align(64))]
+pub struct ScratchpadArray {
+    pub entries: [u64; MAX_SCRATCHPAD_PAGES],
+}
+
+pub static mut SCRATCHPAD_PAGES: ScratchpadPages = ScratchpadPages {
+    pages: [[0; 4096]; MAX_SCRATCHPAD_PAGES],
+};
+
+pub static mut SCRATCHPAD_ARRAY: ScratchpadArray = ScratchpadArray {
+    entries: [0; MAX_SCRATCHPAD_PAGES],
+};
+
+/// Fill the scratchpad array with `count` page addresses and point DCBAA[0]
+/// at it. Returns false if more pages are required than we have.
+pub unsafe fn setup_scratchpad(count: usize) -> bool {
+    if count == 0 {
+        DCBAA_DATA.data[0] = 0;
+        return true;
+    }
+    if count > MAX_SCRATCHPAD_PAGES {
+        return false;
+    }
+    for i in 0..count {
+        SCRATCHPAD_ARRAY.entries[i] = SCRATCHPAD_PAGES.pages[i].as_ptr() as u64;
+    }
+    DCBAA_DATA.data[0] = SCRATCHPAD_ARRAY.entries.as_ptr() as u64;
+    true
 }
 
 /// Alignment check helpers

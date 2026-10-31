@@ -174,10 +174,7 @@ pub fn init() -> Result<(), &'static str> {
         }
 
         // Wait for controller ready (USB spec requires delays!)
-        crate::framebuffer::write_str("Step 4: Waiting for controller ready...\n");
-        for _ in 0..100_000_000 {
-            core::arch::asm!("nop");
-        }
+        crate::framebuffer::write_str("Step 4: Checking controller is running...\n");
 
         // Check if controller is running
         let is_running = match controller_type {
@@ -208,12 +205,12 @@ pub fn init() -> Result<(), &'static str> {
                 Ok(())
             }
             Err(UsbError::DeviceNotFound) => {
-                crate::framebuffer::write_str("USB: No device found on ports 1-4\n");
+                crate::framebuffer::write_str("USB: No device connected to this controller\n");
                 crate::framebuffer::put_pixel(15, 1, 0xFF, 0xA5, 0x00); // Orange
                 Err("No USB device found")
             }
             Err(UsbError::HidKeyboardNotFound) => {
-                crate::framebuffer::write_str("USB: Device found but not a keyboard\n");
+                crate::framebuffer::write_str("USB: Devices found, but none is a boot keyboard\n");
                 crate::framebuffer::put_pixel(15, 1, 0xFF, 0xA5, 0x00); // Orange
                 Err("No HID keyboard found")
             }

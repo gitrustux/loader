@@ -23,20 +23,28 @@ const REG_CRCR: usize = 0x018;
 const REG_DCBAAP: usize = 0x030;
 const REG_CONFIG: usize = 0x038;
 
-/// Runtime register offsets
-const REG_MFINDEX: usize = 0x000;
-const REG_ERSTSZ: usize = 0x008; // Event Ring Segment Table Size
-const REG_ERSTBA_LO: usize = 0x010; // Event Ring Segment Table Base Address Low
-const REG_ERSTBA_HI: usize = 0x014; // Event Ring Segment Table Base Address High
-const REG_ERDP_LO: usize = 0x020; // Event Ring Dequeue Pointer
-const REG_ERDP_HI: usize = 0x024;
-const REG_IMAN: usize = 0x000; // Interrupter Management (for interrupter 0)
-const REG_IMOD: usize = 0x004; // Interrupter Moderation
-const REG_ERSTSZ_0: usize = 0x008; // ERST Size for interrupter 0
-const REG_ERSTBA_LO_0: usize = 0x010; // ERST Base Low for interrupter 0
-const REG_ERSTBA_HI_0: usize = 0x014; // ERST Base High for interrupter 0
-const REG_ERDP_LO_0: usize = 0x020; // ERDP Low for interrupter 0
-const REG_ERDP_HI_0: usize = 0x024; // ERDP High for interrupter 0
+/// Runtime register offsets (xHCI 5.5). MFINDEX is at 0x00; the register
+/// set for interrupter 0 starts at 0x20.
+const REG_IMAN: usize = 0x020; // Interrupter Management
+const REG_IMOD: usize = 0x024; // Interrupter Moderation
+const REG_ERSTSZ_0: usize = 0x028; // Event Ring Segment Table Size
+const REG_ERSTBA_LO_0: usize = 0x030; // Event Ring Segment Table Base Address
+const REG_ERSTBA_HI_0: usize = 0x034;
+const REG_ERDP_LO_0: usize = 0x038; // Event Ring Dequeue Pointer
+const REG_ERDP_HI_0: usize = 0x03C;
+
+/// ERDP Event Handler Busy (RW1C)
+const ERDP_EHB: u32 = 0x0000_0008;
+
+/// Capability register offsets
+const CAP_HCSPARAMS1: usize = 0x04;
+const CAP_HCSPARAMS2: usize = 0x08;
+const CAP_HCCPARAMS1: usize = 0x10;
+
+/// Extended capability: USB Legacy Support (BIOS/OS handoff)
+const XECP_ID_LEGACY: u32 = 1;
+const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
+const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
 
 /// Interrupter Management bits
 const IMAN_IP: u32 = 0x0000_0001; // Interrupt Pending
@@ -49,26 +57,34 @@ const REG_PORTSC_BASE: usize = 0x400;
 const USBCMD_RUN: u32 = 0x0000_0001;
 const USBCMD_HCRST: u32 = 0x0000_0002;
 
-/// USB status register bits
-const USBSTS_HCH: u32 = 0x0000_1000; // HCHalted
-const USBSTS_CNR: u32 = 0x0000_0800; // Controller Not Ready
-const USBSTS_EINT: u32 = 0x0000_0004; // Event Interrupt
-const USBSTS_PCD: u32 = 0x0000_0002; // Port Change Detect
-const USBSTS_HSE: u32 = 0x0000_0010; // Host System Error
+/// USB status register bits (xHCI 5.4.2)
+const USBSTS_HCH: u32 = 0x0000_0001; // Bit 0: HCHalted
+const USBSTS_HSE: u32 = 0x0000_0004; // Bit 2: Host System Error
+const USBSTS_EINT: u32 = 0x0000_0008; // Bit 3: Event Interrupt (RW1C)
+const USBSTS_PCD: u32 = 0x0000_0010; // Bit 4: Port Change Detect (RW1C)
+const USBSTS_CNR: u32 = 0x0000_0800; // Bit 11: Controller Not Ready
+const USBSTS_HCE: u32 = 0x0000_1000; // Bit 12: Host Controller Error
 
-/// Port status register bits (xHCI spec section 5.4.8)
-pub const PORTSC_CCS: u32 = 0x0000_0001; // Bit 0: Current Connect Status
-const PORTSC_CSC_FLAG: u32 = 0x0000_0002; // Bit 1: Connect Status Change (renamed to avoid conflict)
-pub const PORTSC_PED: u32 = 0x0000_0004; // Bit 2: Port Enabled/Disabled (FIXED - was 0x0002)
-const PORTSC_PEDC: u32 = 0x0000_0008; // Bit 3: Port Enabled/Disabled Change (FIXED - was 0x0010)
-const PORTSC_OCA: u32 = 0x0000_0010; // Bit 4: Over-current Active
-pub const PORTSC_PR: u32 = 0x0000_0020; // Bit 5: Port Reset (FIXED - was 0x0010)
-const PORTSC_PLS_MASK: u32 = 0x0000_03E0; // Bits 9-5: Port Link State (fixed range)
-const PORTSC_PLS_U0: u32 = 0x0000_0000; // U0 state
-const PORTSC_PP: u32 = 0x0000_0200; // Bit 9: Port Power
-const PORTSC_PR_MASK: u32 = 0x0000_0020; // Bit 5: Port Reset mask for clearing
-pub const PORTSC_PORT_SPEED_MASK: u32 = 0x0000_F000; // Bits 15-12: Port Speed
-pub const PORTSC_PORT_SPEED_SHIFT: u32 = 12;
+/// Port status register bits (xHCI 5.4.8)
+pub const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status
+pub const PORTSC_PED: u32 = 1 << 1; // Port Enabled (RW1CS: writing 1 DISABLES the port)
+pub const PORTSC_PR: u32 = 1 << 4; // Port Reset
+pub const PORTSC_PP: u32 = 1 << 9; // Port Power
+pub const PORTSC_PORT_SPEED_MASK: u32 = 0xF << 10; // Port Speed (bits 13:10)
+pub const PORTSC_PORT_SPEED_SHIFT: u32 = 10;
+pub const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change (RW1C)
+/// All RW1C change bits (CSC, PEC, WRC, OCC, PRC, PLC, CEC)
+pub const PORTSC_CHANGE_BITS: u32 = 0x00FE_0000;
+/// Bits that keep their value when written back (PP, PIC, WCE/WDE/WOE).
+/// Everything else must be written as 0 to avoid disabling the port or
+/// clearing change bits by accident.
+pub const PORTSC_PRESERVE: u32 = PORTSC_PP | (3 << 14) | (7 << 25);
+
+/// Port speed IDs (default Protocol Speed IDs)
+pub const SPEED_FULL: u32 = 1;
+pub const SPEED_LOW: u32 = 2;
+pub const SPEED_HIGH: u32 = 3;
+pub const SPEED_SUPER: u32 = 4;
 
 /// Transfer Ring
 #[repr(C)]
@@ -135,6 +151,10 @@ pub struct XhciController {
     cap_length: u8,
     runtime_offset: u64,
     doorbell_offset: u64,
+    max_ports: u8,
+    max_slots: u8,
+    scratchpad_count: u32,
+    context_size_64: bool,
     // Rings are now in the dma module, not owned here
     pub transfer_ring: TransferRing,
 }
@@ -155,14 +175,8 @@ impl XhciController {
             return Err(UsbError::XhciInitFailed);
         }
 
-        crate::framebuffer::write_str("xHCI: CAPLENGTH = ");
-        // Simple decimal print
-        if cap_length < 10 {
-            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + cap_length]).unwrap());
-        } else {
-            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + (cap_length / 10)]).unwrap());
-            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + (cap_length % 10)]).unwrap());
-        }
+        crate::framebuffer::write_str("xHCI: CAPLENGTH = 0x");
+        print_hex_u32(cap_length as u32);
         crate::framebuffer::write_str("\n");
 
         // Read HCIVERSION (offset 0x02 in capability registers)
@@ -203,6 +217,32 @@ impl XhciController {
         }
         crate::framebuffer::write_str("\n");
 
+        // Structural / capability parameters
+        let hcsparams1 = mmio_base.add(CAP_HCSPARAMS1).cast::<u32>().read_volatile();
+        let hcsparams2 = mmio_base.add(CAP_HCSPARAMS2).cast::<u32>().read_volatile();
+        let hccparams1 = mmio_base.add(CAP_HCCPARAMS1).cast::<u32>().read_volatile();
+        let max_slots = (hcsparams1 & 0xFF) as u8;
+        let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
+        let scratchpad_count = (((hcsparams2 >> 21) & 0x1F) << 5) | ((hcsparams2 >> 27) & 0x1F);
+        let context_size_64 = hccparams1 & (1 << 2) != 0;
+
+        crate::framebuffer::write_str("xHCI: MaxSlots=");
+        print_decimal(max_slots as u32);
+        crate::framebuffer::write_str(" MaxPorts=");
+        print_decimal(max_ports as u32);
+        crate::framebuffer::write_str(" Scratchpads=");
+        print_decimal(scratchpad_count);
+        crate::framebuffer::write_str(if context_size_64 { " CSZ=64\n" } else { " CSZ=32\n" });
+
+        if context_size_64 {
+            // Our Input/Device Context structs use the 32-byte layout
+            crate::framebuffer::write_str("xHCI: ERROR - 64-byte contexts not supported yet\n");
+            return Err(UsbError::XhciInitFailed);
+        }
+
+        // Take ownership from the BIOS before touching the controller
+        bios_handoff(mmio_base, hccparams1);
+
         crate::framebuffer::write_str("xHCI: Resetting controller...\n");
 
         // Initialize ERST with event ring address
@@ -215,6 +255,10 @@ impl XhciController {
             cap_length,
             runtime_offset,
             doorbell_offset,
+            max_ports,
+            max_slots,
+            scratchpad_count,
+            context_size_64,
             transfer_ring: TransferRing::new(),
         };
 
@@ -255,44 +299,61 @@ impl XhciController {
         addr.cast::<u32>().write_volatile(value);
     }
 
-    /// Read port status register
+    /// Read port status register. `port` is 1-based (1..=max_ports), as in
+    /// the xHCI spec and the Slot Context "Root Hub Port Number".
     pub unsafe fn read_port_sc(&self, port: usize) -> u32 {
-        self.read_op_reg(REG_PORTSC_BASE + (port * 0x10))
+        if port == 0 || port > self.max_ports as usize {
+            return 0;
+        }
+        self.read_op_reg(REG_PORTSC_BASE + ((port - 1) * 0x10))
     }
 
-    /// Write port status register
+    /// Write port status register. `port` is 1-based.
     pub unsafe fn write_port_sc(&self, port: usize, value: u32) {
-        self.write_op_reg(REG_PORTSC_BASE + (port * 0x10), value);
+        if port == 0 || port > self.max_ports as usize {
+            return;
+        }
+        self.write_op_reg(REG_PORTSC_BASE + ((port - 1) * 0x10), value);
     }
 
-    /// Reset xHCI controller
+    /// Number of root hub ports (HCSPARAMS1)
+    pub fn max_ports(&self) -> usize {
+        self.max_ports as usize
+    }
+
+    /// Reset xHCI controller (xHCI 4.2): stop it, wait for HCHalted, then
+    /// issue HCRST and wait for HCRST and CNR to clear.
     unsafe fn reset(&mut self) -> Result<(), UsbError> {
-        // Check if controller is halted
-        let status = self.read_op_reg(REG_USBSTS);
-        if status & USBSTS_HCH == 0 {
-            // Controller running - issue reset
-            self.write_op_reg(REG_USBCMD, USBCMD_HCRST);
-
-            // Wait for reset to complete (HCRST bit clears and CNR sets)
-            let mut timeout = 100000;
-            while timeout > 0 {
-                let cmd = self.read_op_reg(REG_USBCMD);
-                let sts = self.read_op_reg(REG_USBSTS);
-
-                if cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0 {
-                    return Ok(());
-                }
-
-                timeout -= 1;
-                for _ in 0..100 {
-                    core::arch::asm!("nop", options(nomem, nostack));
-                }
-            }
-
+        // Stop the controller if it is running
+        let cmd = self.read_op_reg(REG_USBCMD);
+        if cmd & USBCMD_RUN != 0 {
+            self.write_op_reg(REG_USBCMD, cmd & !USBCMD_RUN);
+        }
+        if !self.wait_op(REG_USBSTS, USBSTS_HCH, USBSTS_HCH) {
+            crate::framebuffer::write_str("xHCI: ERROR - controller did not halt\n");
             return Err(UsbError::XhciInitFailed);
         }
 
+        self.write_op_reg(REG_USBCMD, USBCMD_HCRST);
+        // Some Intel controllers need a short delay before HCRST can be read back
+        spin(10_000);
+        if !self.wait_op(REG_USBCMD, USBCMD_HCRST, 0) || !self.wait_op(REG_USBSTS, USBSTS_CNR, 0) {
+            crate::framebuffer::write_str("xHCI: ERROR - reset did not complete\n");
+            return Err(UsbError::XhciInitFailed);
+        }
+        crate::framebuffer::write_str("xHCI: Reset OK\n");
         Ok(())
+    }
+
+    /// Poll an operational register until (value & mask) == expected.
+    unsafe fn wait_op(&self, reg: usize, mask: u32, expected: u32) -> bool {
+        for _ in 0..1_000_000u32 {
+            if self.read_op_reg(reg) & mask == expected {
+                return true;
+            }
+            spin(100);
+        }
+        false
     }
 
     /// Initialize operational registers
@@ -357,186 +418,78 @@ impl XhciController {
         }
 
         // ============================================================
-        // STEP 2: Program DCBAAP (Device Context Base Address Array Pointer)
+        // STEP 2: Max slots, scratchpads, DCBAAP
         // ============================================================
+
+        let slots = core::cmp::min(self.max_slots as u32, 8);
+        self.write_op_reg(REG_CONFIG, slots);
+
+        if !setup_scratchpad(self.scratchpad_count as usize) {
+            crate::framebuffer::write_str("xHCI: ERROR - controller needs more scratchpad pages than reserved\n");
+            return Err(UsbError::XhciInitFailed);
+        }
 
         let dcbaa_lo = (dcbaa_ptr & 0xFFFFFFFF) as u32;
         let dcbaa_hi = ((dcbaa_ptr >> 32) & 0xFFFFFFFF) as u32;
         self.write_op_reg(REG_DCBAAP, dcbaa_lo);
         self.write_op_reg(REG_DCBAAP + 4, dcbaa_hi);
 
-        crate::framebuffer::write_str("xHCI: DCBAAP programmed\n");
+        // ============================================================
+        // STEP 3: Command ring (CRCR) - must be programmed while halted
+        // ============================================================
+        // Note: the Command Ring Pointer field always reads back as 0
+        // (xHCI 5.4.5), so there is nothing useful to verify by reading it.
+
+        let crcr: u64 = command_ring_base() | (command_ring_cycle() & 1);
+        self.write_op_reg(REG_CRCR, (crcr & 0xFFFF_FFFF) as u32);
+        self.write_op_reg(REG_CRCR + 4, (crcr >> 32) as u32);
 
         // ============================================================
-        // STEP 3: Program ERST (Event Ring Segment Table)
+        // STEP 4: Event ring for interrupter 0
         // ============================================================
 
-        // Set ERST size (number of segments)
         self.write_runtime_reg(REG_ERSTSZ_0, 1); // 1 segment
+        self.write_runtime_reg(REG_ERDP_LO_0, (evt_base & 0xFFFFFFFF) as u32);
+        self.write_runtime_reg(REG_ERDP_HI_0, (evt_base >> 32) as u32);
+        // Writing ERSTBA (low then high) is what enables the event ring
+        self.write_runtime_reg(REG_ERSTBA_LO_0, (erst_addr & 0xFFFFFFFF) as u32);
+        self.write_runtime_reg(REG_ERSTBA_HI_0, (erst_addr >> 32) as u32);
 
-        // Set ERST base address (pointer to ERST entries)
-        let erst_lo = (erst_addr & 0xFFFFFFFF) as u32;
-        let erst_hi = ((erst_addr >> 32) & 0xFFFFFFFF) as u32;
-        self.write_runtime_reg(REG_ERSTBA_LO_0, erst_lo);
-        self.write_runtime_reg(REG_ERSTBA_HI_0, erst_hi);
+        // We poll the event ring; keep the interrupter enabled so IMAN.IP
+        // and USBSTS.EINT reflect pending events, but USBCMD.INTE stays off.
+        self.write_runtime_reg(REG_IMOD, 0);
+        self.write_runtime_reg(REG_IMAN, IMAN_IP | IMAN_IE);
 
-        // Initialize ERDP to point to event ring start
-        let erdp_lo = (evt_base & 0xFFFFFFFF) as u32;
-        let erdp_hi = ((evt_base >> 32) & 0xFFFFFFFF) as u32;
-        self.write_runtime_reg(REG_ERDP_LO_0, erdp_lo);
-        self.write_runtime_reg(REG_ERDP_HI_0, erdp_hi);
-
-        // Enable interrupter 0
-        let iman = self.read_runtime_reg(REG_IMAN);
-        self.write_runtime_reg(REG_IMAN, iman | IMAN_IE); // Enable interrupter
-
-        // Set interrupt moderation to avoid overwhelming the system
-        self.write_runtime_reg(REG_IMOD, 500); // 500 microseconds
-
-        crate::framebuffer::write_str("xHCI: ERST configured, interrupter enabled\n");
+        crate::framebuffer::write_str("xHCI: DCBAA, command ring and event ring programmed\n");
 
         // ============================================================
-        // STEP 4: Set max device slots and start controller
+        // STEP 5: Run
         // ============================================================
 
-        self.write_op_reg(REG_CONFIG, 8); // Max slots = 8
-
-        // Start controller FIRST (before programming CRCR)
         self.write_op_reg(REG_USBCMD, USBCMD_RUN);
-
-        // Wait for controller to be ready
-        let mut timeout = 100000;
-        while timeout > 0 {
-            let status = self.read_op_reg(REG_USBSTS);
-            if status & USBSTS_CNR == 0 {
-                break;
-            }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
-            }
-        }
-
-        if timeout == 0 {
-            crate::framebuffer::write_str("xHCI: Controller Not Ready timeout\n");
+        if !self.wait_op(REG_USBSTS, USBSTS_HCH, 0) {
+            crate::framebuffer::write_str("xHCI: ERROR - controller did not start\n");
             return Err(UsbError::XhciInitFailed);
         }
-
-        // Verify controller is actually running (HCH == 0 means running)
         let usbsts = self.read_op_reg(REG_USBSTS);
-        if usbsts & USBSTS_HCH != 0 {
-            crate::framebuffer::write_str("xHCI: ERROR - Controller Halted!\n");
-            return Err(UsbError::XhciInitFailed);
-        }
-        crate::framebuffer::write_str("xHCI: Controller running OK\n");
-
-        // ============================================================
-        // STEP 5: Initialize CRCR ONCE during controller setup
-        // ============================================================
-        // CRITICAL: CRCR must point to command ring BASE, not enqueue position
-        // Format: [63:6] Command Ring Base (64-byte aligned)
-        //         [5:1] Reserved (must be 0)
-        //         [0] RCS (Ring Cycle State)
-        //
-        // Per xHCI spec 5.4.5: CRCR is initialized ONCE, then never modified
-        // except for RCS bit toggling when ring wraps.
-
-        // FRESH read of command ring base - use function call to ensure no caching
-        let cmd_ring_base: u64 = command_ring_base();
-        let cmd_cycle: u64 = command_ring_cycle();
-
-        crate::framebuffer::write_str("xHCI: CRCR calculation:\n");
-        crate::framebuffer::write_str("xHCI:   cmd_ring_base=0x");
-        print_hex_u64(cmd_ring_base);
-        crate::framebuffer::write_str("\n");
-        crate::framebuffer::write_str("xHCI:   cmd_cycle=");
-        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + cmd_cycle as u8]).unwrap());
-        crate::framebuffer::write_str("\n");
-
-        // Verify alignment one more time before programming
-        if cmd_ring_base & 0x3F != 0 {
-            crate::framebuffer::write_str("xHCI: ERROR - Command ring not 64-byte aligned!\n");
-            return Err(UsbError::XhciInitFailed);
-        }
-
-        let crcr: u64 = cmd_ring_base | cmd_cycle;
-
-        crate::framebuffer::write_str("xHCI: CRCR calculated=0x");
-        print_hex_u64(crcr);
-        crate::framebuffer::write_str("\n");
-
-        // Check CRR (Command Ring Running) bit before writing
-        let crcr_before = self.read_op_reg(REG_CRCR);
-        crate::framebuffer::write_str("xHCI: CRCR before=0x");
-        print_hex_u32(crcr_before);
-        crate::framebuffer::write_str("\n");
-        if crcr_before & (1 << 3) != 0 {
-            crate::framebuffer::write_str("xHCI: WARNING - CRR bit set, ring running!\n");
-        }
-
-        // Write CRCR as two 32-bit registers
-        let crcr_lo: u32 = (crcr & 0xFFFFFFFF) as u32;
-        let crcr_hi: u32 = ((crcr >> 32) & 0xFFFFFFFF) as u32;
-
-        crate::framebuffer::write_str("xHCI: CRCR_LO=0x");
-        print_hex_u32(crcr_lo);
-        crate::framebuffer::write_str("\n");
-        crate::framebuffer::write_str("xHCI: CRCR_HI=0x");
-        print_hex_u32(crcr_hi);
-        crate::framebuffer::write_str("\n");
-
-        // Calculate actual MMIO addresses for debugging
-        let mmio_base = self.mmio_base as *mut u8;
-        let op_base = mmio_base.add(self.cap_length as usize);
-        let crcr_lo_addr = op_base.add(REG_CRCR) as u64;
-        let crcr_hi_addr = op_base.add(REG_CRCR + 4) as u64;
-
-        crate::framebuffer::write_str("xHCI: MMIO base=0x");
-        print_hex_u64(self.mmio_base);
-        crate::framebuffer::write_str("\n");
-        crate::framebuffer::write_str("xHCI: Writing CRCR_LO to addr=0x");
-        print_hex_u64(crcr_lo_addr);
-        crate::framebuffer::write_str(" val=0x");
-        print_hex_u32(crcr_lo);
-        crate::framebuffer::write_str("\n");
-        crate::framebuffer::write_str("xHCI: Writing CRCR_HI to addr=0x");
-        print_hex_u64(crcr_hi_addr);
-        crate::framebuffer::write_str(" val=0x");
-        print_hex_u32(crcr_hi);
-        crate::framebuffer::write_str("\n");
-
-        // Write HI first (some xHCI controllers require this order)
-        self.write_op_reg(REG_CRCR + 4, crcr_hi);
-        // Small delay between writes
-        for _ in 0..100 {
-            core::arch::asm!("nop", options(nomem, nostack));
-        }
-        self.write_op_reg(REG_CRCR, crcr_lo);
-
-        // Verify CRCR was written correctly
-        let crcr_lo_read = self.read_op_reg(REG_CRCR);
-        let crcr_hi_read = self.read_op_reg(REG_CRCR + 4);
-        let crcr_read: u64 = (crcr_hi_read as u64) << 32 | (crcr_lo_read as u64);
-
-        crate::framebuffer::write_str("xHCI: CRCR_LO readback=0x");
-        print_hex_u32(crcr_lo_read);
-        crate::framebuffer::write_str("\n");
-        crate::framebuffer::write_str("xHCI: CRCR_HI readback=0x");
-        print_hex_u32(crcr_hi_read);
-        crate::framebuffer::write_str("\n");
-        crate::framebuffer::write_str("xHCI: CRCR readback=0x");
-        print_hex_u64(crcr_read);
-        if crcr_read == crcr {
-            crate::framebuffer::write_str(" OK\n");
-        } else {
-            crate::framebuffer::write_str(" MISMATCH!\n");
-            // Print expected vs actual
-            crate::framebuffer::write_str("xHCI: Expected=0x");
-            print_hex_u64(crcr);
-            crate::framebuffer::write_str(" Got=0x");
-            print_hex_u64(crcr_read);
+        if usbsts & (USBSTS_HSE | USBSTS_HCE) != 0 {
+            crate::framebuffer::write_str("xHCI: ERROR - host system/controller error, USBSTS=0x");
+            print_hex_u32(usbsts);
             crate::framebuffer::write_str("\n");
+            return Err(UsbError::XhciInitFailed);
         }
+        crate::framebuffer::write_str("xHCI: Controller running\n");
+
+        // Power every port (needed when the controller supports port power
+        // switching; harmless otherwise), then allow ~100 ms+ for devices to
+        // connect and debounce after the reset.
+        for port in 1..=self.max_ports as usize {
+            let portsc = self.read_port_sc(port);
+            if portsc & PORTSC_PP == 0 {
+                self.write_port_sc(port, (portsc & PORTSC_PRESERVE) | PORTSC_PP);
+            }
+        }
+        spin(150_000_000);
 
         Ok(())
     }
@@ -569,439 +522,366 @@ impl XhciController {
         (portsc & PORTSC_CCS) != 0 && (portsc & PORTSC_PED) != 0
     }
 
-    /// Reset a port
+    /// Reset a USB2 port and wait until it is enabled.
+    /// (USB3 ports enable themselves after link training and need no reset.)
     pub unsafe fn reset_port(&self, port: usize) -> Result<(), UsbError> {
-        let mut portsc = self.read_port_sc(port);
+        let portsc = self.read_port_sc(port);
+        // Clear stale change bits, then set PR without touching PED
+        self.write_port_sc(port, (portsc & PORTSC_PRESERVE) | (portsc & PORTSC_CHANGE_BITS));
+        self.write_port_sc(port, (portsc & PORTSC_PRESERVE) | PORTSC_PR);
 
-        // Set port reset bit
-        self.write_port_sc(port, portsc | PORTSC_PR);
-
-        // Wait for reset to complete
-        let mut timeout = 100000;
-        while timeout > 0 {
-            portsc = self.read_port_sc(port);
-            if portsc & PORTSC_PR == 0 {
+        let mut done = false;
+        for _ in 0..1_000_000u32 {
+            let p = self.read_port_sc(port);
+            if p & PORTSC_PRC != 0 && p & PORTSC_PR == 0 {
+                done = true;
                 break;
             }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
-            }
+            spin(100);
         }
+        let p = self.read_port_sc(port);
+        // Acknowledge PRC (and any other change bits)
+        self.write_port_sc(port, (p & PORTSC_PRESERVE) | (p & PORTSC_CHANGE_BITS));
 
-        if timeout == 0 {
-            return Err(UsbError::XhciInitFailed);
+        if !done {
+            return Err(UsbError::Timeout);
         }
-
-        // Check if port is enabled
-        portsc = self.read_port_sc(port);
-        if portsc & PORTSC_PED == 0 {
+        if p & PORTSC_PED == 0 {
             return Err(UsbError::DeviceNotFound);
         }
-
+        // USB 2.0 reset recovery time (10 ms)
+        spin(5_000_000);
         Ok(())
     }
 
-    /// Poll for events
+    /// Take the next event off the event ring, if any, and tell the
+    /// controller how far we have read (ERDP with EHB cleared).
     pub unsafe fn poll_events(&self) -> Option<EventTrb> {
-        // Update ERDP to clear events (use interrupter 0 registers)
-        let erdp = event_ring_dequeue_ptr();
-        self.write_runtime_reg(REG_ERDP_LO_0, (erdp & 0xFFFF_FFFF) as u32);
-        self.write_runtime_reg(REG_ERDP_HI_0, ((erdp >> 32) & 0xFFFF_FFFF) as u32);
+        let event = event_ring_dequeue()?;
 
-        // Check for pending events in IMAN
+        let erdp = event_ring_dequeue_ptr();
+        self.write_runtime_reg(REG_ERDP_LO_0, ((erdp & 0xFFFF_FFF0) as u32) | ERDP_EHB);
+        self.write_runtime_reg(REG_ERDP_HI_0, (erdp >> 32) as u32);
+
+        // Acknowledge interrupt-pending state (both RW1C)
         let iman = self.read_runtime_reg(REG_IMAN);
         if iman & IMAN_IP != 0 {
-            // Event pending - clear it by writing 1 to IP
-            self.write_runtime_reg(REG_IMAN, IMAN_IP);
+            self.write_runtime_reg(REG_IMAN, iman | IMAN_IP);
+        }
+        let sts = self.read_op_reg(REG_USBSTS);
+        if sts & (USBSTS_EINT | USBSTS_PCD) != 0 {
+            self.write_op_reg(REG_USBSTS, sts & (USBSTS_EINT | USBSTS_PCD));
         }
 
-        // Try to dequeue an event
-        event_ring_dequeue()
+        Some(event)
     }
 
-    /// Issue Enable Slot command and wait for completion
-    /// Returns the assigned slot ID on success
-    ///
-    /// IMPORTANT: CRCR is already set during controller initialization.
-    /// Commands are submitted by:
-    /// 1. Enqueue TRB to command ring
-    /// 2. Ring doorbell 0
-    /// 3. Poll event ring for completion
-    pub unsafe fn issue_enable_slot_command(&mut self) -> Result<u8, UsbError> {
-        crate::framebuffer::write_str("xHCI: Enable Slot command...\n");
-
-        // Verify controller is running before issuing commands
-        let usbsts = self.read_op_reg(REG_USBSTS);
-        if usbsts & USBSTS_HCH != 0 {
-            crate::framebuffer::write_str("xHCI: ERROR - Controller halted, cannot issue command\n");
-            return Err(UsbError::XhciInitFailed);
-        }
-
-        // Show command ring state before enqueue
-        let enqueue_idx = command_ring_enqueue_idx();
-        let cycle = command_ring_cycle_value();
-
-        crate::framebuffer::write_str("xHCI: CMD idx=");
-        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + enqueue_idx as u8]).unwrap());
-        crate::framebuffer::write_str(" cycle=");
-        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + cycle as u8]).unwrap());
-        crate::framebuffer::write_str("\n");
-
-        // Create Enable Slot TRB (TRB Type 9)
-        // No parameters needed for Enable Slot
-        let trb = NormalTrb {
-            data_ptr: 0,
-            status: 0,
-            control: (9 << 10) | (1 << 5), // TRB Type=9, IOC (no IMMED for Enable Slot)
-        };
-
-        // Debug: Print TRB contents
-        crate::framebuffer::write_str("xHCI: TRB Type=9 (Enable Slot)\n");
-
-        // Enqueue to command ring
-        command_ring_enqueue(&trb)?;
-
-        // Ring command doorbell (doorbell 0) to notify controller
-        // NOTE: CRCR was already set during init, controller tracks dequeue internally
-        crate::framebuffer::write_str("xHCI: Ringing doorbell 0...\n");
-        self.ring_doorbell(0, 0, 0);
-
-        // Wait for command completion event
-        let mut events_seen = 0;
-        let mut timeout = 100000;
-        while timeout > 0 {
+    /// Wait for a Command Completion Event (type 33). Other events (e.g.
+    /// Port Status Change, type 34) are skipped. Returns (completion code, slot id).
+    unsafe fn wait_command_completion(&self) -> Result<(u8, u8), UsbError> {
+        for _ in 0..2_000_000u32 {
             if let Some(event) = self.poll_events() {
-                events_seen += 1;
-
-                // Dump raw event TRB for debugging
-                crate::framebuffer::write_str("xHCI: Event ");
-                print_hex_u64(event.trb_ptr);
-                crate::framebuffer::write_str(" ");
-                print_hex_u32(event.status);
-                crate::framebuffer::write_str(" ");
-                print_hex_u32(event.control);
-                crate::framebuffer::write_str("\n");
-
-                // Check if this is a command completion event (Type 33)
                 let event_type = ((event.control >> 10) & 0x3F) as u8;
-                crate::framebuffer::write_str("xHCI: Event Type=");
-                crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + event_type as u8]).unwrap());
-
-                // Extract completion code
-                let code = (event.status >> 24) as u8;
-                crate::framebuffer::write_str(" CC=");
-                crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + code as u8]).unwrap());
-
                 if event_type == 33 {
-                    // Command completion event
-                    if code == 1 {
-                        // Success - extract slot ID from control field
-                        let slot_id = ((event.control >> 24) & 0xFF) as u8;
-                        crate::framebuffer::write_str(" Slot=");
-                        if slot_id < 10 {
-                            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + slot_id]).unwrap());
-                        } else {
-                            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + (slot_id / 10)]).unwrap());
-                            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + (slot_id % 10)]).unwrap());
-                        }
-                        crate::framebuffer::write_str("\n");
-                        return Ok(slot_id);
-                    } else {
-                        // Command failed
-                        crate::framebuffer::write_str(" ERROR\n");
-                        return Err(UsbError::XhciInitFailed);
-                    }
-                } else {
-                    // Not a command completion event (unexpected)
-                    crate::framebuffer::write_str(" (not command completion)\n");
+                    let code = (event.status >> 24) as u8;
+                    let slot = ((event.control >> 24) & 0xFF) as u8;
+                    return Ok((code, slot));
                 }
-            }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
+            } else {
+                spin(100);
             }
         }
-
-        // Timeout - no events received
-        crate::framebuffer::write_str("xHCI: Timeout (");
-        // Print events seen count
-        if events_seen < 10 {
-            crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + events_seen as u8]).unwrap());
-        }
-        crate::framebuffer::write_str(" events)\n");
-
-        // Try to dump event ring state even on timeout
-        crate::framebuffer::write_str("xHCI: Event ring state:\n");
-        let (evt_dequeue, evt_cycle) = event_ring_state();
-        crate::framebuffer::write_str("xHCI:  dequeue=");
-        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + evt_dequeue as u8]).unwrap());
-        crate::framebuffer::write_str(" cycle=");
-        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + evt_cycle as u8]).unwrap());
-        crate::framebuffer::write_str("\n");
-
-        // Dump first event TRB regardless of cycle state
-        let first_trb = event_ring_first_trb();
-        crate::framebuffer::write_str("xHCI:  First TRB: ");
-        print_hex_u64(first_trb.trb_ptr);
-        crate::framebuffer::write_str(" ");
-        print_hex_u32(first_trb.status);
-        crate::framebuffer::write_str(" ");
-        print_hex_u32(first_trb.control);
-        crate::framebuffer::write_str("\n");
-
         Err(UsbError::Timeout)
     }
 
-    /// Issue control transfer GET (read data from device)
-    /// Used for GET_DESCRIPTOR and other control-IN transfers
-    pub unsafe fn issue_control_get(
-        &mut self,
-        slot_id: u8,
-        setup: &crate::usb::device::UsbSetupPacket,
-        data_ptr: u64,
-        data_length: u16,
-    ) -> Result<(), UsbError> {
-        crate::framebuffer::write_str("xHCI: Control GET transfer...\n");
-
-        // Step 1: Setup Stage TRB
-        let setup_trb = NormalTrb {
-            data_ptr: setup.bm_request_type as u64 |
-                      ((setup.b_request as u64) << 8) |
-                      ((setup.w_value as u64) << 16) |
-                      ((setup.w_index as u64) << 32) |
-                      ((setup.w_length as u64) << 48),
-            status: (data_length as u32) & 0x00FFFFFF,
-            control: (2 << 10) | (3 << 16) | (1 << 5) | (1 << 6), // TRB Type=2, TRT=3 (IN data), IOC, IDT
-        };
-
-        ep0_ring_enqueue(&setup_trb)?;
-
-        // Step 2: Data Stage TRB
-        let data_trb = NormalTrb {
-            data_ptr,
-            status: (data_length as u32) & 0x00FFFFFF,
-            control: (3 << 10) | (1 << 16) | (1 << 5), // TRB Type=3 (Data Stage), DIR=IN, IOC
-        };
-
-        ep0_ring_enqueue(&data_trb)?;
-
-        // Step 3: Status Stage TRB (Direction=OUT for control-IN)
-        let status_trb = NormalTrb {
-            data_ptr: 0,
-            status: 0,
-            control: (4 << 10) | (1 << 5), // TRB Type=4 (Status Stage), IOC
-        };
-
-        ep0_ring_enqueue(&status_trb)?;
-
-        // Ring doorbell for Default Control Endpoint (EP0)
-        // DCI for control endpoint is always 1 (EP0 IN/OUT)
-        self.ring_doorbell(slot_id, 1, 0);
-
-        // Wait for completion events
-        let mut events_received = 0;
-        let mut timeout = 100000;
-        while timeout > 0 && events_received < 3 {
+    /// Wait for a Transfer Event (type 32) for `slot_id`.
+    /// Returns (completion code, residual byte count).
+    pub unsafe fn wait_transfer_event(&self, slot_id: u8) -> Result<(u8, u32), UsbError> {
+        for _ in 0..2_000_000u32 {
             if let Some(event) = self.poll_events() {
-                events_received += 1;
-                // Extract completion code
-                let code = (event.status >> 24) as u8;
-                if code != 1 {
-                    crate::framebuffer::write_str("xHCI: Control transfer event CC=");
-                    let code_hi = (code >> 4) & 0xF;
-                    let code_lo = code & 0xF;
-                    let c1 = if code_hi < 10 { b'0' + code_hi } else { b'A' + (code_hi - 10) };
-                    let c2 = if code_lo < 10 { b'0' + code_lo } else { b'A' + (code_lo - 10) };
-                    crate::framebuffer::write_str(core::str::from_utf8(&[c1, c2]).unwrap());
-                    crate::framebuffer::write_str("\n");
+                let event_type = ((event.control >> 10) & 0x3F) as u8;
+                let slot = ((event.control >> 24) & 0xFF) as u8;
+                if event_type == 32 && slot == slot_id {
+                    return Ok(((event.status >> 24) as u8, event.status & 0x00FF_FFFF));
                 }
-            }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
+            } else {
+                spin(100);
             }
         }
-
-        if timeout == 0 {
-            crate::framebuffer::write_str("xHCI: Control transfer timeout\n");
-            return Err(UsbError::Timeout);
-        }
-
-        crate::framebuffer::write_str("xHCI: Control GET OK\n");
-        Ok(())
+        Err(UsbError::Timeout)
     }
 
-    /// Issue control transfer SET (write data to device, or no data)
-    /// Used for SET_ADDRESS, SET_CONFIGURATION, SET_PROTOCOL, etc.
-    pub unsafe fn issue_control_set(
-        &mut self,
-        slot_id: u8,
-        setup: &crate::usb::device::UsbSetupPacket,
-    ) -> Result<(), UsbError> {
-        crate::framebuffer::write_str("xHCI: Control SET transfer...\n");
-
-        // Step 1: Setup Stage TRB
-        let setup_trb = NormalTrb {
-            data_ptr: setup.bm_request_type as u64 |
-                      ((setup.b_request as u64) << 8) |
-                      ((setup.w_value as u64) << 16) |
-                      ((setup.w_index as u64) << 32) |
-                      ((setup.w_length as u64) << 48),
-            status: (setup.w_length as u32) & 0x00FFFFFF,
-            control: (2 << 10) | (1 << 5) | (1 << 6), // TRB Type=2, TRT=0 (No Data), IOC, IDT
-        };
-
-        ep0_ring_enqueue(&setup_trb)?;
-
-        // Step 2: Status Stage TRB (Direction=IN for control-OUT)
-        let status_trb = NormalTrb {
-            data_ptr: 0,
-            status: 0,
-            control: (4 << 10) | (1 << 16) | (1 << 5), // TRB Type=4 (Status Stage), DIR=IN, IOC
-        };
-
-        ep0_ring_enqueue(&status_trb)?;
-
-        // Ring doorbell for Default Control Endpoint (EP0)
-        self.ring_doorbell(slot_id, 1, 0);
-
-        // Wait for completion events
-        let mut events_received = 0;
-        let mut timeout = 100000;
-        while timeout > 0 && events_received < 2 {
-            if let Some(event) = self.poll_events() {
-                events_received += 1;
-                // Extract completion code
-                let code = (event.status >> 24) as u8;
-                if code != 1 {
-                    crate::framebuffer::write_str("xHCI: Control SET event CC=");
-                    let code_hi = (code >> 4) & 0xF;
-                    let code_lo = code & 0xF;
-                    let c1 = if code_hi < 10 { b'0' + code_hi } else { b'A' + (code_hi - 10) };
-                    let c2 = if code_lo < 10 { b'0' + code_lo } else { b'A' + (code_lo - 10) };
-                    crate::framebuffer::write_str(core::str::from_utf8(&[c1, c2]).unwrap());
-                    crate::framebuffer::write_str("\n");
-                }
+    /// Run a command TRB and wait for its completion. Returns the slot id
+    /// from the completion event.
+    unsafe fn run_command(&mut self, name: &str, trb: NormalTrb) -> Result<u8, UsbError> {
+        command_ring_enqueue(&trb)?;
+        self.ring_doorbell(0, 0, 0);
+        match self.wait_command_completion() {
+            Ok((1, slot)) => Ok(slot),
+            Ok((code, _)) => {
+                crate::framebuffer::write_str("xHCI: ");
+                crate::framebuffer::write_str(name);
+                crate::framebuffer::write_str(" failed, CC=");
+                print_decimal(code as u32);
+                crate::framebuffer::write_str(" (");
+                crate::framebuffer::write_str(completion_code_name(code));
+                crate::framebuffer::write_str(")\n");
+                Err(UsbError::XhciInitFailed)
             }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
+            Err(e) => {
+                crate::framebuffer::write_str("xHCI: ");
+                crate::framebuffer::write_str(name);
+                crate::framebuffer::write_str(" timed out\n");
+                Err(e)
             }
         }
-
-        if timeout == 0 {
-            crate::framebuffer::write_str("xHCI: Control SET timeout\n");
-            return Err(UsbError::Timeout);
-        }
-
-        crate::framebuffer::write_str("xHCI: Control SET OK\n");
-        Ok(())
     }
 
-    /// Issue Address Device command
-    /// Configures slot and EP0 using the Input Context; with BSR=false the controller
-    /// also sends SET_ADDRESS to the device (xHCI handles addressing, not software).
+    /// Enable Slot command (TRB type 9). Returns the assigned slot id.
+    pub unsafe fn issue_enable_slot_command(&mut self) -> Result<u8, UsbError> {
+        let trb = NormalTrb { data_ptr: 0, status: 0, control: 9 << 10 };
+        let slot = self.run_command("Enable Slot", trb)?;
+        if slot == 0 {
+            return Err(UsbError::XhciInitFailed);
+        }
+        Ok(slot)
+    }
+
+    /// Disable Slot command (TRB type 10)
+    pub unsafe fn issue_disable_slot_command(&mut self, slot_id: u8) -> Result<(), UsbError> {
+        let trb = NormalTrb { data_ptr: 0, status: 0, control: ((slot_id as u32) << 24) | (10 << 10) };
+        self.run_command("Disable Slot", trb).map(|_| ())
+    }
+
+    /// Address Device command (TRB type 11). With BSR=false the controller
+    /// also sends SET_ADDRESS to the device.
     pub unsafe fn issue_address_device_command(
         &mut self,
         slot_id: u8,
         input_context_ptr: u64,
         bsr: bool,
     ) -> Result<(), UsbError> {
-        crate::framebuffer::write_str("xHCI: Address Device command...\n");
-
         let bsr_bit: u32 = if bsr { 1 << 9 } else { 0 };
         let trb = NormalTrb {
             data_ptr: input_context_ptr,
             status: 0,
             control: ((slot_id as u32) << 24) | (11 << 10) | bsr_bit,
         };
-
-        command_ring_enqueue(&trb)?;
-        self.ring_doorbell(0, 0, 0);
-
-        let mut timeout = 100000u32;
-        while timeout > 0 {
-            if let Some(event) = self.poll_events() {
-                let event_type = ((event.control >> 10) & 0x3F) as u8;
-                let code = (event.status >> 24) as u8;
-                if event_type == 33 {
-                    if code == 1 {
-                        crate::framebuffer::write_str("xHCI: Address Device OK\n");
-                        return Ok(());
-                    } else {
-                        crate::framebuffer::write_str("xHCI: Address Device CC=");
-                        let hi = (code >> 4) & 0xF;
-                        let lo = code & 0xF;
-                        let c1 = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
-                        let c2 = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
-                        crate::framebuffer::write_str(core::str::from_utf8(&[c1, c2]).unwrap());
-                        crate::framebuffer::write_str("\n");
-                        return Err(UsbError::XhciInitFailed);
-                    }
-                }
-            }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
-            }
-        }
-        crate::framebuffer::write_str("xHCI: Address Device timeout\n");
-        Err(UsbError::Timeout)
+        self.run_command("Address Device", trb).map(|_| ())
     }
 
-    /// Issue Configure Endpoint command
-    /// Configures additional endpoints after Address Device (e.g. EP1 IN for HID keyboard).
+    /// Configure Endpoint command (TRB type 12)
     pub unsafe fn issue_configure_endpoint_command(
         &mut self,
         slot_id: u8,
         input_context_ptr: u64,
     ) -> Result<(), UsbError> {
-        crate::framebuffer::write_str("xHCI: Configure Endpoint command...\n");
-
         let trb = NormalTrb {
             data_ptr: input_context_ptr,
             status: 0,
             control: ((slot_id as u32) << 24) | (12 << 10),
         };
+        self.run_command("Configure Endpoint", trb).map(|_| ())
+    }
 
-        command_ring_enqueue(&trb)?;
-        self.ring_doorbell(0, 0, 0);
+    /// Evaluate Context command (TRB type 13), used to update EP0 max packet size
+    pub unsafe fn issue_evaluate_context_command(
+        &mut self,
+        slot_id: u8,
+        input_context_ptr: u64,
+    ) -> Result<(), UsbError> {
+        let trb = NormalTrb {
+            data_ptr: input_context_ptr,
+            status: 0,
+            control: ((slot_id as u32) << 24) | (13 << 10),
+        };
+        self.run_command("Evaluate Context", trb).map(|_| ())
+    }
 
-        let mut timeout = 100000u32;
-        while timeout > 0 {
-            if let Some(event) = self.poll_events() {
-                let event_type = ((event.control >> 10) & 0x3F) as u8;
-                let code = (event.status >> 24) as u8;
-                if event_type == 33 {
-                    if code == 1 {
-                        crate::framebuffer::write_str("xHCI: Configure Endpoint OK\n");
-                        return Ok(());
-                    } else {
-                        crate::framebuffer::write_str("xHCI: Configure Endpoint CC=");
-                        let hi = (code >> 4) & 0xF;
-                        let lo = code & 0xF;
-                        let c1 = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 };
-                        let c2 = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 };
-                        crate::framebuffer::write_str(core::str::from_utf8(&[c1, c2]).unwrap());
-                        crate::framebuffer::write_str("\n");
-                        return Err(UsbError::XhciInitFailed);
-                    }
+    /// Control transfer with an IN data stage (e.g. GET_DESCRIPTOR).
+    /// Returns the number of bytes received.
+    pub unsafe fn issue_control_get(
+        &mut self,
+        slot_id: u8,
+        setup: &crate::usb::device::UsbSetupPacket,
+        data_ptr: u64,
+        data_length: u16,
+    ) -> Result<u32, UsbError> {
+        // Setup Stage: IDT, TRT=3 (IN data stage), transfer length is always 8
+        ep0_ring_enqueue(&NormalTrb {
+            data_ptr: setup_packet_u64(setup),
+            status: 8,
+            control: (2 << 10) | (3 << 16) | (1 << 6),
+        })?;
+        // Data Stage: DIR=IN; ISP so a short packet ends the TD with an event
+        ep0_ring_enqueue(&NormalTrb {
+            data_ptr,
+            status: (data_length as u32) & 0x1_FFFF,
+            control: (3 << 10) | (1 << 16) | (1 << 2),
+        })?;
+        // Status Stage: DIR=OUT, IOC
+        ep0_ring_enqueue(&NormalTrb {
+            data_ptr: 0,
+            status: 0,
+            control: (4 << 10) | (1 << 5),
+        })?;
+        self.ring_doorbell(slot_id, 1, 0);
+        self.finish_control_transfer(slot_id, data_length as u32)
+    }
+
+    /// Control transfer without a data stage (SET_CONFIGURATION, SET_PROTOCOL, ...)
+    pub unsafe fn issue_control_set(
+        &mut self,
+        slot_id: u8,
+        setup: &crate::usb::device::UsbSetupPacket,
+    ) -> Result<(), UsbError> {
+        // Setup Stage: IDT, TRT=0 (no data stage)
+        ep0_ring_enqueue(&NormalTrb {
+            data_ptr: setup_packet_u64(setup),
+            status: 8,
+            control: (2 << 10) | (1 << 6),
+        })?;
+        // Status Stage: DIR=IN, IOC
+        ep0_ring_enqueue(&NormalTrb {
+            data_ptr: 0,
+            status: 0,
+            control: (4 << 10) | (1 << 16) | (1 << 5),
+        })?;
+        self.ring_doorbell(slot_id, 1, 0);
+        self.finish_control_transfer(slot_id, 0).map(|_| ())
+    }
+
+    /// Wait for the end of a control transfer. A short packet on the data
+    /// stage produces an extra event (CC=13) before the status stage event.
+    unsafe fn finish_control_transfer(&self, slot_id: u8, requested: u32) -> Result<u32, UsbError> {
+        let mut received = requested;
+        loop {
+            let (code, residual) = self.wait_transfer_event(slot_id)?;
+            match code {
+                13 => {
+                    // Short packet on data stage; status stage event follows
+                    received = requested.saturating_sub(residual);
+                }
+                1 => return Ok(received),
+                _ => {
+                    crate::framebuffer::write_str("xHCI: control transfer failed, CC=");
+                    print_decimal(code as u32);
+                    crate::framebuffer::write_str(" (");
+                    crate::framebuffer::write_str(completion_code_name(code));
+                    crate::framebuffer::write_str(")\n");
+                    return Err(UsbError::XhciInitFailed);
                 }
             }
-            timeout -= 1;
-            for _ in 0..100 {
-                core::arch::asm!("nop", options(nomem, nostack));
-            }
         }
-        crate::framebuffer::write_str("xHCI: Configure Endpoint timeout\n");
-        Err(UsbError::Timeout)
+    }
+}
+
+/// Pack a setup packet into the 8-byte immediate data of a Setup TRB
+fn setup_packet_u64(setup: &crate::usb::device::UsbSetupPacket) -> u64 {
+    setup.bm_request_type as u64
+        | ((setup.b_request as u64) << 8)
+        | ((setup.w_value as u64) << 16)
+        | ((setup.w_index as u64) << 32)
+        | ((setup.w_length as u64) << 48)
+}
+
+/// Human-readable completion code
+pub fn completion_code_name(code: u8) -> &'static str {
+    match code {
+        1 => "Success",
+        2 => "Data Buffer Error",
+        3 => "Babble",
+        4 => "USB Transaction Error",
+        5 => "TRB Error",
+        6 => "Stall",
+        7 => "Resource Error",
+        8 => "Bandwidth Error",
+        9 => "No Slots Available",
+        11 => "Slot Not Enabled",
+        12 => "Endpoint Not Enabled",
+        13 => "Short Packet",
+        17 => "Parameter Error",
+        19 => "Context State Error",
+        _ => "Other",
+    }
+}
+
+/// Busy-wait for roughly `n` iterations
+fn spin(n: u32) {
+    for _ in 0..n {
+        unsafe { core::arch::asm!("nop", options(nomem, nostack)) };
+    }
+}
+
+/// Walk the extended capability list and, if the BIOS owns the controller
+/// (USB Legacy Support capability), request ownership and turn off the
+/// BIOS's SMI handlers. Without this the firmware may keep driving the
+/// controller (legacy keyboard emulation) and fight with our driver.
+unsafe fn bios_handoff(mmio_base: *mut u8, hccparams1: u32) {
+    let mut offset = ((hccparams1 >> 16) & 0xFFFF) as usize * 4;
+    let mut guard = 0;
+    while offset != 0 && guard < 64 {
+        guard += 1;
+        let cap_ptr = mmio_base.add(offset).cast::<u32>();
+        let cap = cap_ptr.read_volatile();
+        if cap & 0xFF == XECP_ID_LEGACY {
+            crate::framebuffer::write_str("xHCI: BIOS handoff... ");
+            if cap & USBLEGSUP_BIOS_OWNED != 0 {
+                cap_ptr.write_volatile(cap | USBLEGSUP_OS_OWNED);
+                let mut released = false;
+                for _ in 0..1_000_000u32 {
+                    if cap_ptr.read_volatile() & USBLEGSUP_BIOS_OWNED == 0 {
+                        released = true;
+                        break;
+                    }
+                    spin(200);
+                }
+                if released {
+                    crate::framebuffer::write_str("released by BIOS\n");
+                } else {
+                    // BIOS did not respond: take it anyway
+                    let v = cap_ptr.read_volatile();
+                    cap_ptr.write_volatile((v & !USBLEGSUP_BIOS_OWNED) | USBLEGSUP_OS_OWNED);
+                    crate::framebuffer::write_str("BIOS timeout, forced\n");
+                }
+            } else {
+                cap_ptr.write_volatile(cap | USBLEGSUP_OS_OWNED);
+                crate::framebuffer::write_str("not BIOS-owned\n");
+            }
+            // USBLEGCTLSTS: disable all SMI enables, clear SMI status (RW1C)
+            let ctl = cap_ptr.add(1);
+            let v = ctl.read_volatile();
+            ctl.write_volatile((v & 0xE000_0000) & !0x0000_E011);
+            return;
+        }
+        let next = ((cap >> 8) & 0xFF) as usize;
+        if next == 0 {
+            break;
+        }
+        offset += next * 4;
+    }
+}
+
+/// Helper: print a u32 in decimal
+unsafe fn print_decimal(mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for i in (0..len).rev() {
+        crate::framebuffer::write_str(core::str::from_utf8(&[digits[i]]).unwrap());
     }
 }
 
 /// Helper: Print 64-bit hex value
 unsafe fn print_hex_u64(value: u64) {
-    for i in (0..64).step_by(8).rev() {
+    for i in (0..64).step_by(4).rev() {
         let nibble = (value >> i) & 0xF;
         let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
         crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
@@ -1010,7 +890,7 @@ unsafe fn print_hex_u64(value: u64) {
 
 /// Helper: Print 32-bit hex value
 unsafe fn print_hex_u32(value: u32) {
-    for i in (0..32).step_by(8).rev() {
+    for i in (0..32).step_by(4).rev() {
         let nibble = (value >> i) & 0xF;
         let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
         crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());

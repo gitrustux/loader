@@ -54,8 +54,8 @@ const PCI_PRIMARY_BUS: u8 = 0x18;
 const PCI_SECONDARY_BUS: u8 = 0x19;
 const PCI_SUBORDINATE_BUS: u8 = 0x1A;
 
-/// BAR0 type bits
-const BAR_TYPE_MASK: u32 = 0x0F;
+/// BAR0 type bits (bits 2:1; bit 3 is "prefetchable" and must be ignored here)
+const BAR_TYPE_MASK: u32 = 0x06;
 const BAR_TYPE_64BIT: u32 = 0x04;
 const BAR_TYPE_MEMORY: u32 = 0x00;
 
@@ -173,6 +173,7 @@ fn print_hex_byte(value: u8) {
 }
 
 /// Print all PCI device details (full diagnostic dump)
+#[allow(dead_code)]
 unsafe fn dump_pci_device(bus: u8, device: u8, function: u8,
                           vendor_id: u16, device_id: u16,
                           class: u8, subclass: u8, prog_if: u8, header_type: u8) {
@@ -270,197 +271,176 @@ unsafe fn dump_pci_device(bus: u8, device: u8, function: u8,
     }
 }
 
+/// A USB controller found during the PCI scan
+#[derive(Clone, Copy)]
+struct UsbCandidate {
+    controller_type: UsbControllerType,
+    mmio_base: u64,
+    bus: u8,
+    device: u8,
+    function: u8,
+    vendor_id: u16,
+    device_id: u16,
+}
+
+/// Lower is better. xHCI on bus 0 is the chipset (PCH) controller, which owns
+/// the USB-A ports and the internal USB devices; add-in xHCI controllers
+/// (Thunderbolt, GPU USB-C) come next; then EHCI, then the rest.
+fn candidate_rank(c: &UsbCandidate) -> u8 {
+    match c.controller_type {
+        UsbControllerType::Xhci if c.bus == 0 => 0,
+        UsbControllerType::Xhci => 1,
+        UsbControllerType::Ehci => 2,
+        _ => 3,
+    }
+}
+
+unsafe fn print_candidate(c: &UsbCandidate) {
+    print_hex_byte(c.bus);
+    crate::framebuffer::write_str(":");
+    print_hex_byte(c.device);
+    crate::framebuffer::write_str(".");
+    crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + c.function]).unwrap());
+    crate::framebuffer::write_str(" ");
+    print_hex_byte((c.vendor_id >> 8) as u8);
+    print_hex_byte(c.vendor_id as u8);
+    crate::framebuffer::write_str(":");
+    print_hex_byte((c.device_id >> 8) as u8);
+    print_hex_byte(c.device_id as u8);
+    crate::framebuffer::write_str(match c.controller_type {
+        UsbControllerType::Xhci => " xHCI",
+        UsbControllerType::Ehci => " EHCI",
+        UsbControllerType::Uhci => " UHCI",
+        UsbControllerType::Ohci => " OHCI",
+    });
+    crate::framebuffer::write_str(" MMIO=0x");
+    for i in (0..64).step_by(4).rev() {
+        let nibble = ((c.mmio_base >> i) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'A' + (nibble - 10) };
+        crate::framebuffer::write_str(core::str::from_utf8(&[ch]).unwrap());
+    }
+}
+
 /// Scan PCI buses for any USB controller
 ///
-/// Returns the best available USB controller (xHCI > EHCI > others).
-/// Scans all buses (0-255), devices (0-31), functions (0-7).
+/// Scans all buses (0-255), devices (0-31) and functions (0-7 for
+/// multi-function devices). Prints every USB controller found and returns the
+/// best one (see `candidate_rank`).
 pub fn scan_for_usb_controller() -> Result<(UsbControllerType, u64), UsbError> {
     unsafe {
         crate::framebuffer::write_str("PCI: Scanning for USB controllers...\n");
 
-        // DEBUG: Test if PCI reads work at all by reading bus 0, device 0
-        let test_vendor = pci_read_config(0, 0, 0, PCI_VENDOR_ID);
-        crate::framebuffer::write_str("PCI: Test read bus0:dev0:fn0 vendor = 0x");
-        for i in (0..32).step_by(4).rev() {
-            let nibble = ((test_vendor >> i) & 0xF) as u8;
-            let c = if nibble < 10 { b'0' + nibble } else { b'A' + (nibble - 10) };
-            crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-        }
-        crate::framebuffer::write_str("\n");
-
-        // Track the best controller found (xHCI > EHCI > others)
-        let mut best_controller: Option<(UsbControllerType, u64, u8, u8, u8)> = None;
+        const MAX_CANDIDATES: usize = 16;
+        let mut candidates: [Option<UsbCandidate>; MAX_CANDIDATES] = [None; MAX_CANDIDATES];
+        let mut count = 0usize;
         let mut devices_found = 0u32;
-        let mut buses_with_devices = 0u8;
 
         for bus in 0u8..=255 {
-            let max_device = if bus == 0 { 8 } else { 32 };
-            let mut bus_has_devices = false;
+            for device in 0u8..32 {
+                // Function 0 must exist; functions 1-7 only if multi-function
+                let vendor0 = pci_read_config(bus, device, 0, PCI_VENDOR_ID) as u16;
+                if vendor0 == 0xFFFF {
+                    continue;
+                }
+                let header0 = ((pci_read_config(bus, device, 0, 0x0C) >> 16) & 0xFF) as u8;
+                let functions = if header0 & HEADER_TYPE_MULTIFUNCTION != 0 { 8 } else { 1 };
 
-            for device in 0u8..max_device {
-                for function in 0u8..8 {
-                    let vendor_id = pci_read_config(bus, device, function, PCI_VENDOR_ID) as u16;
+                for function in 0u8..functions {
+                    let vendor_device = pci_read_config(bus, device, function, 0x00);
+                    let vendor_id = (vendor_device & 0xFFFF) as u16;
                     if vendor_id == 0xFFFF {
                         continue;
                     }
-
-                    if !bus_has_devices {
-                        buses_with_devices += 1;
-                        bus_has_devices = true;
-                    }
-
-                    devices_found += 1;  // Count all PCI devices found
-
-                    // Read PCI config DWORDs and extract fields properly
-                    // Offset 0x00: Vendor ID (bits 0-15) + Device ID (bits 16-31)
-                    let vendor_device = pci_read_config(bus, device, function, 0x00);
-                    let vendor_id = (vendor_device & 0xFFFF) as u16;
+                    devices_found += 1;
                     let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
 
-                    // Offset 0x08: Class (bits 24-31) + Subclass (bits 16-23) + Prog IF (bits 8-15) + Revision (bits 0-7)
                     let class_reg = pci_read_config(bus, device, function, 0x08);
                     let class = ((class_reg >> 24) & 0xFF) as u8;
                     let subclass = ((class_reg >> 16) & 0xFF) as u8;
                     let prog_if = ((class_reg >> 8) & 0xFF) as u8;
 
-                    // Offset 0x0C: Cache Line + Latency + Header Type + BIST
-                    let header_reg = pci_read_config(bus, device, function, 0x0C);
-                    let header_type = ((header_reg >> 16) & 0xFF) as u8;
+                    if class != PCI_CLASS_SERIAL_BUS || subclass != PCI_SUBCLASS_USB {
+                        continue;
+                    }
 
-                    // DIAGNOSTIC: Dump all PCI devices
-                    dump_pci_device(bus, device, function, vendor_id, device_id, class, subclass, prog_if, header_type);
+                    let controller_type = match prog_if {
+                        PCI_PROG_IF_XHCI => UsbControllerType::Xhci,
+                        PCI_PROG_IF_EHCI => UsbControllerType::Ehci,
+                        PCI_PROG_IF_UHCI => UsbControllerType::Uhci,
+                        PCI_PROG_IF_OHCI => UsbControllerType::Ohci,
+                        _ => continue, // USB device controller / other, not a host
+                    };
 
-                    // USB controller: Class 0x0C, Subclass 0x03
-                    if class == PCI_CLASS_SERIAL_BUS && subclass == PCI_SUBCLASS_USB {
-                        let controller_type = match prog_if {
-                            PCI_PROG_IF_XHCI => {
-                                crate::framebuffer::write_str("PCI: Found xHCI (USB 3.0) controller\n");
-                                UsbControllerType::Xhci
-                            }
-                            PCI_PROG_IF_EHCI => {
-                                crate::framebuffer::write_str("PCI: Found EHCI (USB 2.0) controller\n");
-                                UsbControllerType::Ehci
-                            }
-                            PCI_PROG_IF_UHCI => {
-                                crate::framebuffer::write_str("PCI: Found UHCI (USB 1.1) controller\n");
-                                UsbControllerType::Uhci
-                            }
-                            PCI_PROG_IF_OHCI => {
-                                crate::framebuffer::write_str("PCI: Found OHCI (USB 1.1) controller\n");
-                                UsbControllerType::Ohci
-                            }
-                            _ => {
-                                crate::framebuffer::write_str("PCI: Found USB controller with unknown prog_if = 0x");
-                                print_hex_byte(prog_if);
-                                crate::framebuffer::write_str(", attempting to use\n");
-                                // Try to use it anyway as a generic USB controller
-                                UsbControllerType::Xhci  // Assume xHCI for unknown
-                            }
-                        };
-
-                        // Get BAR0 MMIO base
-                        if let Some(mmio_base) = get_bar0_mmio(bus, device, function) {
-                            // Print MMIO address
-                            crate::framebuffer::write_str("PCI: MMIO base = 0x");
-                            let mut base = mmio_base;
-                            for _ in 0..8 {
-                                let nibble = (base & 0xF0000000) >> 28;
-                                let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
-                                crate::framebuffer::write_str(core::str::from_utf8(&[c]).unwrap());
-                                base <<= 4;
-                            }
+                    let mmio_base = match get_bar0_mmio(bus, device, function) {
+                        Some(b) => b,
+                        None => {
+                            crate::framebuffer::write_str("PCI: USB controller with unusable BAR0 at ");
+                            print_hex_byte(bus);
+                            crate::framebuffer::write_str(":");
+                            print_hex_byte(device);
                             crate::framebuffer::write_str("\n");
-
-                            // Enable bus mastering
-                            enable_bus_mastering(bus, device, function);
-
-                            // Update best controller (priority: xHCI > EHCI > others)
-                            if best_controller.is_none()
-                                || matches!(controller_type, UsbControllerType::Xhci)
-                                || (matches!(controller_type, UsbControllerType::Ehci)
-                                    && !matches!(best_controller, Some((UsbControllerType::Xhci, _, _, _, _))))
-                            {
-                                best_controller = Some((controller_type, mmio_base, bus, device, function));
-                            }
-
-                            // If we found xHCI, we can stop searching (it's the best)
-                            if matches!(controller_type, UsbControllerType::Xhci) {
-                                crate::framebuffer::write_str("PCI: Using xHCI controller\n");
-                                return Ok((controller_type, mmio_base));
-                            }
+                            continue;
                         }
+                    };
+
+                    let c = UsbCandidate {
+                        controller_type, mmio_base, bus, device, function, vendor_id, device_id,
+                    };
+                    crate::framebuffer::write_str("PCI: found ");
+                    print_candidate(&c);
+                    crate::framebuffer::write_str("\n");
+
+                    if count < MAX_CANDIDATES {
+                        candidates[count] = Some(c);
+                        count += 1;
                     }
                 }
             }
         }
 
-        // Scan all 255 buses - USB controllers can be on higher bus numbers
-        // No need to break early, the loop handles this efficiently by skipping
-        // buses/devices that don't exist (vendor_id == 0xFFFF)
-
-        // DEBUG: Report total PCI devices found
-        crate::framebuffer::write_str("PCI: Total devices found = ");
-        if devices_found > 9999 {
-            crate::framebuffer::write_str("MANY\n");
-        } else {
-            // Simple decimal conversion for devices_found
-            let mut temp = devices_found;
-            let mut digits = [0u8; 5];
-            let mut len = 0;
-            if temp == 0 {
-                digits[len] = b'0';
-                len += 1;
-            } else {
-                while temp > 0 && len < 5 {
-                    digits[len] = b'0' + (temp % 10) as u8;
-                    temp /= 10;
-                    len += 1;
-                }
-            }
-            // Print in reverse order
-            for i in (0..len).rev() {
-                crate::framebuffer::write_str(core::str::from_utf8(&[digits[i]]).unwrap());
-            }
-            crate::framebuffer::write_str("\n");
-        }
-
-        // DEBUG: Report buses scanned
-        crate::framebuffer::write_str("PCI: Buses with devices = ");
-        let mut temp = buses_with_devices;
-        let mut digits = [0u8; 3];
-        let mut len = 0;
-        if temp == 0 {
-            digits[len] = b'0';
-            len += 1;
-        } else {
-            while temp > 0 && len < 3 {
-                digits[len] = b'0' + (temp % 10) as u8;
-                temp /= 10;
-                len += 1;
-            }
-        }
-        for i in (0..len).rev() {
-            crate::framebuffer::write_str(core::str::from_utf8(&[digits[i]]).unwrap());
-        }
+        crate::framebuffer::write_str("PCI: total devices = ");
+        print_decimal(devices_found);
+        crate::framebuffer::write_str(", USB controllers = ");
+        print_decimal(count as u32);
         crate::framebuffer::write_str("\n");
 
-        if let Some((controller_type, mmio_base, _, _, _)) = best_controller {
-            match controller_type {
-                UsbControllerType::Xhci => {
-                    crate::framebuffer::write_str("PCI: Using xHCI controller\n");
-                }
-                UsbControllerType::Ehci => {
-                    crate::framebuffer::write_str("PCI: Using EHCI controller\n");
-                }
-                _ => {
-                    crate::framebuffer::write_str("PCI: Using legacy USB controller (limited support)\n");
-                }
+        let mut best: Option<UsbCandidate> = None;
+        for c in candidates.iter().flatten() {
+            if best.map_or(true, |b| candidate_rank(c) < candidate_rank(&b)) {
+                best = Some(*c);
             }
-            return Ok((controller_type, mmio_base));
         }
 
-        crate::framebuffer::write_str("PCI: No compatible USB controller found\n");
-        Err(UsbError::XhciNotFound) // Will be translated to appropriate error
+        match best {
+            Some(c) => {
+                enable_bus_mastering(c.bus, c.device, c.function);
+                crate::framebuffer::write_str("PCI: SELECTED ");
+                print_candidate(&c);
+                crate::framebuffer::write_str("\n");
+                Ok((c.controller_type, c.mmio_base))
+            }
+            None => {
+                crate::framebuffer::write_str("PCI: No compatible USB controller found\n");
+                Err(UsbError::XhciNotFound)
+            }
+        }
+    }
+}
+
+/// Helper: print a u32 in decimal
+unsafe fn print_decimal(mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for i in (0..len).rev() {
+        crate::framebuffer::write_str(core::str::from_utf8(&[digits[i]]).unwrap());
     }
 }
 

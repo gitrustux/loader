@@ -365,9 +365,6 @@ fn main() -> Status {
     );
     }
 
-    // Jump into shell
-    framebuffer::write_str("Starting shell...\n");
-
     // POST CODE 0x47: In shell
     // POST CODE 0x48: About to run_shell()
     // POST CODE 0x49: In run_shell

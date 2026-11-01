@@ -11,9 +11,30 @@
 set -e
 
 VERSION="0.1.0"
-IMAGE_NAME="rustica-live-amd64-${VERSION}.img"
-SYMLINK_NAME="rustica-live-amd64.img"
+# Which kernel goes in /EFI/Rustux/kernel.efi:
+#   KERNEL=kernel-efi (default)  the frozen transition kernel
+#   KERNEL=rustux                the Rustux microkernel (gitrustux/rustux,
+#                                checked out at /var/www/rustux.com/prod);
+#                                written to a separate image file
+KERNEL="${KERNEL:-kernel-efi}"
+RUSTUX_DIR="/var/www/rustux.com/prod"
 KERNEL_DIR="/var/www/rustux.com/prod/loader/kernel-efi"
+case "${KERNEL}" in
+  kernel-efi)
+    IMAGE_NAME="rustica-live-amd64-${VERSION}.img"
+    SYMLINK_NAME="rustica-live-amd64.img"
+    KERNEL_EFI="${KERNEL_DIR}/target/x86_64-unknown-uefi/release/rustux-kernel-efi.efi"
+    ;;
+  rustux)
+    IMAGE_NAME="rustica-live-amd64-rustux-${VERSION}.img"
+    SYMLINK_NAME="rustica-live-amd64-rustux.img"
+    KERNEL_EFI="${RUSTUX_DIR}/target/x86_64-unknown-uefi/release/rustux.efi"
+    ;;
+  *)
+    echo "KERNEL must be kernel-efi or rustux" >&2
+    exit 1
+    ;;
+esac
 LOADER_DIR="/var/www/rustux.com/prod/loader/uefi-loader"
 OUTPUT_DIR="/var/www/rustux.com/html/rustica"
 MOUNT_POINT="/tmp/rustica-mount"
@@ -36,7 +57,16 @@ echo ""
 
 # Step 1: Build kernel
 echo -e "${YELLOW}[1/6] Building kernel...${NC}"
-cargo build --release --manifest-path "${KERNEL_DIR}/Cargo.toml" --target x86_64-unknown-uefi
+if [ "${KERNEL}" = rustux ]; then
+    (cd "${RUSTUX_DIR}" && cargo build --release --bin rustux --features uefi_kernel --target x86_64-unknown-uefi)
+else
+    cargo build --release --manifest-path "${KERNEL_DIR}/Cargo.toml" --target x86_64-unknown-uefi
+fi
+# A kernel of a few KB means the build produced the old panic stub
+if [ "$(stat -c %s "${KERNEL_EFI}")" -lt 20000 ]; then
+    echo -e "${RED}Kernel ${KERNEL_EFI} is only $(stat -c %s "${KERNEL_EFI}") bytes; refusing to build the image${NC}" >&2
+    exit 1
+fi
 echo -e "${GREEN}✓ Kernel built${NC}"
 echo ""
 
@@ -58,9 +88,8 @@ cp "${LOADER_DIR}/target/x86_64-unknown-uefi/release/rustux-uefi-loader.efi" \
 echo -e "${GREEN}  ✓ Bootloader: EFI/BOOT/BOOTX64.EFI${NC}"
 
 # Copy kernel
-cp "${KERNEL_DIR}/target/x86_64-unknown-uefi/release/rustux-kernel-efi.efi" \
-   "${STAGING_DIR}/EFI/Rustux/kernel.efi"
-echo -e "${GREEN}  ✓ Kernel: EFI/Rustux/kernel.efi${NC}"
+cp "${KERNEL_EFI}" "${STAGING_DIR}/EFI/Rustux/kernel.efi"
+echo -e "${GREEN}  ✓ Kernel (${KERNEL}): EFI/Rustux/kernel.efi${NC}"
 
 # Calculate staging size
 STAGING_SIZE=$(du -sk "${STAGING_DIR}" | cut -f1)

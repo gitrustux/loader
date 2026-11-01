@@ -5,6 +5,7 @@
 // xHCI requires all DMA structures to be 64-byte aligned.
 // This module provides aligned DMA buffers using explicit alignment.
 
+extern crate alloc;
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::usb::trb::*;  // Imports TRB_RING_SIZE, NormalTrb, EventTrb, etc.
 use crate::usb::UsbError;  // Import UsbError type
@@ -105,27 +106,29 @@ pub fn command_ring_cycle() -> u64 {
     unsafe { COMMAND_RING_DATA.cycle_state.load(Ordering::Acquire) as u64 }
 }
 
-/// Enqueue a TRB on a producer ring (command ring or transfer ring).
+/// Enqueue a TRB on a producer ring of `size` TRBs (command ring or
+/// transfer ring) and return the physical address of the TRB written.
 ///
 /// The last slot of every producer ring holds a Link TRB that points back to
 /// the start of the ring with Toggle Cycle set, so the controller follows the
 /// ring around instead of running off the end of the array. Software does not
 /// track completions here, so there is no "ring full" check; the rings are
 /// only ever a few TRBs ahead of the controller.
-pub unsafe fn producer_ring_enqueue(
+pub unsafe fn producer_ring_enqueue_sized(
     trbs: *mut NormalTrb,
+    size: usize,
     enqueue: &AtomicU32,
     cycle_state: &AtomicU32,
     trb: &NormalTrb,
-) {
+) -> u64 {
     let mut index = enqueue.load(Ordering::Acquire) as usize;
     let mut cycle = cycle_state.load(Ordering::Acquire) & 1;
 
-    if index >= TRB_RING_SIZE - 1 {
+    if index >= size - 1 {
         // Write the Link TRB in the last slot, hand it to the controller with
         // the current cycle bit, then wrap and flip our cycle state.
         write_trb(
-            trbs.add(TRB_RING_SIZE - 1),
+            trbs.add(size - 1),
             trbs as u64,
             0,
             (6 << 10) | TRB_TOGGLE_CYCLE_BIT,
@@ -139,6 +142,17 @@ pub unsafe fn producer_ring_enqueue(
     write_trb(trbs.add(index), trb.data_ptr, trb.status, trb.control, cycle);
 
     enqueue.store((index + 1) as u32, Ordering::Release);
+    trbs.add(index) as u64
+}
+
+/// [`producer_ring_enqueue_sized`] for the fixed-size static rings
+pub unsafe fn producer_ring_enqueue(
+    trbs: *mut NormalTrb,
+    enqueue: &AtomicU32,
+    cycle_state: &AtomicU32,
+    trb: &NormalTrb,
+) -> u64 {
+    producer_ring_enqueue_sized(trbs, TRB_RING_SIZE, enqueue, cycle_state, trb)
 }
 
 /// Write a TRB so that the controller only sees it once it is complete:
@@ -157,11 +171,13 @@ unsafe fn write_trb(slot: *mut NormalTrb, data_ptr: u64, status: u32, control: u
     core::sync::atomic::fence(Ordering::SeqCst);
 }
 
-/// Enqueue to command ring
-pub unsafe fn command_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
+/// Enqueue to command ring. Returns the TRB's address (used to match its
+/// Command Completion Event) and the cycle bit it was written with.
+pub unsafe fn command_ring_enqueue(trb: &NormalTrb) -> Result<(u64, u32), UsbError> {
     let ring = &mut COMMAND_RING_DATA;
-    producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
-    Ok(())
+    let addr = producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
+    let cycle = (core::ptr::read_volatile(addr as *const NormalTrb).control & TRB_CYCLE_BIT) as u32;
+    Ok((addr, cycle))
 }
 
 /// Get command ring enqueue index
@@ -194,7 +210,8 @@ pub unsafe fn event_ring_dequeue() -> Option<EventTrb> {
     let index = ring.dequeue.load(Ordering::Acquire) as usize;
     let cycle = ring.cycle_state.load(Ordering::Acquire);
 
-    let trb = ring.trbs[index];
+    // Written by the controller: read it with a volatile access
+    let trb = core::ptr::read_volatile(&ring.trbs[index]);
     let trb_cycle = (trb.control & TRB_CYCLE_BIT) as u32;
 
     // Check if TRB is owned by controller
@@ -327,118 +344,60 @@ pub struct DeviceContextStruct {
     pub ep: [EndpointContext; 31],
 }
 
-/// EP0 Transfer Ring — Default Control Pipe for USB control transfers
-#[repr(C, align(64))]
-pub struct Ep0RingStruct {
-    pub trbs: [NormalTrb; TRB_RING_SIZE],
-    pub enqueue: AtomicU32,
-    pub dequeue: AtomicU32,
-    pub cycle_state: AtomicU32,
-    pub _pad: [u8; 52],
+// ============================================================
+// PER-DEVICE MEMORY AND TRANSFER RINGS
+// ============================================================
+//
+// kernel-efi runs on the firmware's identity mapping, so the address of
+// any kernel allocation is also its physical address. Device structures
+// get whole 4 KiB pages: that satisfies every xHCI alignment rule (64-byte
+// contexts and rings, no 64 KiB boundary crossing).
+
+/// Allocate a zeroed, 4 KiB aligned page for device DMA. The kernel heap
+/// never frees, so pages are kept and reused per slot.
+pub fn alloc_dma_page() -> Option<*mut u8> {
+    let layout = core::alloc::Layout::from_size_align(4096, 4096).ok()?;
+    let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if p.is_null() { None } else { Some(p) }
 }
 
-/// EP1 IN Transfer Ring — HID keyboard interrupt IN endpoint
-#[repr(C, align(64))]
-pub struct Ep1InRingStruct {
-    pub trbs: [NormalTrb; TRB_RING_SIZE],
-    pub enqueue: AtomicU32,
-    pub dequeue: AtomicU32,
-    pub cycle_state: AtomicU32,
-    pub _pad: [u8; 52],
+/// A transfer ring occupying one page: 255 TRBs plus the Link TRB
+pub struct Ring {
+    trbs: *mut NormalTrb,
+    enqueue: AtomicU32,
+    cycle_state: AtomicU32,
 }
 
-const ZERO_SLOT: SlotContext = SlotContext {
-    dword0: 0, dword1: 0, dword2: 0, dword3: 0, _reserved: [0; 4],
-};
-const ZERO_EP: EndpointContext = EndpointContext {
-    dword0: 0, dword1: 0, deq_ptr_lo: 0, deq_ptr_hi: 0, dword4: 0, _reserved: [0; 3],
-};
+/// TRBs per ring page
+pub const RING_TRBS: usize = 4096 / 16;
 
-pub static mut INPUT_CONTEXT: InputContextStruct = InputContextStruct {
-    control: InputControlContext { drop_flags: 0, add_flags: 0, _reserved: [0; 6] },
-    slot: ZERO_SLOT,
-    ep: [ZERO_EP; 31],
-};
+impl Ring {
+    /// A ring in a freshly zeroed page
+    pub fn new() -> Option<Self> {
+        let page = alloc_dma_page()?;
+        Some(Self {
+            trbs: page as *mut NormalTrb,
+            enqueue: AtomicU32::new(0),
+            cycle_state: AtomicU32::new(1),
+        })
+    }
 
-pub static mut DEVICE_CONTEXT: DeviceContextStruct = DeviceContextStruct {
-    slot: ZERO_SLOT,
-    ep: [ZERO_EP; 31],
-};
+    /// Empty the ring for reuse (contents zeroed, cycle state 1)
+    pub fn reset(&mut self) {
+        unsafe { core::ptr::write_bytes(self.trbs as *mut u8, 0, 4096) };
+        self.enqueue.store(0, Ordering::Release);
+        self.cycle_state.store(1, Ordering::Release);
+    }
 
-pub static mut EP0_RING: Ep0RingStruct = Ep0RingStruct {
-    trbs: [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
-    enqueue: AtomicU32::new(0),
-    dequeue: AtomicU32::new(0),
-    cycle_state: AtomicU32::new(1),
-    _pad: [0; 52],
-};
+    /// Physical address of the first TRB (for endpoint contexts)
+    pub fn base(&self) -> u64 {
+        self.trbs as u64
+    }
 
-pub static mut EP1_IN_RING: Ep1InRingStruct = Ep1InRingStruct {
-    trbs: [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
-    enqueue: AtomicU32::new(0),
-    dequeue: AtomicU32::new(0),
-    cycle_state: AtomicU32::new(1),
-    _pad: [0; 52],
-};
-
-/// Get Input Context physical address
-pub fn input_context_base() -> u64 {
-    unsafe { &INPUT_CONTEXT as *const InputContextStruct as u64 }
-}
-
-/// Get Device Context physical address
-pub fn device_context_base() -> u64 {
-    unsafe { &DEVICE_CONTEXT as *const DeviceContextStruct as u64 }
-}
-
-/// Get EP0 Transfer Ring base address
-pub fn ep0_ring_base() -> u64 {
-    unsafe { &EP0_RING.trbs[0] as *const NormalTrb as u64 }
-}
-
-/// Get EP0 ring initial cycle state
-pub fn ep0_ring_cycle() -> u64 {
-    unsafe { EP0_RING.cycle_state.load(Ordering::Acquire) as u64 }
-}
-
-/// Enqueue a TRB to the EP0 transfer ring
-pub unsafe fn ep0_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
-    let ring = &mut EP0_RING;
-    producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
-    Ok(())
-}
-
-/// Get EP1 IN Transfer Ring base address
-pub fn ep1_in_ring_base() -> u64 {
-    unsafe { &EP1_IN_RING.trbs[0] as *const NormalTrb as u64 }
-}
-
-/// Get EP1 IN ring initial cycle state
-pub fn ep1_in_ring_cycle() -> u64 {
-    unsafe { EP1_IN_RING.cycle_state.load(Ordering::Acquire) as u64 }
-}
-
-/// Enqueue a TRB to the EP1 IN transfer ring
-pub unsafe fn ep1_in_ring_enqueue(trb: &NormalTrb) -> Result<(), UsbError> {
-    let ring = &mut EP1_IN_RING;
-    producer_ring_enqueue(ring.trbs.as_mut_ptr(), &ring.enqueue, &ring.cycle_state, trb);
-    Ok(())
-}
-
-/// Clear the per-device state (contexts and transfer rings) so a new device
-/// can be enumerated after a previous attempt was abandoned.
-pub unsafe fn reset_device_state() {
-    INPUT_CONTEXT.control = InputControlContext { drop_flags: 0, add_flags: 0, _reserved: [0; 6] };
-    INPUT_CONTEXT.slot = ZERO_SLOT;
-    INPUT_CONTEXT.ep = [ZERO_EP; 31];
-    DEVICE_CONTEXT.slot = ZERO_SLOT;
-    DEVICE_CONTEXT.ep = [ZERO_EP; 31];
-    EP0_RING.trbs = [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE];
-    EP0_RING.enqueue.store(0, Ordering::Release);
-    EP0_RING.cycle_state.store(1, Ordering::Release);
-    EP1_IN_RING.trbs = [NormalTrb { data_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE];
-    EP1_IN_RING.enqueue.store(0, Ordering::Release);
-    EP1_IN_RING.cycle_state.store(1, Ordering::Release);
+    /// Enqueue a TRB; returns its address
+    pub fn push(&mut self, trb: &NormalTrb) -> u64 {
+        unsafe { producer_ring_enqueue_sized(self.trbs, RING_TRBS, &self.enqueue, &self.cycle_state, trb) }
+    }
 }
 
 /// ============================================================
@@ -486,20 +445,6 @@ pub unsafe fn setup_scratchpad(count: usize) -> bool {
     true
 }
 
-/// Alignment check helpers
-pub fn input_context_aligned() -> bool {
-    input_context_base() & 0x3F == 0
-}
-pub fn device_context_aligned() -> bool {
-    device_context_base() & 0x3F == 0
-}
-pub fn ep0_ring_aligned() -> bool {
-    ep0_ring_base() & 0x3F == 0
-}
-pub fn ep1_in_ring_aligned() -> bool {
-    ep1_in_ring_base() & 0x3F == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,10 +456,6 @@ mod tests {
             assert!(event_ring_aligned());
             assert!(erst_aligned());
             assert!(dcbaa_aligned());
-            assert!(input_context_aligned());
-            assert!(device_context_aligned());
-            assert!(ep0_ring_aligned());
-            assert!(ep1_in_ring_aligned());
         }
     }
 

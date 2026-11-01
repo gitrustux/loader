@@ -59,15 +59,10 @@ const SHIFT_SYMBOL: [u8; 12] = [
 ];
 
 /// Previous key state (for key press detection)
-static mut PREVIOUS_KEYCODES: [u8; 6] = [0; 6];
-static mut PREVIOUS_MODIFIER: u8 = 0;
-
-/// Check if shift modifier is active
 fn is_shift(modifier: u8) -> bool {
     (modifier & MODIFIER_LEFT_SHIFT != 0) || (modifier & MODIFIER_RIGHT_SHIFT != 0)
 }
 
-/// Convert HID keycode to ASCII with shift handling
 fn keycode_to_ascii(keycode: u8, modifier: u8) -> u8 {
     if keycode as usize >= HID_TO_ASCII.len() {
         return 0;
@@ -75,7 +70,6 @@ fn keycode_to_ascii(keycode: u8, modifier: u8) -> u8 {
 
     let mut ascii = HID_TO_ASCII[keycode as usize];
 
-    // Apply shift for letters and certain symbols
     if is_shift(modifier) {
         if ascii >= b'a' && ascii <= b'z' {
             ascii -= 32; // Convert to uppercase
@@ -84,7 +78,6 @@ fn keycode_to_ascii(keycode: u8, modifier: u8) -> u8 {
         } else if ascii == b'0' {
             ascii = b')';
         } else {
-            // Handle shifted symbols
             match ascii {
                 b'-' => ascii = SHIFT_SYMBOL[0],
                 b'=' => ascii = SHIFT_SYMBOL[1],
@@ -105,18 +98,8 @@ fn keycode_to_ascii(keycode: u8, modifier: u8) -> u8 {
     ascii
 }
 
-/// Detect key press (key is newly pressed, not held down)
-fn is_key_press(keycode: u8) -> bool {
-    unsafe {
-        // Check if this keycode was NOT in the previous state
-        !PREVIOUS_KEYCODES.contains(&keycode)
-    }
-}
-
-/// Parse USB HID keyboard report and return ASCII character if available
-/// Characters decoded from reports but not yet returned. One report can
-/// contain several newly pressed keys (fast typing overlaps key presses).
-static mut PENDING: [u8; 16] = [0; 16];
+/// Characters decoded from reports (all keyboards) but not yet returned
+static mut PENDING: [u8; 32] = [0; 32];
 static mut PENDING_HEAD: usize = 0;
 static mut PENDING_LEN: usize = 0;
 
@@ -137,59 +120,42 @@ unsafe fn pending_pop() -> Option<char> {
     Some(c as char)
 }
 
-/// Return the first newly pressed key in `report` (compared with the
-/// previous report) and queue any others for later calls.
-pub fn parse_keyboard_report(report: &KeyboardReport) -> Option<char> {
-    unsafe {
-        for keycode in &report.keycodes {
-            // 0 = no key, 1 = rollover error (too many keys held)
-            if *keycode <= 1 || !is_key_press(*keycode) {
-                continue;
-            }
-            let ascii = keycode_to_ascii(*keycode, report.modifier);
+/// Decode one boot-protocol report from a keyboard. Every key that is in
+/// this report but not in `prev` (that keyboard's previous report) is a new
+/// press and is queued. `prev` is updated.
+pub fn process_report(report: &[u8], prev: &mut [u8; 6]) {
+    if report.len() < 3 {
+        return;
+    }
+    let modifier = report[0];
+    let mut keys = [0u8; 6];
+    for (i, k) in report[2..].iter().take(6).enumerate() {
+        keys[i] = *k;
+    }
+    // Rollover error (too many keys): says nothing about which keys are
+    // held, keep the previous state
+    if keys[0] == 1 {
+        return;
+    }
+    for &k in keys.iter() {
+        if k > 1 && !prev.contains(&k) {
+            let ascii = keycode_to_ascii(k, modifier);
             if ascii != 0 {
-                pending_push(ascii);
+                unsafe { pending_push(ascii) };
             }
         }
-        pending_pop()
     }
+    *prev = keys;
 }
 
+/// Next character from any USB keyboard, if one is waiting
 pub fn poll_keyboard() -> Option<char> {
     unsafe {
         if let Some(c) = pending_pop() {
             return Some(c);
         }
-
-        let _controller = super::xhci::controller()?;
-
-        let _keyboard = super::device::get_hid_keyboard()?;
-
-        let bytes_read = super::device::read_keyboard_report();
-        if bytes_read == 0 {
-            return None;
-        }
-
-        let report = super::device::parse_report_buffer()?;
-
-        // A rollover report (all keycodes 1) says nothing about which keys
-        // are held; ignore it and keep the previous state.
-        if report.keycodes[0] == 1 {
-            return None;
-        }
-
-        let ch = parse_keyboard_report(&report);
-
-        update_key_state(&report);
-
-        ch
-    }
-}
-
-pub fn update_key_state(report: &KeyboardReport) {
-    unsafe {
-        PREVIOUS_KEYCODES = report.keycodes;
-        PREVIOUS_MODIFIER = report.modifier;
+        super::device::poll_keyboards();
+        pending_pop()
     }
 }
 
@@ -203,57 +169,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_simple_key() {
-        // Reset previous state
-        unsafe {
-            PREVIOUS_KEYCODES = [0; 6];
-            PREVIOUS_MODIFIER = 0;
-        }
-
-        let report = KeyboardReport {
-            modifier: 0,
-            reserved: 0,
-            keycodes: [0x04, 0, 0, 0, 0, 0], // HID keycode 0x04 = 'a'
-        };
-        let result = parse_keyboard_report(&report);
-        assert_eq!(result, Some('a'));
+    fn test_new_key_and_repeat() {
+        let mut prev = [0u8; 6];
+        process_report(&[0, 0, 0x04, 0, 0, 0, 0, 0], &mut prev);
+        assert_eq!(poll_pending(), Some('a'));
+        process_report(&[0, 0, 0x04, 0, 0, 0, 0, 0], &mut prev);
+        assert_eq!(poll_pending(), None);
     }
 
-    #[test]
-    fn test_parse_shifted_key() {
-        // Reset previous state
-        unsafe {
-            PREVIOUS_KEYCODES = [0; 6];
-            PREVIOUS_MODIFIER = 0;
-        }
-
-        let report = KeyboardReport {
-            modifier: MODIFIER_LEFT_SHIFT,
-            reserved: 0,
-            keycodes: [0x04, 0, 0, 0, 0, 0], // HID keycode 0x04 = 'a' -> 'A'
-        };
-        let result = parse_keyboard_report(&report);
-        assert_eq!(result, Some('A'));
-    }
-
-    #[test]
-    fn test_key_repeat_detection() {
-        // First press should return character
-        unsafe {
-            PREVIOUS_KEYCODES = [0; 6];
-            PREVIOUS_MODIFIER = 0;
-        }
-
-        let report = KeyboardReport {
-            modifier: 0,
-            reserved: 0,
-            keycodes: [0x04, 0, 0, 0, 0, 0],
-        };
-        let result1 = parse_keyboard_report(&report);
-        assert_eq!(result1, Some('a'));
-
-        // Second call with same keycodes should NOT return character (held key)
-        let result2 = parse_keyboard_report(&report);
-        assert_eq!(result2, None);
+    fn poll_pending() -> Option<char> {
+        unsafe { pending_pop() }
     }
 }

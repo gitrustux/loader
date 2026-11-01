@@ -51,6 +51,7 @@ mod vga_console;
 mod native_console;
 mod acpi;
 mod usb;
+mod time;
 
 /// Exit UEFI boot services with frozen zone enforcement
 ///

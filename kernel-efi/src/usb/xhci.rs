@@ -6,6 +6,7 @@
 
 use crate::usb::{XhciInfo, UsbError, trb::*};
 use crate::usb::dma::*;
+use crate::time::{delay_ms, Deadline};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum number of USB devices
@@ -155,6 +156,9 @@ pub struct XhciController {
     max_slots: u8,
     scratchpad_count: u32,
     context_size_64: bool,
+    /// Set when the command ring could not be stopped after a timeout;
+    /// the controller needs a full reset, so no further commands are sent.
+    dead: bool,
     // Rings are now in the dma module, not owned here
     pub transfer_ring: TransferRing,
 }
@@ -262,6 +266,7 @@ impl XhciController {
             max_slots,
             scratchpad_count,
             context_size_64,
+            dead: false,
             transfer_ring: TransferRing::new(),
         };
 
@@ -332,15 +337,15 @@ impl XhciController {
         if cmd & USBCMD_RUN != 0 {
             self.write_op_reg(REG_USBCMD, cmd & !USBCMD_RUN);
         }
-        if !self.wait_op(REG_USBSTS, USBSTS_HCH, USBSTS_HCH) {
+        if !self.wait_op(REG_USBSTS, USBSTS_HCH, USBSTS_HCH, 100) {
             crate::framebuffer::write_str("xHCI: ERROR - controller did not halt\n");
             return Err(UsbError::XhciInitFailed);
         }
 
         self.write_op_reg(REG_USBCMD, USBCMD_HCRST);
         // Some Intel controllers need a short delay before HCRST can be read back
-        spin(10_000);
-        if !self.wait_op(REG_USBCMD, USBCMD_HCRST, 0) || !self.wait_op(REG_USBSTS, USBSTS_CNR, 0) {
+        delay_ms(1);
+        if !self.wait_op(REG_USBCMD, USBCMD_HCRST, 0, 1000) || !self.wait_op(REG_USBSTS, USBSTS_CNR, 0, 1000) {
             crate::framebuffer::write_str("xHCI: ERROR - reset did not complete\n");
             return Err(UsbError::XhciInitFailed);
         }
@@ -348,15 +353,19 @@ impl XhciController {
         Ok(())
     }
 
-    /// Poll an operational register until (value & mask) == expected.
-    unsafe fn wait_op(&self, reg: usize, mask: u32, expected: u32) -> bool {
-        for _ in 0..1_000_000u32 {
+    /// Poll an operational register until (value & mask) == expected, for
+    /// at most `timeout_ms` milliseconds.
+    unsafe fn wait_op(&self, reg: usize, mask: u32, expected: u32, timeout_ms: u64) -> bool {
+        let deadline = Deadline::after_ms(timeout_ms);
+        loop {
             if self.read_op_reg(reg) & mask == expected {
                 return true;
             }
-            spin(100);
+            if deadline.expired() {
+                return false;
+            }
+            core::hint::spin_loop();
         }
-        false
     }
 
     /// Initialize operational registers
@@ -424,7 +433,8 @@ impl XhciController {
         // STEP 2: Max slots, scratchpads, DCBAAP
         // ============================================================
 
-        let slots = core::cmp::min(self.max_slots as u32, 8);
+        // Hubs keep their slot while the devices behind them are set up
+        let slots = core::cmp::min(self.max_slots as u32, 32);
         self.write_op_reg(REG_CONFIG, slots);
 
         if !setup_scratchpad(self.scratchpad_count as usize) {
@@ -470,7 +480,7 @@ impl XhciController {
         // ============================================================
 
         self.write_op_reg(REG_USBCMD, USBCMD_RUN);
-        if !self.wait_op(REG_USBSTS, USBSTS_HCH, 0) {
+        if !self.wait_op(REG_USBSTS, USBSTS_HCH, 0, 100) {
             crate::framebuffer::write_str("xHCI: ERROR - controller did not start\n");
             return Err(UsbError::XhciInitFailed);
         }
@@ -484,15 +494,15 @@ impl XhciController {
         crate::framebuffer::write_str("xHCI: Controller running\n");
 
         // Power every port (needed when the controller supports port power
-        // switching; harmless otherwise), then allow ~100 ms+ for devices to
-        // connect and debounce after the reset.
+        // switching; harmless otherwise), then allow time for devices to
+        // connect and debounce after the reset (USB: 100 ms debounce).
         for port in 1..=self.max_ports as usize {
             let portsc = self.read_port_sc(port);
             if portsc & PORTSC_PP == 0 {
                 self.write_port_sc(port, (portsc & PORTSC_PRESERVE) | PORTSC_PP);
             }
         }
-        spin(150_000_000);
+        delay_ms(200);
 
         Ok(())
     }
@@ -500,6 +510,12 @@ impl XhciController {
     /// Get MMIO base address
     pub fn mmio_base(&self) -> u64 {
         self.mmio_base
+    }
+
+    /// True after the command ring could not be stopped; no further
+    /// commands are sent to this controller.
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     /// Check if controller is running
@@ -533,14 +549,16 @@ impl XhciController {
         self.write_port_sc(port, (portsc & PORTSC_PRESERVE) | (portsc & PORTSC_CHANGE_BITS));
         self.write_port_sc(port, (portsc & PORTSC_PRESERVE) | PORTSC_PR);
 
+        // The controller drives the reset (10-20 ms) and clears PR when done
+        let deadline = Deadline::after_ms(500);
         let mut done = false;
-        for _ in 0..1_000_000u32 {
+        while !deadline.expired() {
             let p = self.read_port_sc(port);
             if p & PORTSC_PRC != 0 && p & PORTSC_PR == 0 {
                 done = true;
                 break;
             }
-            spin(100);
+            delay_ms(1);
         }
         let p = self.read_port_sc(port);
         // Acknowledge PRC (and any other change bits)
@@ -552,8 +570,8 @@ impl XhciController {
         if p & PORTSC_PED == 0 {
             return Err(UsbError::DeviceNotFound);
         }
-        // USB 2.0 reset recovery time (10 ms)
-        spin(5_000_000);
+        // USB 2.0 reset recovery time (TRSTRCY, 10 ms)
+        delay_ms(10);
         Ok(())
     }
 
@@ -579,47 +597,84 @@ impl XhciController {
         Some(event)
     }
 
-    /// Wait for a Command Completion Event (type 33). Other events (e.g.
-    /// Port Status Change, type 34) are skipped. Returns (completion code, slot id).
-    unsafe fn wait_command_completion(&self) -> Result<(u8, u8), UsbError> {
-        for _ in 0..2_000_000u32 {
+    /// Wait for the Command Completion Event (type 33) of the command TRB at
+    /// `trb_addr`. Completions of other (earlier, aborted) commands and all
+    /// other events are skipped. Returns (completion code, slot id).
+    unsafe fn wait_command_completion(&self, trb_addr: u64, timeout_ms: u64) -> Result<(u8, u8), UsbError> {
+        let deadline = Deadline::after_ms(timeout_ms);
+        loop {
             if let Some(event) = self.poll_events() {
                 let event_type = ((event.control >> 10) & 0x3F) as u8;
-                if event_type == 33 {
+                if event_type == 33 && event.trb_ptr & !0xF == trb_addr {
                     let code = (event.status >> 24) as u8;
                     let slot = ((event.control >> 24) & 0xFF) as u8;
                     return Ok((code, slot));
                 }
+            } else if deadline.expired() {
+                return Err(UsbError::Timeout);
             } else {
-                spin(100);
+                core::hint::spin_loop();
             }
         }
-        Err(UsbError::Timeout)
     }
 
-    /// Wait for a Transfer Event (type 32) for `slot_id`.
+    /// Wait for a Transfer Event (type 32) for endpoint `dci` of `slot_id`.
     /// Returns (completion code, residual byte count).
-    pub unsafe fn wait_transfer_event(&self, slot_id: u8) -> Result<(u8, u32), UsbError> {
-        for _ in 0..2_000_000u32 {
+    pub unsafe fn wait_transfer_event(&self, slot_id: u8, dci: u8, timeout_ms: u64) -> Result<(u8, u32), UsbError> {
+        let deadline = Deadline::after_ms(timeout_ms);
+        loop {
             if let Some(event) = self.poll_events() {
                 let event_type = ((event.control >> 10) & 0x3F) as u8;
                 let slot = ((event.control >> 24) & 0xFF) as u8;
-                if event_type == 32 && slot == slot_id {
+                let ep = ((event.control >> 16) & 0x1F) as u8;
+                if event_type == 32 && slot == slot_id && ep == dci {
                     return Ok(((event.status >> 24) as u8, event.status & 0x00FF_FFFF));
                 }
+            } else if deadline.expired() {
+                return Err(UsbError::Timeout);
             } else {
-                spin(100);
+                core::hint::spin_loop();
             }
         }
-        Err(UsbError::Timeout)
     }
 
-    /// Run a command TRB and wait for its completion. Returns the slot id
-    /// from the completion event.
+    /// Stop the command ring after a command timed out (xHCI 4.6.1.2): set
+    /// Command Abort, wait for Command Ring Running to clear, and consume the
+    /// "Command Aborted" / "Command Ring Stopped" events. The next doorbell
+    /// restarts the ring at the command after the aborted one.
+    unsafe fn abort_command_ring(&mut self, trb_addr: u64, cycle: u32) -> bool {
+        const CRCR_CA: u32 = 1 << 2;
+        const CRCR_CRR: u32 = 1 << 3;
+        let crcr = (trb_addr & !0x3F) | CRCR_CA as u64 | (cycle & 1) as u64;
+        self.write_op_reg(REG_CRCR, crcr as u32);
+        self.write_op_reg(REG_CRCR + 4, (crcr >> 32) as u32);
+
+        if !self.wait_op(REG_CRCR, CRCR_CRR, 0, 5000) {
+            crate::framebuffer::write_str("xHCI: command ring did not stop; giving up on this controller\n");
+            self.dead = true;
+            return false;
+        }
+        // Drain the abort/stop completions (they reference older TRBs)
+        let deadline = Deadline::after_ms(50);
+        while !deadline.expired() {
+            if self.poll_events().is_none() {
+                core::hint::spin_loop();
+            }
+        }
+        true
+    }
+
+    /// Run a command TRB and wait for its completion (up to 5 s; the USB
+    /// spec allows an unresponsive device that long). On timeout the
+    /// command is aborted so it cannot block the commands after it.
+    /// Returns the slot id from the completion event.
     unsafe fn run_command(&mut self, name: &str, trb: NormalTrb) -> Result<u8, UsbError> {
-        command_ring_enqueue(&trb)?;
+        if self.dead {
+            return Err(UsbError::XhciInitFailed);
+        }
+        let (addr, cycle) = command_ring_enqueue(&trb)?;
         self.ring_doorbell(0, 0, 0);
-        match self.wait_command_completion() {
+        match self.wait_command_completion(addr, 5000) {
             Ok((1, slot)) => Ok(slot),
             Ok((code, _)) => {
                 crate::framebuffer::write_str("xHCI: ");
@@ -634,15 +689,10 @@ impl XhciController {
             Err(e) => {
                 crate::framebuffer::write_str("xHCI: ");
                 crate::framebuffer::write_str(name);
-                // Controller state, to tell "never fetched the command"
-                // (HSE/HCE set, or halted) from "event not seen"
                 crate::framebuffer::write_str(" timed out (USBSTS=0x");
                 print_hex_u32(self.read_op_reg(REG_USBSTS));
-                crate::framebuffer::write_str(" CRCR=0x");
-                print_hex_u32(self.read_op_reg(REG_CRCR));
-                crate::framebuffer::write_str(" IMAN=0x");
-                print_hex_u32(self.read_runtime_reg(REG_IMAN));
-                crate::framebuffer::write_str(")\n");
+                crate::framebuffer::write_str("), aborting it\n");
+                self.abort_command_ring(addr, cycle);
                 Err(e)
             }
         }
@@ -709,65 +759,74 @@ impl XhciController {
         self.run_command("Evaluate Context", trb).map(|_| ())
     }
 
-    /// Control transfer with an IN data stage (e.g. GET_DESCRIPTOR).
-    /// Returns the number of bytes received.
+    /// Control transfer with an IN data stage (e.g. GET_DESCRIPTOR) on the
+    /// device's EP0 ring. Returns the number of bytes received.
     pub unsafe fn issue_control_get(
         &mut self,
         slot_id: u8,
+        ep0: &mut Ring,
         setup: &crate::usb::device::UsbSetupPacket,
         data_ptr: u64,
         data_length: u16,
     ) -> Result<u32, UsbError> {
         // Setup Stage: IDT, TRT=3 (IN data stage), transfer length is always 8
-        ep0_ring_enqueue(&NormalTrb {
+        ep0.push(&NormalTrb {
             data_ptr: setup_packet_u64(setup),
             status: 8,
             control: (2 << 10) | (3 << 16) | (1 << 6),
-        })?;
+        });
         // Data Stage: DIR=IN; ISP so a short packet ends the TD with an event
-        ep0_ring_enqueue(&NormalTrb {
+        ep0.push(&NormalTrb {
             data_ptr,
             status: (data_length as u32) & 0x1_FFFF,
             control: (3 << 10) | (1 << 16) | (1 << 2),
-        })?;
+        });
         // Status Stage: DIR=OUT, IOC
-        ep0_ring_enqueue(&NormalTrb {
+        ep0.push(&NormalTrb {
             data_ptr: 0,
             status: 0,
             control: (4 << 10) | (1 << 5),
-        })?;
+        });
         self.ring_doorbell(slot_id, 1, 0);
         self.finish_control_transfer(slot_id, data_length as u32)
     }
 
-    /// Control transfer without a data stage (SET_CONFIGURATION, SET_PROTOCOL, ...)
+    /// Control transfer without a data stage (SET_CONFIGURATION, SET_FEATURE, ...)
     pub unsafe fn issue_control_set(
         &mut self,
         slot_id: u8,
+        ep0: &mut Ring,
         setup: &crate::usb::device::UsbSetupPacket,
     ) -> Result<(), UsbError> {
         // Setup Stage: IDT, TRT=0 (no data stage)
-        ep0_ring_enqueue(&NormalTrb {
+        ep0.push(&NormalTrb {
             data_ptr: setup_packet_u64(setup),
             status: 8,
             control: (2 << 10) | (1 << 6),
-        })?;
+        });
         // Status Stage: DIR=IN, IOC
-        ep0_ring_enqueue(&NormalTrb {
+        ep0.push(&NormalTrb {
             data_ptr: 0,
             status: 0,
             control: (4 << 10) | (1 << 16) | (1 << 5),
-        })?;
+        });
         self.ring_doorbell(slot_id, 1, 0);
         self.finish_control_transfer(slot_id, 0).map(|_| ())
     }
 
-    /// Wait for the end of a control transfer. A short packet on the data
-    /// stage produces an extra event (CC=13) before the status stage event.
+    /// Wait for the end of a control transfer (up to 2 s). A short packet on
+    /// the data stage produces an extra event (CC=13) before the status
+    /// stage event.
     unsafe fn finish_control_transfer(&self, slot_id: u8, requested: u32) -> Result<u32, UsbError> {
         let mut received = requested;
         loop {
-            let (code, residual) = self.wait_transfer_event(slot_id)?;
+            let (code, residual) = match self.wait_transfer_event(slot_id, 1, 2000) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::framebuffer::write_str("xHCI: control transfer timed out\n");
+                    return Err(e);
+                }
+            };
             match code {
                 13 => {
                     // Short packet on data stage; status stage event follows
@@ -811,18 +870,14 @@ pub fn completion_code_name(code: u8) -> &'static str {
         11 => "Slot Not Enabled",
         12 => "Endpoint Not Enabled",
         13 => "Short Packet",
+        24 => "Command Ring Stopped",
+        25 => "Command Aborted",
         17 => "Parameter Error",
         19 => "Context State Error",
         _ => "Other",
     }
 }
 
-/// Busy-wait for roughly `n` iterations
-fn spin(n: u32) {
-    for _ in 0..n {
-        unsafe { core::arch::asm!("nop", options(nomem, nostack)) };
-    }
-}
 
 /// Walk the extended capability list and, if the BIOS owns the controller
 /// (USB Legacy Support capability), request ownership and turn off the
@@ -839,13 +894,15 @@ unsafe fn bios_handoff(mmio_base: *mut u8, hccparams1: u32) {
             crate::framebuffer::write_str("xHCI: BIOS handoff... ");
             if cap & USBLEGSUP_BIOS_OWNED != 0 {
                 cap_ptr.write_volatile(cap | USBLEGSUP_OS_OWNED);
+                // The BIOS should release ownership within 1 s
                 let mut released = false;
-                for _ in 0..1_000_000u32 {
+                let deadline = Deadline::after_ms(1000);
+                while !deadline.expired() {
                     if cap_ptr.read_volatile() & USBLEGSUP_BIOS_OWNED == 0 {
                         released = true;
                         break;
                     }
-                    spin(200);
+                    delay_ms(1);
                 }
                 if released {
                     crate::framebuffer::write_str("released by BIOS\n");

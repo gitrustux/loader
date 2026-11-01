@@ -217,38 +217,64 @@ pub struct ExceptionFrame {
 
 /// Exception handler wrapper - called from assembly stubs
 extern "C" fn exception_handler_wrapper(vector: usize, error_code: u64, frame: &ExceptionFrame) {
-    // Get the handler for this exception
-    let handler = unsafe {
-        EXCEPTION_HANDLERS.get(vector)
-            .and_then(|h| *h)
-            .unwrap_or(default_exception_handler)
-    };
-
-    // Call the handler with error code, RIP, CS, and RFLAGS
-    handler(
-        error_code as usize,
-        frame.rip as usize,
-        frame.cs as usize,
-        frame.rflags as usize,
-    );
+    let handler = unsafe { EXCEPTION_HANDLERS.get(vector).and_then(|h| *h) };
+    match handler {
+        Some(h) => h(error_code as usize, frame.rip as usize, frame.cs as usize, frame.rflags as usize),
+        None => report_exception_and_halt(vector, error_code, frame),
+    }
 }
 
-/// Macro to generate exception handler stubs
+/// Print an unhandled CPU exception on the framebuffer and stop.
+fn report_exception_and_halt(vector: usize, error_code: u64, frame: &ExceptionFrame) -> ! {
+    fn hex(v: u64) {
+        let h = b"0123456789ABCDEF";
+        let mut buf = [0u8; 16];
+        for i in 0..16 {
+            buf[i] = h[((v >> (60 - i * 4)) & 0xF) as usize];
+        }
+        crate::framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&buf) });
+    }
+    let cr2: u64;
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
+    crate::framebuffer::write_str("\n*** CPU EXCEPTION ");
+    hex(vector as u64);
+    crate::framebuffer::write_str(" ERR=");
+    hex(error_code);
+    crate::framebuffer::write_str("\n    RIP=");
+    hex(frame.rip);
+    crate::framebuffer::write_str(" RSP=");
+    hex(frame.rsp);
+    crate::framebuffer::write_str(" CR2=");
+    hex(cr2);
+    crate::framebuffer::write_str("\n    System halted.\n");
+    loop {
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Macro to generate exception handler stubs.
+///
+/// Stack after the pushes below (lowest address first):
+/// 15 saved registers, vector, error code, then the CPU's frame (RIP, CS,
+/// RFLAGS, RSP, SS). For vectors where the CPU pushes no error code a 0 is
+/// pushed so the layout is the same for every vector.
+///
+/// The wrapper is called with the Microsoft x64 convention used by this
+/// target: RCX = vector, RDX = error code, R8 = frame, plus 32 bytes of
+/// shadow space. RSP is realigned to 16 bytes for the call.
 macro_rules! define_exception_stub {
     ($name:ident, $vector:expr) => {
+        define_exception_stub!(@impl $name, $vector, "push 0");
+    };
+    ($name:ident, $vector:expr, error_code) => {
+        define_exception_stub!(@impl $name, $vector, "");
+    };
+    (@impl $name:ident, $vector:expr, $push_err:literal) => {
         #[unsafe(naked)]
         unsafe extern "C" fn $name() -> ! {
-            // For exceptions without error code (most of them)
-            // Stack layout when handler is called:
-            // [old RSP] [SS] [old RSP] [RFLAGS] [CS] [RIP] [error code (optional)]
-            // We need to push a dummy error code for exceptions that don't have one
-
             core::arch::naked_asm!(
-                // Push dummy error code (0) for consistency
-                "push 0",
-                // Push exception vector
+                $push_err,
                 "push {vector}",
-                // Save all general-purpose registers
                 "push rax",
                 "push rbx",
                 "push rcx",
@@ -264,31 +290,15 @@ macro_rules! define_exception_stub {
                 "push r13",
                 "push r14",
                 "push r15",
-                // Save data segment
-                "mov rdi, ds",
-                "push rdi",
-                // Load kernel data segment
-                "mov ax, 0x10",  // Assuming kernel data selector is 0x10
-                "mov ds, ax",
-                "mov es, ax",
-                "mov fs, ax",
-                "mov gs, ax",
-                // Call the wrapper: exception_handler_wrapper(vector, error_code, &frame)
-                // Stack already has: [error_code] [vector] [saved regs...]
-                // We need to pass: RDI=vector, RSI=error_code, RDX=&frame
-                "mov rdi, rsp",  // RDI = pointer to saved regs (contains error_code at offset)
-                "add rdi, 8",     // Skip past dummy error code to get vector
-                "mov rsi, [rsp-8]",  // RSI = error_code (from dummy push)
-                "mov rdx, rsp",  // RDX = stack pointer (as ExceptionFrame*)
-                "add rdx, 9*8",  // Skip past saved regs to get to exception frame
+                "cld",
+                "mov rcx, [rsp + 15*8]",   // vector
+                "mov rdx, [rsp + 16*8]",   // error code
+                "lea r8, [rsp + 17*8]",    // ExceptionFrame (CPU-pushed RIP...)
+                "mov rbx, rsp",
+                "and rsp, -16",
+                "sub rsp, 32",
                 "call {wrapper}",
-                // Restore data segment
-                "pop rdi",
-                "mov ds, rdi",
-                "mov es, rdi",
-                "mov fs, rdi",
-                "mov gs, rdi",
-                // Restore registers
+                "mov rsp, rbx",
                 "pop r15",
                 "pop r14",
                 "pop r13",
@@ -304,9 +314,7 @@ macro_rules! define_exception_stub {
                 "pop rcx",
                 "pop rbx",
                 "pop rax",
-                // Clean up error code and vector
                 "add rsp, 16",
-                // Return from exception
                 "iretq",
                 vector = const $vector,
                 wrapper = sym exception_handler_wrapper
@@ -315,7 +323,6 @@ macro_rules! define_exception_stub {
     };
 }
 
-// Define exception stubs for all 32 exception vectors
 define_exception_stub!(exception_stub_0, 0);   // Division by zero
 define_exception_stub!(exception_stub_1, 1);   // Debug
 define_exception_stub!(exception_stub_2, 2);   // Non-maskable interrupt
@@ -324,20 +331,20 @@ define_exception_stub!(exception_stub_4, 4);   // Overflow
 define_exception_stub!(exception_stub_5, 5);   // Bound range exceeded
 define_exception_stub!(exception_stub_6, 6);   // Invalid opcode
 define_exception_stub!(exception_stub_7, 7);   // Device not available
-define_exception_stub!(exception_stub_8, 8);   // Double fault (has error code)
+define_exception_stub!(exception_stub_8, 8, error_code);   // Double fault (has error code)
 define_exception_stub!(exception_stub_9, 9);   // Coprocessor segment overrun
-define_exception_stub!(exception_stub_10, 10); // Invalid TSS
-define_exception_stub!(exception_stub_11, 11); // Segment not present
-define_exception_stub!(exception_stub_12, 12); // Stack segment fault
-define_exception_stub!(exception_stub_13, 13); // General protection fault
-define_exception_stub!(exception_stub_14, 14); // Page fault
+define_exception_stub!(exception_stub_10, 10, error_code); // Invalid TSS
+define_exception_stub!(exception_stub_11, 11, error_code); // Segment not present
+define_exception_stub!(exception_stub_12, 12, error_code); // Stack segment fault
+define_exception_stub!(exception_stub_13, 13, error_code); // General protection fault
+define_exception_stub!(exception_stub_14, 14, error_code); // Page fault
 define_exception_stub!(exception_stub_15, 15); // Reserved
 define_exception_stub!(exception_stub_16, 16); // x87 FPU error
-define_exception_stub!(exception_stub_17, 17); // Alignment check
+define_exception_stub!(exception_stub_17, 17, error_code); // Alignment check
 define_exception_stub!(exception_stub_18, 18); // Machine check
 define_exception_stub!(exception_stub_19, 19); // SIMD floating-point exception
 define_exception_stub!(exception_stub_20, 20); // Virtualization exception
-define_exception_stub!(exception_stub_21, 21); // Reserved
+define_exception_stub!(exception_stub_21, 21, error_code); // Reserved
 define_exception_stub!(exception_stub_22, 22); // Reserved
 define_exception_stub!(exception_stub_23, 23); // Reserved
 define_exception_stub!(exception_stub_24, 24); // Reserved
@@ -345,8 +352,8 @@ define_exception_stub!(exception_stub_25, 25); // Reserved
 define_exception_stub!(exception_stub_26, 26); // Reserved
 define_exception_stub!(exception_stub_27, 27); // Reserved
 define_exception_stub!(exception_stub_28, 28); // Reserved
-define_exception_stub!(exception_stub_29, 29); // Reserved
-define_exception_stub!(exception_stub_30, 30); // Reserved
+define_exception_stub!(exception_stub_29, 29, error_code); // Reserved
+define_exception_stub!(exception_stub_30, 30, error_code); // Reserved
 define_exception_stub!(exception_stub_31, 31); // Reserved
 
 /// Array of exception stub pointers
@@ -371,14 +378,22 @@ static EXCEPTION_STUBS: [unsafe extern "C" fn() -> !; 32] = [
 
 /// Keyboard IRQ1 interrupt handler stub
 ///
-/// CRITICAL: Save ALL registers BEFORE doing anything else.
-/// The CPU pushes RIP, CS, RFLAGS, RSP, SS on interrupt entry.
-/// We must preserve the interrupt frame and all caller-saved registers.
+/// Saves every general-purpose register, calls the Rust handler (which reads
+/// all pending bytes from the 8042), sends EOI to the local APIC, restores
+/// the registers and returns.
+///
+/// - The stub must not read port 0x60 itself: that consumed the scancode
+///   before the handler saw it, so every key press was lost.
+/// - EOI is sent while RAX is still saved. (It used to be sent after the
+///   registers were restored, which returned 0xFEE000B0 in RAX to whatever
+///   code the interrupt had stopped.)
+/// - This target uses the Microsoft x64 calling convention, which requires
+///   32 bytes of "shadow space" above the return address for the callee.
+///   With the 5-qword CPU frame and 15 saved registers RSP is 16-byte
+///   aligned here, and stays aligned after reserving 32 bytes.
 #[unsafe(naked)]
 unsafe extern "C" fn keyboard_irq_stub() -> ! {
     core::arch::naked_asm!(
-        // === STEP 1: Save ALL registers FIRST ===
-        // Do NOTHING before this - rax, rcx, rdx, r8-r11 are caller-saved!
         "push rax",
         "push rbx",
         "push rcx",
@@ -394,23 +409,13 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
         "push r13",
         "push r14",
         "push r15",
-
-        // === STEP 2: NOW it's safe to debug/use rax ===
-        // IRQ1 ENTRY PROOF: VGA text mode marker
-        "mov rax, 0xB8000",
-        "mov word ptr [rax], 0x4F21",  // '!' in red on white
-
-        // === CRITICAL: Read PS/2 data port to ACKNOWLEDGE the device ===
-        // The PS/2 controller will NOT deassert IRQ1 until we read port 0x60.
-        // Without this read, the IRQ line stays high and NO FURTHER IRQs will fire.
-        // This is NON-NEGOTIABLE for PS/2 interrupt operation.
-        "mov dx, 0x60",    // PS/2 data port
-        "in al, dx",       // Read scancode (this ACKs the device)
-
-        // === STEP 3: Call the keyboard handler ===
+        "cld",
+        "sub rsp, 32",
         "call {handler}",
-
-        // === STEP 4: Restore registers in reverse order ===
+        "add rsp, 32",
+        // EOI to the local APIC (offset 0xB0), before RAX is restored
+        "mov rax, 0xFEE000B0",
+        "mov dword ptr [rax], 0",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -426,14 +431,6 @@ unsafe extern "C" fn keyboard_irq_stub() -> ! {
         "pop rcx",
         "pop rbx",
         "pop rax",
-
-        // === STEP 5: Send EOI to Local APIC ===
-        // CRITICAL: EOI register is at offset 0xB0, NOT 0x40!
-        // 0xFEE00040 is NOT the EOI register - that's a critical bug
-        "mov rax, 0xFEE000B0",  // Correct EOI offset (0xB0 from base)
-        "mov dword ptr [rax], 0",
-
-        // === STEP 6: Return from interrupt ===
         "iretq",
         handler = sym crate::keyboard::keyboard_irq_handler
     );

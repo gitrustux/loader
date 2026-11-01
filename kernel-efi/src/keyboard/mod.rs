@@ -99,6 +99,10 @@ pub fn init() {
         if usb::init().is_ok() {
             USB_ACTIVE = true;
             crate::framebuffer::write_str("[USB KBD]\n");
+        } else if crate::usb::controller_ready() {
+            // No USB keyboard yet: keep polling so one plugged in later
+            // (or a KVM switched to this computer) is picked up
+            USB_ACTIVE = true;
         }
 
         if ps2::controller_present() {

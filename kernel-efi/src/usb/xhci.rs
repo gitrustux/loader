@@ -642,10 +642,16 @@ impl XhciController {
     /// Command Abort, wait for Command Ring Running to clear, and consume the
     /// "Command Aborted" / "Command Ring Stopped" events. The next doorbell
     /// restarts the ring at the command after the aborted one.
-    unsafe fn abort_command_ring(&mut self, trb_addr: u64, cycle: u32) -> bool {
-        const CRCR_CA: u32 = 1 << 2;
+    ///
+    /// The pointer bits written along with CA hold the next command slot (as
+    /// Linux does): if the ring has already stopped by the time the write
+    /// lands, the controller latches that pointer, and it must be the place
+    /// to resume from, not the aborted command.
+    unsafe fn abort_command_ring(&mut self) -> bool {
+        const CRCR_CA: u64 = 1 << 2;
         const CRCR_CRR: u32 = 1 << 3;
-        let crcr = (trb_addr & !0x3F) | CRCR_CA as u64 | (cycle & 1) as u64;
+        let (next, cycle) = command_ring_next();
+        let crcr = (next & !0x3F) | CRCR_CA | (cycle & 1) as u64;
         self.write_op_reg(REG_CRCR, crcr as u32);
         self.write_op_reg(REG_CRCR + 4, (crcr >> 32) as u32);
 
@@ -667,35 +673,48 @@ impl XhciController {
     /// Run a command TRB and wait for its completion (up to 5 s; the USB
     /// spec allows an unresponsive device that long). On timeout the
     /// command is aborted so it cannot block the commands after it.
+    /// Commands that do not talk to a device (everything but Address
+    /// Device) are retried once after an abort.
     /// Returns the slot id from the completion event.
     unsafe fn run_command(&mut self, name: &str, trb: NormalTrb) -> Result<u8, UsbError> {
-        if self.dead {
-            return Err(UsbError::XhciInitFailed);
-        }
-        let (addr, cycle) = command_ring_enqueue(&trb)?;
-        self.ring_doorbell(0, 0, 0);
-        match self.wait_command_completion(addr, 5000) {
-            Ok((1, slot)) => Ok(slot),
-            Ok((code, _)) => {
-                crate::framebuffer::write_str("xHCI: ");
-                crate::framebuffer::write_str(name);
-                crate::framebuffer::write_str(" failed, CC=");
-                print_decimal(code as u32);
-                crate::framebuffer::write_str(" (");
-                crate::framebuffer::write_str(completion_code_name(code));
-                crate::framebuffer::write_str(")\n");
-                Err(UsbError::XhciInitFailed)
+        let involves_device = (trb.control >> 10) & 0x3F == 11; // Address Device
+        let attempts = if involves_device { 1 } else { 2 };
+        for attempt in 0..attempts {
+            if self.dead {
+                return Err(UsbError::XhciInitFailed);
             }
-            Err(e) => {
-                crate::framebuffer::write_str("xHCI: ");
-                crate::framebuffer::write_str(name);
-                crate::framebuffer::write_str(" timed out (USBSTS=0x");
-                print_hex_u32(self.read_op_reg(REG_USBSTS));
-                crate::framebuffer::write_str("), aborting it\n");
-                self.abort_command_ring(addr, cycle);
-                Err(e)
+            let (addr, _cycle) = command_ring_enqueue(&trb)?;
+            self.ring_doorbell(0, 0, 0);
+            match self.wait_command_completion(addr, 5000) {
+                Ok((1, slot)) => return Ok(slot),
+                Ok((code, _)) => {
+                    crate::framebuffer::write_str("xHCI: ");
+                    crate::framebuffer::write_str(name);
+                    crate::framebuffer::write_str(" failed, CC=");
+                    print_decimal(code as u32);
+                    crate::framebuffer::write_str(" (");
+                    crate::framebuffer::write_str(completion_code_name(code));
+                    crate::framebuffer::write_str(")\n");
+                    return Err(UsbError::XhciInitFailed);
+                }
+                Err(e) => {
+                    crate::framebuffer::write_str("xHCI: ");
+                    crate::framebuffer::write_str(name);
+                    crate::framebuffer::write_str(" timed out (USBSTS=0x");
+                    print_hex_u32(self.read_op_reg(REG_USBSTS));
+                    crate::framebuffer::write_str(if attempt + 1 < attempts {
+                        "), aborting and retrying\n"
+                    } else {
+                        "), aborting it\n"
+                    });
+                    self.abort_command_ring();
+                    if attempt + 1 == attempts {
+                        return Err(e);
+                    }
+                }
             }
         }
+        Err(UsbError::Timeout)
     }
 
     /// Enable Slot command (TRB type 9). Returns the assigned slot id.

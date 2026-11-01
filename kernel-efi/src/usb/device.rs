@@ -15,6 +15,7 @@
 use crate::usb::{UsbError, trb::*};
 use crate::usb::xhci::{
     self, PORTSC_CCS, PORTSC_PED, PORTSC_PORT_SPEED_MASK, PORTSC_PORT_SPEED_SHIFT,
+    PORTSC_CHANGE_BITS, PORTSC_PRESERVE,
     SPEED_FULL, SPEED_LOW, SPEED_HIGH, SPEED_SUPER,
 };
 use crate::usb::dma::{
@@ -132,6 +133,8 @@ unsafe fn slot_mem(slot: u8) -> Result<&'static mut SlotMem, UsbError> {
 struct Keyboard {
     slot: u8,
     dci: u8,
+    vid: u16,
+    pid: u16,
     ring: Ring,
     buf: *mut u8,
     active: bool,
@@ -142,6 +145,14 @@ struct Keyboard {
 const NO_KEYBOARD: Option<Keyboard> = None;
 static mut KEYBOARDS: [Option<Keyboard>; MAX_KEYBOARDS] = [NO_KEYBOARD; MAX_KEYBOARDS];
 static mut KEYBOARD_COUNT: usize = 0;
+
+/// Root port of every slot that stays configured (hubs and keyboards);
+/// 0 = slot not in use. Used to release everything behind a root port
+/// when it disconnects (e.g. a KVM switching to another computer).
+static mut KEPT_ROOT_PORT: [u8; MAX_SLOTS + 1] = [0; MAX_SLOTS + 1];
+
+/// Port Status Change Detect bit in PORTSC: Connect Status Change
+const PORTSC_CSC: u32 = 1 << 17;
 
 /// Check if at least one USB keyboard is ready
 pub fn has_hid_keyboard() -> bool {
@@ -158,15 +169,15 @@ pub fn xhci_succeeded_with_device() -> bool {
     has_hid_keyboard()
 }
 
-/// Keep transfers armed on every keyboard and decode finished reports.
-/// Decoded characters go to `hid`'s queue.
+/// Keep transfers armed on every keyboard, decode finished reports, and
+/// handle root ports that connect or disconnect. Decoded characters go to
+/// `hid`'s queue. Runs whenever the shell waits for input, even with no
+/// keyboard attached, so a keyboard plugged in later (or a KVM switched
+/// back) is found.
 pub unsafe fn poll_keyboards() {
-    if KEYBOARD_COUNT == 0 {
-        return;
-    }
     let c = match xhci::controller_mut() {
-        Some(c) => c,
-        None => return,
+        Some(c) if !c.is_dead() => c,
+        _ => return,
     };
 
     // One Normal TRB outstanding per keyboard
@@ -182,14 +193,24 @@ pub unsafe fn poll_keyboards() {
         }
     }
 
-    // Dispatch transfer events to their keyboard
-    for _ in 0..32 {
+    // Dispatch events: transfers to their keyboard, port changes noted
+    let mut changed_ports: u64 = 0;
+    for _ in 0..64 {
         let event = match c.poll_events() {
             Some(e) => e,
             None => break,
         };
-        if (event.control >> 10) & 0x3F != 32 {
-            continue; // port status changes etc.
+        match (event.control >> 10) & 0x3F {
+            32 => {}
+            34 => {
+                // Port Status Change: port id in bits 31:24 of the parameter
+                let port = ((event.trb_ptr >> 24) & 0xFF) as u32;
+                if port > 0 && port < 64 {
+                    changed_ports |= 1 << port;
+                }
+                continue;
+            }
+            _ => continue,
         }
         let slot = ((event.control >> 24) & 0xFF) as u8;
         let ep = ((event.control >> 16) & 0x1F) as u8;
@@ -205,17 +226,107 @@ pub unsafe fn poll_keyboards() {
                 let report = core::slice::from_raw_parts(kb.buf as *const u8, HID_REPORT_SIZE);
                 crate::usb::hid::process_report(&report[..len], &mut kb.prev);
             } else {
-                // The endpoint halts on errors; recovering it needs Reset
-                // Endpoint + Set TR Dequeue Pointer, not implemented yet.
+                // The endpoint halts on errors. CC=4 (USB Transaction
+                // Error) is what a disconnect looks like; the port change
+                // that follows removes the keyboard. Anything else is
+                // reported; recovering the endpoint (Reset Endpoint + Set
+                // TR Dequeue Pointer) is not implemented.
                 kb.dead = true;
-                crate::framebuffer::write_str("[USB] keyboard on slot ");
-                print_decimal(slot as u32);
-                crate::framebuffer::write_str(" stopped, CC=");
-                print_decimal(code as u32);
-                crate::framebuffer::write_str("\n");
+                if code != 4 {
+                    crate::framebuffer::write_str("\n[USB] keyboard ");
+                    print_hex_word(kb.vid);
+                    crate::framebuffer::write_str(":");
+                    print_hex_word(kb.pid);
+                    crate::framebuffer::write_str(" stopped, CC=");
+                    print_decimal(code as u32);
+                    crate::framebuffer::write_str("\n");
+                }
             }
         }
     }
+
+    for port in 1..64u32 {
+        if changed_ports & (1 << port) != 0 {
+            handle_root_port_change(port as usize);
+        }
+    }
+}
+
+/// A root port reported a change: release what was behind it if it
+/// disconnected (or reconnected), and enumerate it again if a device is
+/// present now.
+unsafe fn handle_root_port_change(port: usize) {
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return,
+    };
+    if port > c.max_ports() {
+        return;
+    }
+    let portsc = c.read_port_sc(port);
+    // Acknowledge the change bits
+    c.write_port_sc(port, (portsc & PORTSC_PRESERVE) | (portsc & PORTSC_CHANGE_BITS));
+    if portsc & PORTSC_CSC == 0 {
+        return; // enable/reset/link changes only
+    }
+
+    let removed = release_root_port(port as u8);
+    if portsc & PORTSC_CCS == 0 {
+        if removed > 0 {
+            crate::framebuffer::write_str("\n[USB] port ");
+            print_decimal(port as u32);
+            crate::framebuffer::write_str(" disconnected");
+            print_keyboard_count();
+        }
+        return;
+    }
+
+    // Connected: let it settle (USB debounce, 100 ms), then enumerate
+    delay_ms(100);
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return,
+    };
+    if c.read_port_sc(port) & PORTSC_CCS == 0 {
+        return;
+    }
+    crate::framebuffer::write_str("\n[USB] port ");
+    print_decimal(port as u32);
+    crate::framebuffer::write_str(" connected\n");
+    let before = KEYBOARD_COUNT;
+    enumerate_root_port(port);
+    if KEYBOARD_COUNT != before {
+        crate::framebuffer::write_str("[USB]");
+        print_keyboard_count();
+    }
+}
+
+fn print_keyboard_count() {
+    unsafe {
+        crate::framebuffer::write_str(" (");
+        print_decimal(KEYBOARD_COUNT as u32);
+        crate::framebuffer::write_str(if KEYBOARD_COUNT == 1 { " USB keyboard)\n" } else { " USB keyboards)\n" });
+    }
+}
+
+/// Disable every kept slot behind root port `port` and drop its keyboards.
+/// Returns the number of slots released.
+unsafe fn release_root_port(port: u8) -> usize {
+    let mut released = 0;
+    for slot in 1..=MAX_SLOTS {
+        if KEPT_ROOT_PORT[slot] != port {
+            continue;
+        }
+        for entry in (*core::ptr::addr_of_mut!(KEYBOARDS)).iter_mut() {
+            if entry.as_ref().map_or(false, |k| k.slot as usize == slot) {
+                *entry = None;
+                KEYBOARD_COUNT -= 1;
+            }
+        }
+        release_slot(slot as u8);
+        released += 1;
+    }
+    released
 }
 
 // ============================================================
@@ -258,33 +369,7 @@ pub unsafe fn enumerate_hid_keyboard() -> Result<usize, UsbError> {
 
     let mut any_device = false;
     for port in 1..=max_ports {
-        let controller = xhci::controller().ok_or(UsbError::XhciNotFound)?;
-        let portsc = controller.read_port_sc(port);
-        if portsc & PORTSC_CCS == 0 {
-            continue;
-        }
-        any_device = true;
-        crate::framebuffer::write_str("USB: Port ");
-        print_decimal(port as u32);
-        crate::framebuffer::write_str(": ");
-
-        // USB2 ports need a port reset to become enabled; USB3 ports enable
-        // themselves after link training.
-        let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
-        if speed < SPEED_SUPER || portsc & PORTSC_PED == 0 {
-            if controller.reset_port(port).is_err() {
-                crate::framebuffer::write_str("port reset failed\n");
-                continue;
-            }
-        }
-        // Speed is only valid after reset for USB2
-        let portsc = controller.read_port_sc(port);
-        let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
-        crate::framebuffer::write_str(speed_name(speed));
-        crate::framebuffer::write_str("-speed device\n");
-
-        let loc = Location { root_port: port as u8, route: 0, depth: 0, speed, tt_slot: 0, tt_port: 0 };
-        let _ = attach_device(loc);
+        any_device |= enumerate_root_port(port);
         if xhci::controller().map_or(true, |c| c.is_dead()) {
             break;
         }
@@ -297,6 +382,45 @@ pub unsafe fn enumerate_hid_keyboard() -> Result<usize, UsbError> {
     } else {
         Err(UsbError::DeviceNotFound)
     }
+}
+
+/// Enumerate the device on one root port (and, for a hub, everything
+/// behind it). Returns false if nothing is connected.
+unsafe fn enumerate_root_port(port: usize) -> bool {
+    let controller = match xhci::controller() {
+        Some(c) => c,
+        None => return false,
+    };
+    let portsc = controller.read_port_sc(port);
+    if portsc & PORTSC_CCS == 0 {
+        return false;
+    }
+    // Acknowledge old change bits, so the next connect/disconnect raises
+    // a Port Status Change event
+    controller.write_port_sc(port, (portsc & PORTSC_PRESERVE) | (portsc & PORTSC_CHANGE_BITS));
+
+    crate::framebuffer::write_str("USB: Port ");
+    print_decimal(port as u32);
+    crate::framebuffer::write_str(": ");
+
+    // USB2 ports need a port reset to become enabled; USB3 ports enable
+    // themselves after link training.
+    let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
+    if speed < SPEED_SUPER || portsc & PORTSC_PED == 0 {
+        if controller.reset_port(port).is_err() {
+            crate::framebuffer::write_str("port reset failed\n");
+            return true;
+        }
+    }
+    // Speed is only valid after reset for USB2
+    let portsc = controller.read_port_sc(port);
+    let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
+    crate::framebuffer::write_str(speed_name(speed));
+    crate::framebuffer::write_str("-speed device\n");
+
+    let loc = Location { root_port: port as u8, route: 0, depth: 0, speed, tt_slot: 0, tt_port: 0 };
+    let _ = attach_device(loc);
+    true
 }
 
 fn speed_name(speed: u32) -> &'static str {
@@ -371,7 +495,12 @@ unsafe fn attach_device(loc: Location) -> Result<Kind, UsbError> {
             release_slot(slot);
             Ok(Kind::Other)
         }
-        Ok(kind) => Ok(kind),
+        Ok(kind) => {
+            if (slot as usize) <= MAX_SLOTS {
+                KEPT_ROOT_PORT[slot as usize] = loc.root_port;
+            }
+            Ok(kind)
+        }
         Err(e) => {
             release_slot(slot);
             Err(e)
@@ -384,6 +513,9 @@ unsafe fn release_slot(slot: u8) {
         let _ = c.issue_disable_slot_command(slot);
     }
     DCBAA_DATA.data[slot as usize] = 0;
+    if (slot as usize) <= MAX_SLOTS {
+        KEPT_ROOT_PORT[slot as usize] = 0;
+    }
 }
 
 unsafe fn setup_device(slot: u8, loc: &Location) -> Result<Kind, UsbError> {
@@ -474,7 +606,11 @@ unsafe fn setup_device(slot: u8, loc: &Location) -> Result<Kind, UsbError> {
             return Ok(Kind::Other);
         }
     };
-    if KEYBOARD_COUNT >= MAX_KEYBOARDS {
+    let free = match (*core::ptr::addr_of!(KEYBOARDS)).iter().position(|k| k.is_none()) {
+        Some(i) => i,
+        None => MAX_KEYBOARDS,
+    };
+    if free >= MAX_KEYBOARDS {
         indent(loc.depth);
         crate::framebuffer::write_str("boot keyboard (limit reached, skipping)\n");
         return Ok(Kind::Other);
@@ -516,9 +652,11 @@ unsafe fn setup_device(slot: u8, loc: &Location) -> Result<Kind, UsbError> {
     let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
     c.issue_configure_endpoint_command(slot, m.input as u64)?;
 
-    KEYBOARDS[KEYBOARD_COUNT] = Some(Keyboard {
+    KEYBOARDS[free] = Some(Keyboard {
         slot,
         dci: dci as u8,
+        vid,
+        pid,
         ring,
         buf: report_buf,
         active: false,
@@ -527,7 +665,11 @@ unsafe fn setup_device(slot: u8, loc: &Location) -> Result<Kind, UsbError> {
     });
     KEYBOARD_COUNT += 1;
     indent(loc.depth);
-    crate::framebuffer::write_str("keyboard ready\n");
+    crate::framebuffer::write_str("keyboard ");
+    print_hex_word(vid);
+    crate::framebuffer::write_str(":");
+    print_hex_word(pid);
+    crate::framebuffer::write_str(" ready\n");
     Ok(Kind::Keyboard)
 }
 

@@ -284,6 +284,12 @@ pub fn read_char() -> Option<char> {
     }
 }
 
+/// True if an xHCI controller is running (USB keyboards may be plugged in
+/// later, so it is worth polling even with none found at boot)
+pub fn controller_ready() -> bool {
+    unsafe { xhci::controller().map_or(false, |c| !c.is_dead() && c.is_running()) }
+}
+
 /// Check if USB keyboard is available
 ///
 /// # Returns

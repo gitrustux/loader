@@ -28,15 +28,17 @@ pub struct CommandRingStruct {
     _padding: [u8; 52],
 }
 
-/// Event Ring - must be 64-byte aligned
-#[repr(C, align(64))]
+/// Event ring size in TRBs: one 4 KiB page. (16 was too small once hubs,
+/// several devices and keyboards all post events.)
+pub const EVENT_RING_SIZE: usize = 256;
+
+/// Event Ring - one page, page aligned (so it never crosses a 64 KiB
+/// boundary)
+#[repr(C, align(4096))]
 pub struct EventRingStruct {
-    pub trbs: [EventTrb; TRB_RING_SIZE],
+    pub trbs: [EventTrb; EVENT_RING_SIZE],
     pub dequeue: AtomicU32,
     pub cycle_state: AtomicU32,
-    // Padding to prevent overlap with next allocation
-    // Total size: 256 + 8 = 264 bytes, round up to 320 bytes (5 * 64)
-    _padding: [u8; 56],
 }
 
 /// ERST Entry
@@ -73,16 +75,15 @@ pub static mut COMMAND_RING_DATA: CommandRingStruct = CommandRingStruct {
 };
 
 pub static mut EVENT_RING_DATA: EventRingStruct = EventRingStruct {
-    trbs: [EventTrb { trb_ptr: 0, status: 0, control: 0 }; TRB_RING_SIZE],
+    trbs: [EventTrb { trb_ptr: 0, status: 0, control: 0 }; EVENT_RING_SIZE],
     dequeue: AtomicU32::new(0),
     cycle_state: AtomicU32::new(1),
-    _padding: [0; 56],
 };
 
 pub static mut ERST_DATA: ErstStruct = ErstStruct {
     entries: [ErstEntry {
         segment_base: 0,
-        segment_size: TRB_RING_SIZE as u32,
+        segment_size: EVENT_RING_SIZE as u32,
         _reserved: 0,
     }],
     _padding: [0; 48],
@@ -180,6 +181,14 @@ pub unsafe fn command_ring_enqueue(trb: &NormalTrb) -> Result<(u64, u32), UsbErr
     Ok((addr, cycle))
 }
 
+/// Address the controller should resume from after a command abort: the
+/// next TRB slot the producer will write, and the producer cycle state.
+pub unsafe fn command_ring_next() -> (u64, u32) {
+    let ring = &COMMAND_RING_DATA;
+    let idx = ring.enqueue.load(Ordering::Acquire) as u64;
+    (command_ring_base() + idx * 16, ring.cycle_state.load(Ordering::Acquire) & 1)
+}
+
 /// Get command ring enqueue index
 pub unsafe fn command_ring_enqueue_idx() -> u32 {
     COMMAND_RING_DATA.enqueue.load(Ordering::Acquire)
@@ -220,7 +229,7 @@ pub unsafe fn event_ring_dequeue() -> Option<EventTrb> {
     }
 
     // Update dequeue pointer
-    let next_index = (index + 1) % TRB_RING_SIZE;
+    let next_index = (index + 1) % EVENT_RING_SIZE;
     ring.dequeue.store(next_index as u32, Ordering::Release);
 
     // Toggle cycle bit if wrapping
@@ -252,7 +261,7 @@ pub fn erst_base() -> u64 {
 /// Initialize ERST with event ring address
 pub unsafe fn erst_init() {
     ERST_DATA.entries[0].segment_base = event_ring_base();
-    ERST_DATA.entries[0].segment_size = TRB_RING_SIZE as u32;
+    ERST_DATA.entries[0].segment_size = EVENT_RING_SIZE as u32;
 }
 
 /// Get DCBAA base address

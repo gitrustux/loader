@@ -12,22 +12,22 @@ set -e
 
 VERSION="0.1.0"
 # Which kernel goes in /EFI/Rustux/kernel.efi:
-#   KERNEL=kernel-efi (default)  the frozen transition kernel
-#   KERNEL=rustux                the Rustux microkernel (gitrustux/rustux,
-#                                checked out at /var/www/rustux.com/prod);
-#                                written to a separate image file
-KERNEL="${KERNEL:-kernel-efi}"
+#   KERNEL=rustux (default)  the Rustux microkernel (gitrustux/rustux,
+#                            checked out at /var/www/rustux.com/prod)
+#   KERNEL=kernel-efi        the frozen transition kernel; written to a
+#                            separate image file
+KERNEL="${KERNEL:-rustux}"
 RUSTUX_DIR="/var/www/rustux.com/prod"
 KERNEL_DIR="/var/www/rustux.com/prod/loader/kernel-efi"
 case "${KERNEL}" in
   kernel-efi)
-    IMAGE_NAME="rustica-live-amd64-${VERSION}.img"
-    SYMLINK_NAME="rustica-live-amd64.img"
+    IMAGE_NAME="rustica-live-amd64-kernel-efi-${VERSION}.img"
+    SYMLINK_NAME="rustica-live-amd64-kernel-efi.img"
     KERNEL_EFI="${KERNEL_DIR}/target/x86_64-unknown-uefi/release/rustux-kernel-efi.efi"
     ;;
   rustux)
-    IMAGE_NAME="rustica-live-amd64-rustux-${VERSION}.img"
-    SYMLINK_NAME="rustica-live-amd64-rustux.img"
+    IMAGE_NAME="rustica-live-amd64-${VERSION}.img"
+    SYMLINK_NAME="rustica-live-amd64.img"
     KERNEL_EFI="${RUSTUX_DIR}/target/x86_64-unknown-uefi/release/rustux.efi"
     ;;
   *)

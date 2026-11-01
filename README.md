@@ -11,7 +11,7 @@ The `kernel-efi/` transition kernel serves as:
 - **Hardware testing** - PS/2 keyboard, framebuffer, UEFI GOP
 - **Feature validation** - Process management, syscalls, shell interaction
 
-**Status (2026-11-01): frozen, bug fixes only.** It works on the test laptop (MSI GS75) with the built-in PS/2 keyboard and USB keyboards, including behind a hub (KVM switch) and with the KVM switching away and back. New work goes into the Rustux kernel; see "Hardware notes" below for what it must carry over.
+**Status (2026-11-01): frozen, bug fixes only.** The live image now ships the Rustux kernel (`build-live-image.sh`, default `KERNEL=rustux`); `KERNEL=kernel-efi` still builds this kernel into `rustica-live-amd64-kernel-efi.img`. It works on the test laptop (MSI GS75) with the built-in PS/2 keyboard and USB keyboards, including behind a hub (KVM switch) and with the KVM switching away and back. New work goes into the Rustux kernel; see "Hardware notes" below for what it must carry over.
 
 **This is NOT the canonical Rustux kernel.** The real kernel is [gitrustux/rustux](https://github.com/gitrustux/rustux) (microkernel architecture). The copy of it that used to live in `rustux/` here was merged into that repository and removed.
 

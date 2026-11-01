@@ -73,6 +73,21 @@ fn print_hex_byte(value: u8) {
 }
 
 /// Helper: Print hex word
+fn print_decimal(mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    digits[..len].reverse();
+    crate::framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&digits[..len]) });
+}
+
 fn print_hex_dword(value: u32) {
     for i in (0..32).step_by(8).rev() {
         let byte = ((value >> i) & 0xFF) as u8;
@@ -110,6 +125,11 @@ pub fn init() -> Result<(), &'static str> {
         crate::framebuffer::put_pixel(15, 1, 0xFF, 0xFF, 0x00); // Yellow
 
         // DIAGNOSTIC: Check if PCI enumeration works at all
+        crate::time::init();
+        crate::framebuffer::write_str("USB: TSC ");
+        print_decimal(crate::time::tsc_per_us() as u32);
+        crate::framebuffer::write_str(" ticks/us\n");
+
         crate::framebuffer::write_str("Step 1: Scanning PCI bus...\n");
 
         // Step 1: Try xHCI first (USB 3.0)
@@ -155,6 +175,7 @@ pub fn init() -> Result<(), &'static str> {
             Some(ControllerType::Xhci) => {
                 if let Some(controller) = xhci::controller() {
                     crate::framebuffer::write_str("xHCI: MMIO base = 0x");
+                    print_hex_dword((controller.mmio_base() >> 32) as u32);
                     print_hex_dword(controller.mmio_base() as u32);
                     crate::framebuffer::write_str("\n");
                 }
@@ -162,6 +183,7 @@ pub fn init() -> Result<(), &'static str> {
             Some(ControllerType::Ehci) => {
                 if let Some(controller) = ehci::controller() {
                     crate::framebuffer::write_str("EHCI: MMIO base = 0x");
+                    print_hex_dword((controller.mmio_base() >> 32) as u32);
                     print_hex_dword(controller.mmio_base() as u32);
                     crate::framebuffer::write_str("\n");
                 }
@@ -174,10 +196,7 @@ pub fn init() -> Result<(), &'static str> {
         }
 
         // Wait for controller ready (USB spec requires delays!)
-        crate::framebuffer::write_str("Step 4: Waiting for controller ready...\n");
-        for _ in 0..100_000_000 {
-            core::arch::asm!("nop");
-        }
+        crate::framebuffer::write_str("Step 4: Checking controller is running...\n");
 
         // Check if controller is running
         let is_running = match controller_type {
@@ -202,18 +221,20 @@ pub fn init() -> Result<(), &'static str> {
         crate::framebuffer::write_str("Step 5: Enumerating USB devices...\n");
 
         match device::enumerate_hid_keyboard() {
-            Ok(_keyboard) => {
-                crate::framebuffer::write_str("USB: HID keyboard found\n");
+            Ok(count) => {
+                crate::framebuffer::write_str("USB: ");
+                print_decimal(count as u32);
+                crate::framebuffer::write_str(if count == 1 { " keyboard ready\n" } else { " keyboards ready\n" });
                 crate::framebuffer::put_pixel(15, 1, 0x00, 0xFF, 0x00); // Green = success
                 Ok(())
             }
             Err(UsbError::DeviceNotFound) => {
-                crate::framebuffer::write_str("USB: No device found on ports 1-4\n");
+                crate::framebuffer::write_str("USB: No device connected to this controller\n");
                 crate::framebuffer::put_pixel(15, 1, 0xFF, 0xA5, 0x00); // Orange
                 Err("No USB device found")
             }
             Err(UsbError::HidKeyboardNotFound) => {
-                crate::framebuffer::write_str("USB: Device found but not a keyboard\n");
+                crate::framebuffer::write_str("USB: Devices found, but none is a boot keyboard\n");
                 crate::framebuffer::put_pixel(15, 1, 0xFF, 0xA5, 0x00); // Orange
                 Err("No HID keyboard found")
             }
@@ -261,6 +282,12 @@ pub fn read_char() -> Option<char> {
             None => None,
         }
     }
+}
+
+/// True if an xHCI controller is running (USB keyboards may be plugged in
+/// later, so it is worth polling even with none found at boot)
+pub fn controller_ready() -> bool {
+    unsafe { xhci::controller().map_or(false, |c| !c.is_dead() && c.is_running()) }
 }
 
 /// Check if USB keyboard is available

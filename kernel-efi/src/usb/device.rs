@@ -1,214 +1,41 @@
 // Copyright 2025 The Rustux Authors
 //
-// USB Device Enumeration and HID Keyboard
+// USB device enumeration: root ports, USB 2.0 hubs, HID boot keyboards
 //
-// This module handles USB device enumeration for HID keyboard detection.
+// Every connected root port is enumerated. Hubs are configured and the
+// devices behind them enumerated in turn (route string, and for full/low
+// speed devices behind a high-speed hub the TT fields). Every HID boot
+// keyboard found is kept (up to MAX_KEYBOARDS); other devices are released.
+//
+// Each slot has its own Input Context, Device Context, EP0 ring and
+// descriptor buffer (one page each), so a hub stays configured while the
+// devices behind it are set up. kernel-efi runs identity-mapped, so the
+// address of a page is also its physical address.
 
 use crate::usb::{UsbError, trb::*};
-use crate::usb::xhci::{PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PORT_SPEED_MASK, PORTSC_PORT_SPEED_SHIFT};
+use crate::usb::xhci::{
+    self, PORTSC_CCS, PORTSC_PED, PORTSC_PORT_SPEED_MASK, PORTSC_PORT_SPEED_SHIFT,
+    PORTSC_CHANGE_BITS, PORTSC_PRESERVE,
+    SPEED_FULL, SPEED_LOW, SPEED_HIGH, SPEED_SUPER,
+};
+use crate::usb::dma::{
+    alloc_dma_page, DeviceContextStruct, InputContextStruct, Ring, DCBAA_DATA,
+};
+use crate::time::delay_ms;
 
 /// USB HID Boot Protocol keyboard report size
 pub const HID_REPORT_SIZE: usize = 8;
 
-/// Device descriptor buffer size
-pub const DEVICE_DESC_SIZE: usize = 18;
-
-/// Device descriptor buffer (static for DMA)
-static mut DEVICE_DESC_BUFFER: [u8; DEVICE_DESC_SIZE] = [0; DEVICE_DESC_SIZE];
-
-/// Get device descriptor buffer address (for DMA)
-pub fn get_device_desc_ptr() -> u64 {
-    unsafe { &DEVICE_DESC_BUFFER as *const u8 as u64 }
-}
-
-/// Flag to track if xHCI succeeded and device detected (CCS=1)
-/// This prevents PS/2 fallback when USB hardware is present
-static mut XHCI_SUCCESS_WITH_DEVICE: bool = false;
-
-/// Check if xHCI succeeded with a device detected
-pub fn xhci_succeeded_with_device() -> bool {
-    unsafe { XHCI_SUCCESS_WITH_DEVICE }
-}
-
-/// Print hex byte helper
-fn print_hex_byte(value: u8) {
-    let high = (value >> 4) & 0x0F;
-    let low = value & 0x0F;
-    let high_c = if high < 10 { b'0' + high } else { b'A' + (high - 10) };
-    let low_c = if low < 10 { b'0' + low } else { b'A' + (low - 10) };
-    unsafe {
-        crate::framebuffer::write_str(core::str::from_utf8(&[high_c]).unwrap());
-        crate::framebuffer::write_str(core::str::from_utf8(&[low_c]).unwrap());
-    }
-}
-
-/// Print hex word helper
-fn print_hex_word(value: u16) {
-    print_hex_byte((value >> 8) as u8);
-    print_hex_byte(value as u8);
-}
-
-/// Print hex dword helper
-fn print_hex_dword(value: u32) {
-    print_hex_byte((value >> 24) as u8);
-    print_hex_byte((value >> 16) as u8);
-    print_hex_byte((value >> 8) as u8);
-    print_hex_byte(value as u8);
-}
-
-/// Get port speed name from PORTSC speed field
-fn get_port_speed_name(portsc: u32) -> &'static str {
-    let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
-    match speed {
-        0 => "Full",
-        1 => "Low",
-        2 => "High",
-        3 => "Super",
-        4 => "SuperPlus",
-        _ => "Unknown",
-    }
-}
-
-/// Dump PORTSC register with all relevant fields
-unsafe fn dump_portsc(controller: &crate::usb::xhci::XhciController, port: usize, label: &str) {
-    let portsc = controller.read_port_sc(port);
-
-    crate::framebuffer::write_str("PORTSC[");
-    crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + port as u8]).unwrap());
-    crate::framebuffer::write_str("] ");
-    crate::framebuffer::write_str(label);
-    crate::framebuffer::write_str(": 0x");
-    print_hex_dword(portsc);
-    crate::framebuffer::write_str(" ");
-
-    // Print individual bits
-    let ccs = if portsc & PORTSC_CCS != 0 { "CCS=1 " } else { "CCS=0 " };
-    crate::framebuffer::write_str(ccs);
-
-    let ped = if portsc & PORTSC_PED != 0 { "PED=1 " } else { "PED=0 " };
-    crate::framebuffer::write_str(ped);
-
-    let pr = if portsc & PORTSC_PR != 0 { "PR=1 " } else { "PR=0 " };
-    crate::framebuffer::write_str(pr);
-
-    // Print port speed
-    let speed = get_port_speed_name(portsc);
-    crate::framebuffer::write_str("Speed=");
-    crate::framebuffer::write_str(speed);
-    crate::framebuffer::write_str("\n");
-}
-
-/// Dump event TRB details
-unsafe fn dump_event_trb(event: &EventTrb) {
-    crate::framebuffer::write_str("  Event TRB: ptr=0x");
-    print_hex_dword((event.trb_ptr >> 32) as u32);
-    print_hex_dword((event.trb_ptr & 0xFFFFFFFF) as u32);
-    crate::framebuffer::write_str(" status=0x");
-    print_hex_dword(event.status);
-    crate::framebuffer::write_str(" control=0x");
-    print_hex_dword(event.control);
-
-    // Extract completion code
-    let code = (event.status >> 24) as u8;
-    crate::framebuffer::write_str(" CC=");
-    print_hex_byte(code);
-
-    // Extract TRB type
-    let trb_type = ((event.control >> 10) & 0x3F) as u8;
-    crate::framebuffer::write_str(" Type=");
-    print_hex_byte(trb_type);
-
-    // Extract slot ID
-    let slot_id = ((event.control >> 24) & 0xFF) as u8;
-    crate::framebuffer::write_str(" Slot=");
-    print_hex_byte(slot_id);
-
-    // Print completion code name
-    let cc_name = match code {
-        1 => "Success",
-        2 => "TRBError",
-        3 => "Stall",
-        4 => "ResourceError",
-        5 => "BandwidthError",
-        6 => "NoSlotsError",
-        7 => "InvalidStreamTypeError",
-        8 => "SlotNotEnabledError",
-        9 => "EpNotEnabledError",
-        13 => "ShortPacket",
-        22 => "IncompatibleDeviceError",
-        25 => "CommandAborted",
-        _ => "Unknown",
-    };
-    crate::framebuffer::write_str("(");
-    crate::framebuffer::write_str(cc_name);
-    crate::framebuffer::write_str(")\n");
-}
-
-/// Dump device descriptor (first 18 bytes)
-unsafe fn dump_device_descriptor() {
-    crate::framebuffer::write_str("  Device Descriptor:\n");
-    crate::framebuffer::write_str("    bLength=");
-    print_hex_byte(DEVICE_DESC_BUFFER[0]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    bDescriptorType=");
-    print_hex_byte(DEVICE_DESC_BUFFER[1]);
-    crate::framebuffer::write_str("\n");
-
-    let bcd_usb = (DEVICE_DESC_BUFFER[3] as u16) << 8 | (DEVICE_DESC_BUFFER[2] as u16);
-    crate::framebuffer::write_str("    bcdUSB=0x");
-    print_hex_word(bcd_usb);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    bDeviceClass=");
-    print_hex_byte(DEVICE_DESC_BUFFER[4]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    bDeviceSubClass=");
-    print_hex_byte(DEVICE_DESC_BUFFER[5]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    bDeviceProtocol=");
-    print_hex_byte(DEVICE_DESC_BUFFER[6]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    bMaxPacketSize0=");
-    print_hex_byte(DEVICE_DESC_BUFFER[7]);
-    crate::framebuffer::write_str("\n");
-
-    let id_vendor = (DEVICE_DESC_BUFFER[9] as u16) << 8 | (DEVICE_DESC_BUFFER[8] as u16);
-    crate::framebuffer::write_str("    idVendor=0x");
-    print_hex_word(id_vendor);
-    crate::framebuffer::write_str("\n");
-
-    let id_product = (DEVICE_DESC_BUFFER[11] as u16) << 8 | (DEVICE_DESC_BUFFER[10] as u16);
-    crate::framebuffer::write_str("    idProduct=0x");
-    print_hex_word(id_product);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    iManufacturer=");
-    print_hex_byte(DEVICE_DESC_BUFFER[14]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    iProduct=");
-    print_hex_byte(DEVICE_DESC_BUFFER[15]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    iSerialNumber=");
-    print_hex_byte(DEVICE_DESC_BUFFER[16]);
-    crate::framebuffer::write_str("\n");
-
-    crate::framebuffer::write_str("    bNumConfigurations=");
-    print_hex_byte(DEVICE_DESC_BUFFER[17]);
-    crate::framebuffer::write_str("\n");
-}
-
 /// USB control request types
+pub const USB_REQ_GET_STATUS: u8 = 0x00;
+pub const USB_REQ_CLEAR_FEATURE: u8 = 0x01;
+pub const USB_REQ_SET_FEATURE: u8 = 0x03;
 pub const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
 pub const USB_REQ_SET_ADDRESS: u8 = 0x05;
 pub const USB_REQ_SET_CONFIGURATION: u8 = 0x09;
 pub const USB_REQ_SET_INTERFACE: u8 = 0x0B;
 pub const USB_REQ_SET_PROTOCOL: u8 = 0x0B;
+pub const USB_REQ_SET_IDLE: u8 = 0x0A;
 
 /// USB descriptor types
 pub const USB_DT_DEVICE: u8 = 0x01;
@@ -218,13 +45,15 @@ pub const USB_DT_INTERFACE: u8 = 0x04;
 pub const USB_DT_ENDPOINT: u8 = 0x05;
 pub const USB_DT_HID: u8 = 0x21;
 pub const USB_DT_REPORT: u8 = 0x22;
+pub const USB_DT_HUB: u8 = 0x29;
 
 /// USB HID protocol
 pub const USB_HID_BOOT_PROTOCOL: u8 = 0x00;
 pub const USB_HID_REPORT_PROTOCOL: u8 = 0x01;
 
-/// USB HID class codes
+/// USB class codes
 pub const USB_CLASS_HID: u8 = 0x03;
+pub const USB_CLASS_HUB: u8 = 0x09;
 pub const USB_HID_SUBCLASS_BOOT: u8 = 0x01;
 pub const USB_HID_PROTOCOL_KEYBOARD: u8 = 0x01;
 
@@ -238,445 +67,840 @@ pub const USB_ENDPOINT_XFER_INT: u8 = 0x03;
 pub const USB_DIR_OUT: u8 = 0x00;
 pub const USB_DIR_IN: u8 = 0x80;
 
-/// Transfer poll timeout (iterations)
-const TRANSFER_TIMEOUT: u32 = 100000;
+/// Hub class features and port status bits (USB 2.0 ch. 11.24)
+const HUB_PORT_RESET: u16 = 4;
+const HUB_PORT_POWER: u16 = 8;
+const HUB_C_PORT_CONNECTION: u16 = 16;
+const HUB_C_PORT_RESET: u16 = 20;
+const HUB_STAT_CONNECTION: u16 = 0x0001;
+const HUB_STAT_ENABLE: u16 = 0x0002;
+const HUB_STAT_LOW_SPEED: u16 = 0x0200;
+const HUB_STAT_HIGH_SPEED: u16 = 0x0400;
+const HUB_CHANGE_RESET: u16 = 0x0010;
 
-/// USB device information for HID keyboard
-#[derive(Debug, Clone, Copy)]
-pub struct HidKeyboardInfo {
-    pub slot_id: u8,
-    pub endpoint_addr: u8,
-    pub max_packet: u16,
-    pub interval: u8,
+/// Slots tracked (the controller is configured for at most 32)
+const MAX_SLOTS: usize = 32;
+/// Keyboards kept
+const MAX_KEYBOARDS: usize = 4;
+/// Hub nesting limit (USB allows 5 tiers of hubs)
+const MAX_HUB_DEPTH: u8 = 4;
+
+// ============================================================
+// Per-slot memory
+// ============================================================
+
+struct SlotMem {
+    input: *mut InputContextStruct,
+    dev: *mut DeviceContextStruct,
+    ep0: Ring,
+    /// Descriptor / status buffer (one page)
+    buf: *mut u8,
 }
 
-/// Global HID keyboard device info
-static mut HID_KEYBOARD: Option<HidKeyboardInfo> = None;
+const NO_SLOT: Option<SlotMem> = None;
+static mut SLOT_MEM: [Option<SlotMem>; MAX_SLOTS + 1] = [NO_SLOT; MAX_SLOTS + 1];
 
-/// HID keyboard data buffer
-static mut HID_REPORT_BUFFER: [u8; HID_REPORT_SIZE] = [0; HID_REPORT_SIZE];
+/// Memory for `slot`, zeroed. Pages are allocated the first time a slot
+/// id is used and reused afterwards (the kernel heap never frees).
+unsafe fn slot_mem(slot: u8) -> Result<&'static mut SlotMem, UsbError> {
+    let s = slot as usize;
+    if s == 0 || s > MAX_SLOTS {
+        return Err(UsbError::XhciInitFailed);
+    }
+    let entry = &mut *core::ptr::addr_of_mut!(SLOT_MEM[s]);
+    match entry {
+        Some(m) => {
+            core::ptr::write_bytes(m.input as *mut u8, 0, 4096);
+            core::ptr::write_bytes(m.dev as *mut u8, 0, 4096);
+            core::ptr::write_bytes(m.buf, 0, 4096);
+            m.ep0.reset();
+        }
+        None => {
+            let input = alloc_dma_page().ok_or(UsbError::XhciInitFailed)? as *mut InputContextStruct;
+            let dev = alloc_dma_page().ok_or(UsbError::XhciInitFailed)? as *mut DeviceContextStruct;
+            let buf = alloc_dma_page().ok_or(UsbError::XhciInitFailed)?;
+            let ep0 = Ring::new().ok_or(UsbError::XhciInitFailed)?;
+            *entry = Some(SlotMem { input, dev, ep0, buf });
+        }
+    }
+    Ok(entry.as_mut().unwrap())
+}
 
-/// Active transfer flag (to prevent multiple concurrent transfers)
-static mut TRANSFER_ACTIVE: bool = false;
+// ============================================================
+// Keyboards
+// ============================================================
 
-/// Check if we have a valid HID keyboard device
+struct Keyboard {
+    slot: u8,
+    dci: u8,
+    vid: u16,
+    pid: u16,
+    ring: Ring,
+    buf: *mut u8,
+    active: bool,
+    dead: bool,
+    prev: [u8; 6],
+}
+
+const NO_KEYBOARD: Option<Keyboard> = None;
+static mut KEYBOARDS: [Option<Keyboard>; MAX_KEYBOARDS] = [NO_KEYBOARD; MAX_KEYBOARDS];
+static mut KEYBOARD_COUNT: usize = 0;
+
+/// Root port of every slot that stays configured (hubs and keyboards);
+/// 0 = slot not in use. Used to release everything behind a root port
+/// when it disconnects (e.g. a KVM switching to another computer).
+static mut KEPT_ROOT_PORT: [u8; MAX_SLOTS + 1] = [0; MAX_SLOTS + 1];
+
+/// Port Status Change Detect bit in PORTSC: Connect Status Change
+const PORTSC_CSC: u32 = 1 << 17;
+
+/// Check if at least one USB keyboard is ready
 pub fn has_hid_keyboard() -> bool {
-    unsafe { HID_KEYBOARD.is_some() }
+    unsafe { KEYBOARD_COUNT > 0 }
 }
 
-/// Get HID keyboard device info
-pub fn get_hid_keyboard() -> Option<HidKeyboardInfo> {
-    unsafe { HID_KEYBOARD }
+/// Number of USB keyboards ready
+pub fn keyboard_count() -> usize {
+    unsafe { KEYBOARD_COUNT }
 }
 
-/// Full USB HID keyboard enumeration with comprehensive debugging
-///
-/// This implementation:
-/// 1. Checks for a device on USB ports 1-4
-/// 2. Dumps PORTSC before/during/after reset
-/// 3. Issues Enable Slot command and waits for completion
-/// 4. Reads device descriptor via GET_DESCRIPTOR
-/// 5. Sets device address
-/// 6. Assumes HID boot keyboard for initial testing
-///
-/// Debug output includes:
-/// - PORTSC dumps with CCS, PED, PR, Port Speed
-/// - Enable Slot command TRB and completion event
-/// - Address Device command debugging
-/// - Device descriptor dump
-/// - Event ring debugging with completion codes
-pub unsafe fn enumerate_hid_keyboard() -> Result<HidKeyboardInfo, UsbError> {
-    use crate::usb::xhci;
+/// Kept for callers of the old single-keyboard API
+pub fn xhci_succeeded_with_device() -> bool {
+    has_hid_keyboard()
+}
 
-    crate::framebuffer::write_str("USB: Getting xHCI controller...\n");
+/// Keep transfers armed on every keyboard, decode finished reports, and
+/// handle root ports that connect or disconnect. Decoded characters go to
+/// `hid`'s queue. Runs whenever the shell waits for input, even with no
+/// keyboard attached, so a keyboard plugged in later (or a KVM switched
+/// back) is found.
+pub unsafe fn poll_keyboards() {
+    let c = match xhci::controller_mut() {
+        Some(c) if !c.is_dead() => c,
+        _ => return,
+    };
 
-    // Get xHCI controller
-    let controller = xhci::controller().ok_or(UsbError::XhciNotFound)?;
-
-    crate::framebuffer::write_str("USB: Checking ports 1-4 for devices...\n");
-
-    // Check ports 1-4 for a connected device
-    let mut found_port = None;
-    for port in 1..=4 {
-        crate::framebuffer::write_str("USB: Port ");
-        // Simple decimal print
-        crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + port as u8]).unwrap());
-        crate::framebuffer::write_str("... ");
-
-        let portsc = controller.read_port_sc(port);
-
-        // Check CCS (Current Connect Status) bit
-        if portsc & PORTSC_CCS != 0 {
-            crate::framebuffer::write_str("CCS=1 ");
-
-            // Also check PED (Port Enabled)
-            if portsc & PORTSC_PED != 0 {
-                crate::framebuffer::write_str("PED=1 ");
-            }
-
-            // Print port speed
-            let speed = get_port_speed_name(portsc);
-            crate::framebuffer::write_str(speed);
-            crate::framebuffer::write_str("\n");
-
-            // Flag that xHCI succeeded with a device detected
-            XHCI_SUCCESS_WITH_DEVICE = true;
-
-            found_port = Some(port);
-            break;
-        } else {
-            crate::framebuffer::write_str("CCS=0\n");
+    // One Normal TRB outstanding per keyboard
+    for kb in (*core::ptr::addr_of_mut!(KEYBOARDS)).iter_mut().flatten() {
+        if !kb.active && !kb.dead {
+            kb.ring.push(&NormalTrb {
+                data_ptr: kb.buf as u64,
+                status: HID_REPORT_SIZE as u32,
+                control: (1 << 10) | (1 << 5) | (1 << 2), // Normal, IOC, ISP
+            });
+            c.ring_doorbell(kb.slot, kb.dci, 0);
+            kb.active = true;
         }
     }
 
-    let port = found_port.ok_or(UsbError::DeviceNotFound)?;
-
-    // ============================================================
-    // STEP 1: PORT RESET WITH COMPREHENSIVE DEBUGGING
-    // ============================================================
-
-    crate::framebuffer::write_str("USB: === PORT RESET DEBUG ===\n");
-    crate::framebuffer::write_str("USB: Port ");
-    crate::framebuffer::write_str(core::str::from_utf8(&[b'0' + port as u8]).unwrap());
-    crate::framebuffer::write_str(" reset sequence:\n");
-
-    // Dump PORTSC BEFORE reset
-    dump_portsc(controller, port, "BEFORE");
-
-    let mut portsc = controller.read_port_sc(port);
-
-    // Check if port is already enabled
-    if portsc & PORTSC_PED != 0 {
-        crate::framebuffer::write_str("USB: Port already enabled (PED=1), attempting reset anyway\n");
-    }
-
-    // Set port reset bit
-    crate::framebuffer::write_str("USB: Setting PR bit (0x0020)...\n");
-    crate::framebuffer::write_str("USB: Current PORTSC=0x");
-    print_hex_dword(portsc);
-    crate::framebuffer::write_str(" Writing=0x");
-    print_hex_dword(portsc | 0x0020);
-    crate::framebuffer::write_str("\n");
-
-    controller.write_port_sc(port, portsc | 0x0020);  // PR is bit 5 = 0x0020
-
-    // Small delay before checking
-    for _ in 0..1000 {
-        core::arch::asm!("nop", options(nomem, nostack));
-    }
-
-    // Dump PORTSC DURING reset
-    dump_portsc(controller, port, "DURING");
-
-    // Wait for PR to clear (reset complete)
-    crate::framebuffer::write_str("USB: Waiting for PR to clear...\n");
-    let mut timeout = 100000;
-    while timeout > 0 {
-        portsc = controller.read_port_sc(port);
-        if portsc & PORTSC_PR == 0 {
-            crate::framebuffer::write_str("USB: PR cleared after ");
-            let elapsed = 100000 - timeout;
-            // Simple elapsed print
-            if elapsed < 1000 {
-                crate::framebuffer::write_str("<1ms");
-            } else if elapsed < 10000 {
-                crate::framebuffer::write_str("<10ms");
+    // Dispatch events: transfers to their keyboard, port changes noted
+    let mut changed_ports: u64 = 0;
+    for _ in 0..64 {
+        let event = match c.poll_events() {
+            Some(e) => e,
+            None => break,
+        };
+        match (event.control >> 10) & 0x3F {
+            32 => {}
+            34 => {
+                // Port Status Change: port id in bits 31:24 of the parameter
+                let port = ((event.trb_ptr >> 24) & 0xFF) as u32;
+                if port > 0 && port < 64 {
+                    changed_ports |= 1 << port;
+                }
+                continue;
+            }
+            _ => continue,
+        }
+        let slot = ((event.control >> 24) & 0xFF) as u8;
+        let ep = ((event.control >> 16) & 0x1F) as u8;
+        let code = (event.status >> 24) as u8;
+        let residual = (event.status & 0x00FF_FFFF) as usize;
+        for kb in (*core::ptr::addr_of_mut!(KEYBOARDS)).iter_mut().flatten() {
+            if kb.slot != slot || kb.dci != ep {
+                continue;
+            }
+            kb.active = false;
+            if code == 1 || code == 13 {
+                let len = HID_REPORT_SIZE.saturating_sub(residual);
+                let report = core::slice::from_raw_parts(kb.buf as *const u8, HID_REPORT_SIZE);
+                crate::usb::hid::process_report(&report[..len], &mut kb.prev);
             } else {
-                crate::framebuffer::write_str(">10ms");
-            }
-            crate::framebuffer::write_str("\n");
-            break;
-        }
-        timeout -= 1;
-        for _ in 0..100 {
-            core::arch::asm!("nop", options(nomem, nostack));
-        }
-    }
-
-    if timeout == 0 {
-        crate::framebuffer::write_str("USB: WARNING - PR timeout!\n");
-    }
-
-    // Dump PORTSC AFTER reset
-    dump_portsc(controller, port, "AFTER");
-
-    // Verify port is enabled after reset
-    portsc = controller.read_port_sc(port);
-    if portsc & PORTSC_PED == 0 {
-        crate::framebuffer::write_str("USB: WARNING - Port not enabled after reset (PED=0)\n");
-        crate::framebuffer::write_str("USB: Device may have disconnected during reset\n");
-        crate::framebuffer::write_str("USB: Continuing anyway (device was enabled before reset)\n");
-        // Don't return error - device was already enabled before reset
-    } else {
-        crate::framebuffer::write_str("USB: Port enabled OK (PED=1)\n");
-    }
-
-    // Verify device is still connected
-    if portsc & PORTSC_CCS == 0 {
-        crate::framebuffer::write_str("USB: WARNING - Device disconnected during reset (CCS=0)\n");
-        crate::framebuffer::write_str("USB: Continuing anyway (will try to re-enumerate)\n");
-        // Don't return error - device might reconnect
-    } else {
-        crate::framebuffer::write_str("USB: Device still connected (CCS=1)\n");
-    }
-
-    // ============================================================
-    // STEP 2: ENABLE SLOT COMMAND
-    // ============================================================
-
-    crate::framebuffer::write_str("USB: === ENABLE SLOT COMMAND ===\n");
-
-    // Get controller mut for command ring access
-    let controller_mut = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
-
-    // Issue Enable Slot command
-    crate::framebuffer::write_str("USB: Issuing Enable Slot command...\n");
-
-    match controller_mut.issue_enable_slot_command() {
-        Ok(slot_id) => {
-            crate::framebuffer::write_str("USB: Enable Slot OK - Slot ID=");
-            print_hex_byte(slot_id);
-            crate::framebuffer::write_str("\n");
-        }
-        Err(e) => {
-            crate::framebuffer::write_str("USB: Enable Slot FAILED - ");
-            match e {
-                UsbError::Timeout => crate::framebuffer::write_str("Timeout\n"),
-                UsbError::XhciInitFailed => crate::framebuffer::write_str("InitFailed\n"),
-                _ => crate::framebuffer::write_str("UnknownError\n"),
-            }
-            // Continue anyway - use default slot 1 for testing
-            crate::framebuffer::write_str("USB: Using default Slot ID=1 for testing\n");
-        }
-    }
-
-    // For now, assume slot ID 1
-    let slot_id = 1u8;
-
-    // ============================================================
-    // STEP 3: READ DEVICE DESCRIPTOR (Address 0)
-    // ============================================================
-
-    crate::framebuffer::write_str("USB: === GET DEVICE DESCRIPTOR ===\n");
-    crate::framebuffer::write_str("USB: Reading 18 bytes from address 0...\n");
-
-    // Clear device descriptor buffer
-    for i in 0..DEVICE_DESC_SIZE {
-        DEVICE_DESC_BUFFER[i] = 0;
-    }
-
-    // Create GET_DESCRIPTOR setup packet
-    let setup_packet = get_descriptor_setup_packet(USB_DT_DEVICE, 0, 18);
-
-    crate::framebuffer::write_str("USB: Setup: bmRequestType=0x");
-    print_hex_byte(setup_packet.bm_request_type);
-    crate::framebuffer::write_str(" bRequest=0x");
-    print_hex_byte(setup_packet.b_request);
-    crate::framebuffer::write_str(" wValue=0x");
-    print_hex_word(setup_packet.w_value);
-    crate::framebuffer::write_str(" wLength=0x");
-    print_hex_word(setup_packet.w_length);
-    crate::framebuffer::write_str("\n");
-
-    // Issue control transfer to get device descriptor
-    match controller_mut.issue_control_get(
-        slot_id,
-        &setup_packet,
-        get_device_desc_ptr(),
-        18,
-    ) {
-        Ok(()) => {
-            crate::framebuffer::write_str("USB: Get Descriptor OK\n");
-            dump_device_descriptor();
-        }
-        Err(e) => {
-            crate::framebuffer::write_str("USB: Get Descriptor FAILED - ");
-            match e {
-                UsbError::Timeout => crate::framebuffer::write_str("Timeout\n"),
-                _ => crate::framebuffer::write_str("Error\n"),
-            }
-            // Continue with assumed values for testing
-        }
-    }
-
-    // ============================================================
-    // STEP 4: SET DEVICE ADDRESS
-    // ============================================================
-
-    crate::framebuffer::write_str("USB: === SET DEVICE ADDRESS ===\n");
-    let device_address = 2u8;  // Use address 2 (address 1 is often reserved)
-
-    crate::framebuffer::write_str("USB: Setting device address to ");
-    print_hex_byte(device_address);
-    crate::framebuffer::write_str("...\n");
-
-    let addr_setup = set_address_setup_packet(device_address);
-
-    match controller_mut.issue_control_set(
-        slot_id,
-        &addr_setup,
-    ) {
-        Ok(()) => {
-            crate::framebuffer::write_str("USB: Set Address OK\n");
-        }
-        Err(e) => {
-            crate::framebuffer::write_str("USB: Set Address FAILED - ");
-            match e {
-                UsbError::Timeout => crate::framebuffer::write_str("Timeout\n"),
-                _ => crate::framebuffer::write_str("Error\n"),
+                // The endpoint halts on errors. CC=4 (USB Transaction
+                // Error) is what a disconnect looks like; the port change
+                // that follows removes the keyboard. Anything else is
+                // reported; recovering the endpoint (Reset Endpoint + Set
+                // TR Dequeue Pointer) is not implemented.
+                kb.dead = true;
+                if code != 4 {
+                    crate::framebuffer::write_str("\n[USB] keyboard ");
+                    print_hex_word(kb.vid);
+                    crate::framebuffer::write_str(":");
+                    print_hex_word(kb.pid);
+                    crate::framebuffer::write_str(" stopped, CC=");
+                    print_decimal(code as u32);
+                    crate::framebuffer::write_str("\n");
+                }
             }
         }
     }
 
-    // Wait for device to process address change
-    for _ in 0..10000 {
-        core::arch::asm!("nop", options(nomem, nostack));
+    for port in 1..64u32 {
+        if changed_ports & (1 << port) != 0 {
+            handle_root_port_change(port as usize);
+        }
     }
-
-    // ============================================================
-    // STEP 5: ASSUME HID KEYBOARD FOR INITIAL TESTING
-    // ============================================================
-
-    crate::framebuffer::write_str("USB: === ASSUMING HID KEYBOARD ===\n");
-
-    // For initial testing, assume:
-    // - Slot ID 1 (first device, assigned by Enable Slot)
-    // - Endpoint 1 (interrupt IN) - typical for HID keyboards
-    // - 8-byte max packet (HID boot keyboard)
-    // - 10ms polling interval
-
-    let keyboard_info = HidKeyboardInfo {
-        slot_id: slot_id,
-        endpoint_addr: 0x81,  // Endpoint 1, IN direction
-        max_packet: 8,
-        interval: 10,
-    };
-
-    crate::framebuffer::write_str("USB: Slot=");
-    print_hex_byte(keyboard_info.slot_id);
-    crate::framebuffer::write_str(" Endpoint=0x");
-    print_hex_byte(keyboard_info.endpoint_addr);
-    crate::framebuffer::write_str(" MaxPacket=");
-    print_hex_byte(keyboard_info.max_packet as u8);
-    crate::framebuffer::write_str("\n");
-
-    HID_KEYBOARD = Some(keyboard_info);
-
-    Ok(keyboard_info)
 }
 
-/// Read HID keyboard report via interrupt transfer
-///
-/// This function performs an xHCI interrupt IN transfer to read keyboard data.
-/// Returns the number of bytes read (0-8).
-pub unsafe fn read_keyboard_report() -> usize {
-    use crate::usb::xhci;
-
-    // Check if transfer is already active (prevent concurrent transfers)
-    if TRANSFER_ACTIVE {
-        // Check if previous transfer completed
-        if let Some(event) = xhci::controller().and_then(|c| c.poll_events()) {
-            TRANSFER_ACTIVE = false;
-
-            // Check completion code
-            let code = completion_code(event.status);
-            if code != CompletionCode::Success {
-                return 0;
-            }
-
-            // Get transfer length from event (bits 0-23)
-            let length = (event.status & 0x00FF_FFFF) as usize;
-            return length;
-        }
-        return 0;
+/// A root port reported a change: release what was behind it if it
+/// disconnected (or reconnected), and enumerate it again if a device is
+/// present now.
+unsafe fn handle_root_port_change(port: usize) {
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return,
+    };
+    if port > c.max_ports() {
+        return;
+    }
+    let portsc = c.read_port_sc(port);
+    // Acknowledge the change bits
+    c.write_port_sc(port, (portsc & PORTSC_PRESERVE) | (portsc & PORTSC_CHANGE_BITS));
+    if portsc & PORTSC_CSC == 0 {
+        return; // enable/reset/link changes only
     }
 
-    // Check if we have a HID keyboard
-    let keyboard = match get_hid_keyboard() {
-        Some(k) => k,
-        None => return 0,
-    };
+    let removed = release_root_port(port as u8);
+    if portsc & PORTSC_CCS == 0 {
+        if removed > 0 {
+            crate::framebuffer::write_str("\n[USB] port ");
+            print_decimal(port as u32);
+            crate::framebuffer::write_str(" disconnected");
+            print_keyboard_count();
+        }
+        return;
+    }
 
-    // Get controller
+    // Connected: let it settle (USB debounce, 100 ms), then enumerate
+    delay_ms(100);
+    let c = match xhci::controller() {
+        Some(c) => c,
+        None => return,
+    };
+    if c.read_port_sc(port) & PORTSC_CCS == 0 {
+        return;
+    }
+    crate::framebuffer::write_str("\n[USB] port ");
+    print_decimal(port as u32);
+    crate::framebuffer::write_str(" connected\n");
+    let before = KEYBOARD_COUNT;
+    enumerate_root_port(port);
+    if KEYBOARD_COUNT != before {
+        crate::framebuffer::write_str("[USB]");
+        print_keyboard_count();
+    }
+}
+
+fn print_keyboard_count() {
+    unsafe {
+        crate::framebuffer::write_str(" (");
+        print_decimal(KEYBOARD_COUNT as u32);
+        crate::framebuffer::write_str(if KEYBOARD_COUNT == 1 { " USB keyboard)\n" } else { " USB keyboards)\n" });
+    }
+}
+
+/// Disable every kept slot behind root port `port` and drop its keyboards.
+/// Returns the number of slots released.
+unsafe fn release_root_port(port: u8) -> usize {
+    let mut released = 0;
+    for slot in 1..=MAX_SLOTS {
+        if KEPT_ROOT_PORT[slot] != port {
+            continue;
+        }
+        for entry in (*core::ptr::addr_of_mut!(KEYBOARDS)).iter_mut() {
+            if entry.as_ref().map_or(false, |k| k.slot as usize == slot) {
+                *entry = None;
+                KEYBOARD_COUNT -= 1;
+            }
+        }
+        release_slot(slot as u8);
+        released += 1;
+    }
+    released
+}
+
+// ============================================================
+// Enumeration
+// ============================================================
+
+/// Where a device is attached
+#[derive(Clone, Copy)]
+struct Location {
+    /// Root hub port (1-based) the device or its first hub is on
+    root_port: u8,
+    /// Route string (xHCI 8.9): hub port numbers below the root port
+    route: u32,
+    /// Number of hubs between the root port and the device
+    depth: u8,
+    /// Device speed (xHCI protocol speed ID)
+    speed: u32,
+    /// Transaction translator: high-speed hub slot and port, for full/low
+    /// speed devices behind a high-speed hub (0 = none)
+    tt_slot: u8,
+    tt_port: u8,
+}
+
+/// What a device turned out to be
+enum Kind {
+    Keyboard,
+    Hub,
+    Other,
+}
+
+/// Enumerate every connected root port, including devices behind hubs.
+/// Returns the number of keyboards found.
+pub unsafe fn enumerate_hid_keyboard() -> Result<usize, UsbError> {
+    let controller = xhci::controller().ok_or(UsbError::XhciNotFound)?;
+    let max_ports = controller.max_ports();
+
+    crate::framebuffer::write_str("USB: Scanning ");
+    print_decimal(max_ports as u32);
+    crate::framebuffer::write_str(" ports\n");
+
+    let mut any_device = false;
+    for port in 1..=max_ports {
+        any_device |= enumerate_root_port(port);
+        if xhci::controller().map_or(true, |c| c.is_dead()) {
+            break;
+        }
+    }
+
+    if KEYBOARD_COUNT > 0 {
+        Ok(KEYBOARD_COUNT)
+    } else if any_device {
+        Err(UsbError::HidKeyboardNotFound)
+    } else {
+        Err(UsbError::DeviceNotFound)
+    }
+}
+
+/// Enumerate the device on one root port (and, for a hub, everything
+/// behind it). Returns false if nothing is connected.
+unsafe fn enumerate_root_port(port: usize) -> bool {
     let controller = match xhci::controller() {
         Some(c) => c,
-        None => return 0,
+        None => return false,
     };
-
-    // Get controller mut for transfer ring access
-    let controller_mut = match xhci::controller_mut() {
-        Some(c) => c,
-        None => return 0,
-    };
-
-    // Step 1: Create Normal TRB for interrupt IN transfer
-    let data_ptr = get_report_buffer_ptr();
-
-    // Extract endpoint number from address (lower 4 bits)
-    let endpoint_num = (keyboard.endpoint_addr & 0x0F) as u8;
-
-    // TRB: Normal Interrupt IN
-    // - data_ptr: physical address of HID_REPORT_BUFFER
-    // - status: TRB length (8 bytes) + TD size + interrupter target
-    // - control: TRB Type (1) + Direction (IN) + IOC + Cycle bit (handled by enqueue)
-    let trb = NormalTrb {
-        data_ptr,
-        status: (HID_REPORT_SIZE as u32) & 0x00FFFFFF,  // TRB Length
-        control: (1 << 10) |  // TRB Type = Normal (1)
-                  (1 << 16) |  // Interrupt On Complete (IOC)
-                  (1 << 5),    // ISP (Interrupt on Short Packet)
-    };
-
-    // Step 2: Enqueue TRB to transfer ring
-    if let Err(_) = controller_mut.transfer_ring.enqueue(&trb) {
-        return 0;  // Ring full
+    let portsc = controller.read_port_sc(port);
+    if portsc & PORTSC_CCS == 0 {
+        return false;
     }
+    // Acknowledge old change bits, so the next connect/disconnect raises
+    // a Port Status Change event
+    controller.write_port_sc(port, (portsc & PORTSC_PRESERVE) | (portsc & PORTSC_CHANGE_BITS));
 
-    // Step 3: Ring doorbell for endpoint 1
-    // Note: We use endpoint 1 (DCI = 2, where DCI = (ep_num * 2) + direction)
-    // For interrupt IN endpoint 1, DCI = (1 * 2) + 1 = 3
-    let dci = (endpoint_num as u8) * 2 + 1;
-    controller.ring_doorbell(keyboard.slot_id, dci, 0);
+    crate::framebuffer::write_str("USB: Port ");
+    print_decimal(port as u32);
+    crate::framebuffer::write_str(": ");
 
-    // Set transfer active flag
-    TRANSFER_ACTIVE = true;
+    // USB2 ports need a port reset to become enabled; USB3 ports enable
+    // themselves after link training.
+    let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
+    if speed < SPEED_SUPER || portsc & PORTSC_PED == 0 {
+        if controller.reset_port(port).is_err() {
+            crate::framebuffer::write_str("port reset failed\n");
+            return true;
+        }
+    }
+    // Speed is only valid after reset for USB2
+    let portsc = controller.read_port_sc(port);
+    let speed = (portsc & PORTSC_PORT_SPEED_MASK) >> PORTSC_PORT_SPEED_SHIFT;
+    crate::framebuffer::write_str(speed_name(speed));
+    crate::framebuffer::write_str("-speed device\n");
 
-    // Step 4: Poll for event completion
-    let mut timeout = TRANSFER_TIMEOUT;
-    while timeout > 0 {
-        if let Some(event) = controller.poll_events() {
-            TRANSFER_ACTIVE = false;
+    let loc = Location { root_port: port as u8, route: 0, depth: 0, speed, tt_slot: 0, tt_port: 0 };
+    let _ = attach_device(loc);
+    true
+}
 
-            // Check completion code
-            let code = completion_code(event.status);
-            if code != CompletionCode::Success {
-                return 0;
+fn speed_name(speed: u32) -> &'static str {
+    match speed {
+        SPEED_FULL => "Full",
+        SPEED_LOW => "Low",
+        SPEED_HIGH => "High",
+        SPEED_SUPER => "Super",
+        5 => "SuperPlus",
+        _ => "Unknown",
+    }
+}
+
+fn indent(depth: u8) {
+    for _ in 0..=depth {
+        crate::framebuffer::write_str("  ");
+    }
+}
+
+/// Default EP0 max packet size for a port speed
+fn default_ep0_mps(speed: u32) -> u32 {
+    match speed {
+        SPEED_LOW | SPEED_FULL => 8,
+        SPEED_HIGH => 64,
+        _ => 512,
+    }
+}
+
+/// xHCI Interval field for an interrupt endpoint (xHCI 6.2.3.6)
+fn interrupt_interval(speed: u32, b_interval: u8) -> u32 {
+    let b = core::cmp::max(b_interval as u32, 1);
+    match speed {
+        SPEED_LOW | SPEED_FULL => {
+            // bInterval is in 1 ms frames; Interval is 2^n * 125 us
+            let mut n = 3;
+            while n < 10 && (1u32 << (n + 1)) <= b * 8 {
+                n += 1;
             }
-
-            // Get transfer length from event (bits 0-23)
-            let length = (event.status & 0x00FF_FFFF) as usize;
-            return length.min(HID_REPORT_SIZE);
+            n
         }
+        _ => core::cmp::min(b - 1, 15),
+    }
+}
 
-        timeout -= 1;
-        for _ in 0..10 {
-            core::arch::asm!("nop", options(nomem, nostack));
+/// Slot Context dwords 0-2 for a device at `loc`
+fn slot_dwords(loc: &Location, context_entries: u32) -> (u32, u32, u32) {
+    (
+        (context_entries << 27) | (loc.speed << 20) | (loc.route & 0xF_FFFF),
+        (loc.root_port as u32) << 16,
+        (loc.tt_slot as u32) | ((loc.tt_port as u32) << 8),
+    )
+}
+
+unsafe fn ctrl_get(slot: u8, m: &mut SlotMem, setup: UsbSetupPacket, len: u16) -> Result<usize, UsbError> {
+    let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+    c.issue_control_get(slot, &mut m.ep0, &setup, m.buf as u64, len).map(|n| n as usize)
+}
+
+unsafe fn ctrl_set(slot: u8, m: &mut SlotMem, setup: UsbSetupPacket) -> Result<(), UsbError> {
+    let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+    c.issue_control_set(slot, &mut m.ep0, &setup)
+}
+
+/// Enable a slot for the device at `loc`, address it, read its
+/// descriptors and set it up as a keyboard or hub. Anything else is
+/// released again.
+unsafe fn attach_device(loc: Location) -> Result<Kind, UsbError> {
+    let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+    let slot = c.issue_enable_slot_command()?;
+    match setup_device(slot, &loc) {
+        Ok(Kind::Other) => {
+            release_slot(slot);
+            Ok(Kind::Other)
+        }
+        Ok(kind) => {
+            if (slot as usize) <= MAX_SLOTS {
+                KEPT_ROOT_PORT[slot as usize] = loc.root_port;
+            }
+            Ok(kind)
+        }
+        Err(e) => {
+            release_slot(slot);
+            Err(e)
         }
     }
-
-    // Timeout - transfer still pending, will be checked next call
-    0
 }
 
-/// Get the HID report buffer address (for TRB data pointer)
-pub fn get_report_buffer_ptr() -> u64 {
-    unsafe { &HID_REPORT_BUFFER as *const u8 as u64 }
+unsafe fn release_slot(slot: u8) {
+    if let Some(c) = xhci::controller_mut() {
+        let _ = c.issue_disable_slot_command(slot);
+    }
+    DCBAA_DATA.data[slot as usize] = 0;
+    if (slot as usize) <= MAX_SLOTS {
+        KEPT_ROOT_PORT[slot as usize] = 0;
+    }
 }
 
-/// Parse the HID report buffer into a KeyboardReport
-pub unsafe fn parse_report_buffer() -> Option<super::hid::KeyboardReport> {
-    let ptr = &HID_REPORT_BUFFER as *const u8 as *const super::hid::KeyboardReport;
-    Some(*ptr)
+unsafe fn setup_device(slot: u8, loc: &Location) -> Result<Kind, UsbError> {
+    let m = slot_mem(slot)?;
+    let input = &mut *m.input;
+
+    // ---------------- Address Device ----------------
+    DCBAA_DATA.data[slot as usize] = m.dev as u64;
+    let mut ep0_mps = default_ep0_mps(loc.speed);
+    let (d0, d1, d2) = slot_dwords(loc, 1);
+    input.control.drop_flags = 0;
+    input.control.add_flags = 0x3; // Slot + EP0
+    input.slot.dword0 = d0;
+    input.slot.dword1 = d1;
+    input.slot.dword2 = d2;
+    input.slot.dword3 = 0;
+    let ep0_ring = m.ep0.base();
+    input.ep[0].dword0 = 0;
+    input.ep[0].dword1 = (3u32 << 1) | (4u32 << 3) | (ep0_mps << 16); // CErr=3, Control
+    input.ep[0].deq_ptr_lo = (ep0_ring as u32) | 1; // DCS=1
+    input.ep[0].deq_ptr_hi = (ep0_ring >> 32) as u32;
+    input.ep[0].dword4 = 8; // Average TRB Length
+
+    let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+    c.issue_address_device_command(slot, m.input as u64, false)?;
+    delay_ms(2); // SET_ADDRESS recovery
+
+    // ---------------- Device descriptor ----------------
+    // The first 8 bytes give bMaxPacketSize0
+    ctrl_get(slot, m, get_descriptor_setup_packet(USB_DT_DEVICE, 0, 8), 8)?;
+    let mps0 = *m.buf.add(7) as u32;
+    if loc.speed < SPEED_SUPER && mps0 != 0 && mps0 != ep0_mps {
+        ep0_mps = mps0;
+        let input = &mut *m.input;
+        input.control.add_flags = 0x2; // EP0 only
+        input.ep[0].dword1 = (3u32 << 1) | (4u32 << 3) | (ep0_mps << 16);
+        let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+        c.issue_evaluate_context_command(slot, m.input as u64)?;
+    }
+    ctrl_get(slot, m, get_descriptor_setup_packet(USB_DT_DEVICE, 0, 18), 18)?;
+    let dd = core::slice::from_raw_parts(m.buf as *const u8, 18);
+    let vid = (dd[9] as u16) << 8 | dd[8] as u16;
+    let pid = (dd[11] as u16) << 8 | dd[10] as u16;
+    let dev_class = dd[4];
+    indent(loc.depth);
+    crate::framebuffer::write_str("device ");
+    print_hex_word(vid);
+    crate::framebuffer::write_str(":");
+    print_hex_word(pid);
+    crate::framebuffer::write_str(" class=");
+    print_hex_byte(dev_class);
+    crate::framebuffer::write_str("\n");
+
+    // ---------------- Configuration descriptor ----------------
+    ctrl_get(slot, m, get_descriptor_setup_packet(USB_DT_CONFIG, 0, 9), 9)?;
+    let total = core::cmp::min((*m.buf.add(3) as usize) << 8 | *m.buf.add(2) as usize, 4096);
+    let got = ctrl_get(slot, m, get_descriptor_setup_packet(USB_DT_CONFIG, 0, total as u16), total as u16)?;
+    let mut cfg = [0u8; 512];
+    let cfg_len = core::cmp::min(core::cmp::min(got, total), cfg.len());
+    cfg[..cfg_len].copy_from_slice(core::slice::from_raw_parts(m.buf as *const u8, cfg_len));
+    let cfg = &cfg[..cfg_len];
+    let config_value = if cfg.len() > 5 { cfg[5] } else { 1 };
+
+    // ---------------- Hub ----------------
+    if dev_class == USB_CLASS_HUB || has_interface_class(cfg, USB_CLASS_HUB) {
+        if loc.speed >= SPEED_SUPER {
+            // A USB 3 hub also appears as a USB 2 hub on a USB 2 port;
+            // keyboards are found there.
+            indent(loc.depth);
+            crate::framebuffer::write_str("USB 3 hub: using its USB 2 side instead\n");
+            return Ok(Kind::Other);
+        }
+        if loc.depth >= MAX_HUB_DEPTH {
+            indent(loc.depth);
+            crate::framebuffer::write_str("hub nested too deep, skipping\n");
+            return Ok(Kind::Other);
+        }
+        setup_hub(slot, m, loc, config_value, dd[6])?;
+        return Ok(Kind::Hub);
+    }
+
+    // ---------------- Keyboard ----------------
+    let kbd = match find_boot_keyboard(cfg) {
+        Some(k) => k,
+        None => {
+            indent(loc.depth);
+            crate::framebuffer::write_str("not a boot keyboard, skipping\n");
+            return Ok(Kind::Other);
+        }
+    };
+    let free = match (*core::ptr::addr_of!(KEYBOARDS)).iter().position(|k| k.is_none()) {
+        Some(i) => i,
+        None => MAX_KEYBOARDS,
+    };
+    if free >= MAX_KEYBOARDS {
+        indent(loc.depth);
+        crate::framebuffer::write_str("boot keyboard (limit reached, skipping)\n");
+        return Ok(Kind::Other);
+    }
+    indent(loc.depth);
+    crate::framebuffer::write_str("boot keyboard: interface ");
+    print_decimal(kbd.interface as u32);
+    crate::framebuffer::write_str(", endpoint 0x");
+    print_hex_byte(kbd.endpoint_addr);
+    crate::framebuffer::write_str("\n");
+
+    ctrl_set(slot, m, set_configuration_setup_packet(config_value))?;
+    if ctrl_set(slot, m, set_boot_protocol_setup_packet(kbd.interface)).is_err() {
+        indent(loc.depth);
+        crate::framebuffer::write_str("SET_PROTOCOL failed (continuing)\n");
+    }
+    let _ = ctrl_set(slot, m, set_idle_setup_packet(kbd.interface)); // optional
+
+    // Configure the interrupt IN endpoint
+    let ring = Ring::new().ok_or(UsbError::XhciInitFailed)?;
+    let report_buf = alloc_dma_page().ok_or(UsbError::XhciInitFailed)?;
+    let ep_num = (kbd.endpoint_addr & 0x0F) as u32;
+    let dci = ep_num * 2 + 1; // IN endpoint
+    let ep_index = (dci - 1) as usize;
+    let input = &mut *m.input;
+    let (d0, d1, d2) = slot_dwords(loc, dci); // Context Entries = highest DCI
+    input.control.drop_flags = 0;
+    input.control.add_flags = 1 | (1 << dci);
+    input.slot.dword0 = d0;
+    input.slot.dword1 = d1;
+    input.slot.dword2 = d2;
+    let mps = kbd.max_packet as u32;
+    let ring_base = ring.base();
+    input.ep[ep_index].dword0 = interrupt_interval(loc.speed, kbd.interval) << 16;
+    input.ep[ep_index].dword1 = (3u32 << 1) | (7u32 << 3) | (mps << 16); // Interrupt IN
+    input.ep[ep_index].deq_ptr_lo = (ring_base as u32) | 1;
+    input.ep[ep_index].deq_ptr_hi = (ring_base >> 32) as u32;
+    input.ep[ep_index].dword4 = (mps << 16) | 8; // Max ESIT Payload, Avg TRB Length
+    let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+    c.issue_configure_endpoint_command(slot, m.input as u64)?;
+
+    KEYBOARDS[free] = Some(Keyboard {
+        slot,
+        dci: dci as u8,
+        vid,
+        pid,
+        ring,
+        buf: report_buf,
+        active: false,
+        dead: false,
+        prev: [0; 6],
+    });
+    KEYBOARD_COUNT += 1;
+    indent(loc.depth);
+    crate::framebuffer::write_str("keyboard ");
+    print_hex_word(vid);
+    crate::framebuffer::write_str(":");
+    print_hex_word(pid);
+    crate::framebuffer::write_str(" ready\n");
+    Ok(Kind::Keyboard)
+}
+
+/// Configure a USB 2.0 hub in `slot` and enumerate the devices on its ports.
+unsafe fn setup_hub(slot: u8, m: &mut SlotMem, loc: &Location, config_value: u8, protocol: u8) -> Result<(), UsbError> {
+    ctrl_set(slot, m, set_configuration_setup_packet(config_value))?;
+
+    // Hub descriptor: bNbrPorts, wHubCharacteristics, bPwrOn2PwrGood
+    let n = ctrl_get(
+        slot,
+        m,
+        UsbSetupPacket { bm_request_type: 0xA0, b_request: USB_REQ_GET_DESCRIPTOR, w_value: (USB_DT_HUB as u16) << 8, w_index: 0, w_length: 16 },
+        16,
+    )?;
+    if n < 7 {
+        return Err(UsbError::XhciInitFailed);
+    }
+    let ports = *m.buf.add(2) as u32;
+    let characteristics = (*m.buf.add(4) as u32) << 8 | *m.buf.add(3) as u32;
+    let power_good_ms = (*m.buf.add(5) as u64) * 2;
+    let think_time = (characteristics >> 5) & 0x3;
+    indent(loc.depth);
+    crate::framebuffer::write_str("hub with ");
+    print_decimal(ports);
+    crate::framebuffer::write_str(" ports");
+    if protocol == 2 {
+        crate::framebuffer::write_str(" (multi-TT, using single TT)");
+    }
+    crate::framebuffer::write_str("\n");
+
+    // Tell the controller this slot is a hub (Hub, Number of Ports, TT
+    // Think Time); Configure Endpoint with only the Slot Context added.
+    let input = &mut *m.input;
+    let (d0, d1, d2) = slot_dwords(loc, 1);
+    input.control.drop_flags = 0;
+    input.control.add_flags = 1;
+    input.slot.dword0 = d0 | (1 << 26);
+    input.slot.dword1 = d1 | (ports << 24);
+    input.slot.dword2 = d2 | if loc.speed == SPEED_HIGH { think_time << 16 } else { 0 };
+    let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+    if c.issue_configure_endpoint_command(slot, m.input as u64).is_err() {
+        let c = xhci::controller_mut().ok_or(UsbError::XhciNotFound)?;
+        c.issue_evaluate_context_command(slot, m.input as u64)?;
+    }
+
+    // Power every port, then wait for power to be good plus debounce
+    for p in 1..=ports {
+        let _ = ctrl_set(slot, m, hub_feature(USB_REQ_SET_FEATURE, HUB_PORT_POWER, p));
+    }
+    delay_ms(core::cmp::max(power_good_ms, 20) + 100);
+
+    for p in 1..=ports {
+        let (status, _) = match hub_port_status(slot, m, p) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if status & HUB_STAT_CONNECTION == 0 {
+            continue;
+        }
+        let _ = ctrl_set(slot, m, hub_feature(USB_REQ_CLEAR_FEATURE, HUB_C_PORT_CONNECTION, p));
+
+        // Reset the port and wait for C_PORT_RESET
+        indent(loc.depth);
+        crate::framebuffer::write_str("hub port ");
+        print_decimal(p);
+        crate::framebuffer::write_str(": ");
+        if ctrl_set(slot, m, hub_feature(USB_REQ_SET_FEATURE, HUB_PORT_RESET, p)).is_err() {
+            crate::framebuffer::write_str("reset request failed\n");
+            continue;
+        }
+        let mut reset_done = false;
+        for _ in 0..50 {
+            delay_ms(10);
+            if let Ok((_, change)) = hub_port_status(slot, m, p) {
+                if change & HUB_CHANGE_RESET != 0 {
+                    reset_done = true;
+                    break;
+                }
+            }
+        }
+        let _ = ctrl_set(slot, m, hub_feature(USB_REQ_CLEAR_FEATURE, HUB_C_PORT_RESET, p));
+        if !reset_done {
+            crate::framebuffer::write_str("reset timed out\n");
+            continue;
+        }
+        delay_ms(10); // reset recovery (TRSTRCY)
+
+        let status = match hub_port_status(slot, m, p) {
+            Ok((s, _)) => s,
+            Err(_) => continue,
+        };
+        if status & HUB_STAT_ENABLE == 0 {
+            crate::framebuffer::write_str("not enabled after reset\n");
+            continue;
+        }
+        let speed = if status & HUB_STAT_LOW_SPEED != 0 {
+            SPEED_LOW
+        } else if status & HUB_STAT_HIGH_SPEED != 0 {
+            SPEED_HIGH
+        } else {
+            SPEED_FULL
+        };
+        crate::framebuffer::write_str(speed_name(speed));
+        crate::framebuffer::write_str("-speed device\n");
+
+        // Full/low speed devices behind a high-speed hub go through its
+        // transaction translator; deeper down they inherit the same TT.
+        let (tt_slot, tt_port) = if speed == SPEED_HIGH {
+            (0, 0)
+        } else if loc.speed == SPEED_HIGH {
+            (slot, p as u8)
+        } else {
+            (loc.tt_slot, loc.tt_port)
+        };
+        let child = Location {
+            root_port: loc.root_port,
+            route: loc.route | (core::cmp::min(p, 15) << (4 * loc.depth as u32)),
+            depth: loc.depth + 1,
+            speed,
+            tt_slot,
+            tt_port,
+        };
+        let _ = attach_device(child);
+        if xhci::controller().map_or(true, |c| c.is_dead()) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn hub_feature(request: u8, feature: u16, port: u32) -> UsbSetupPacket {
+    UsbSetupPacket { bm_request_type: 0x23, b_request: request, w_value: feature, w_index: port as u16, w_length: 0 }
+}
+
+/// GET_STATUS for a hub port: (wPortStatus, wPortChange)
+unsafe fn hub_port_status(slot: u8, m: &mut SlotMem, port: u32) -> Result<(u16, u16), UsbError> {
+    let setup = UsbSetupPacket { bm_request_type: 0xA3, b_request: USB_REQ_GET_STATUS, w_value: 0, w_index: port as u16, w_length: 4 };
+    if ctrl_get(slot, m, setup, 4)? < 4 {
+        return Err(UsbError::XhciInitFailed);
+    }
+    let b = core::slice::from_raw_parts(m.buf as *const u8, 4);
+    Ok(((b[1] as u16) << 8 | b[0] as u16, (b[3] as u16) << 8 | b[2] as u16))
+}
+
+/// Does the configuration have an interface of `class`?
+fn has_interface_class(desc: &[u8], class: u8) -> bool {
+    let mut i = 0;
+    while i + 2 <= desc.len() {
+        let len = desc[i] as usize;
+        if len < 2 || i + len > desc.len() {
+            break;
+        }
+        if desc[i + 1] == USB_DT_INTERFACE && len >= 9 && desc[i + 5] == class {
+            return true;
+        }
+        i += len;
+    }
+    false
+}
+
+/// Boot keyboard interface found in a configuration descriptor
+struct BootKeyboard {
+    interface: u8,
+    endpoint_addr: u8,
+    max_packet: u16,
+    interval: u8,
+}
+
+/// Walk a configuration descriptor and return the first HID boot keyboard
+/// interface together with its interrupt IN endpoint.
+fn find_boot_keyboard(desc: &[u8]) -> Option<BootKeyboard> {
+    let mut i = 0;
+    let mut in_keyboard_iface: Option<u8> = None;
+    while i + 2 <= desc.len() {
+        let len = desc[i] as usize;
+        if len < 2 || i + len > desc.len() {
+            break;
+        }
+        match desc[i + 1] {
+            USB_DT_INTERFACE if len >= 9 => {
+                let is_kbd = desc[i + 5] == USB_CLASS_HID
+                    && desc[i + 6] == USB_HID_SUBCLASS_BOOT
+                    && desc[i + 7] == USB_HID_PROTOCOL_KEYBOARD;
+                in_keyboard_iface = if is_kbd { Some(desc[i + 2]) } else { None };
+            }
+            USB_DT_ENDPOINT if len >= 7 => {
+                if let Some(iface) = in_keyboard_iface {
+                    let addr = desc[i + 2];
+                    let attrs = desc[i + 3];
+                    if addr & USB_DIR_IN != 0 && attrs & 0x03 == USB_ENDPOINT_XFER_INT {
+                        return Some(BootKeyboard {
+                            interface: iface,
+                            endpoint_addr: addr,
+                            max_packet: ((desc[i + 5] as u16) << 8 | desc[i + 4] as u16) & 0x7FF,
+                            interval: desc[i + 6],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    None
+}
+
+fn print_hex_byte(value: u8) {
+    let h = b"0123456789ABCDEF";
+    let b = [h[(value >> 4) as usize], h[(value & 0xF) as usize]];
+    crate::framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&b) });
+}
+
+fn print_hex_word(value: u16) {
+    print_hex_byte((value >> 8) as u8);
+    print_hex_byte(value as u8);
+}
+
+/// Print a u32 in decimal
+fn print_decimal(mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    digits[..len].reverse();
+    crate::framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&digits[..len]) });
 }
 
 /// USB setup packet structure
@@ -724,12 +948,23 @@ pub fn set_configuration_setup_packet(config: u8) -> UsbSetupPacket {
 }
 
 /// Create a SET_PROTOCOL (HID boot protocol) setup packet
-pub fn set_boot_protocol_setup_packet() -> UsbSetupPacket {
+pub fn set_boot_protocol_setup_packet(interface: u8) -> UsbSetupPacket {
     UsbSetupPacket {
         bm_request_type: 0x21,  // Host-to-device, Type=Class, Recipient=Interface
         b_request: USB_REQ_SET_PROTOCOL,
         w_value: USB_HID_BOOT_PROTOCOL as u16,
-        w_index: 0,  // Interface 0
+        w_index: interface as u16,
+        w_length: 0,
+    }
+}
+
+/// Create a SET_IDLE (duration 0: report only on change) setup packet
+pub fn set_idle_setup_packet(interface: u8) -> UsbSetupPacket {
+    UsbSetupPacket {
+        bm_request_type: 0x21,
+        b_request: USB_REQ_SET_IDLE,
+        w_value: 0,
+        w_index: interface as u16,
         w_length: 0,
     }
 }
@@ -761,8 +996,4 @@ mod tests {
         assert_eq!(setup.w_length, 0);
     }
 
-    #[test]
-    fn test_hid_report_size() {
-        assert_eq!(HID_REPORT_SIZE, 8);
-    }
 }

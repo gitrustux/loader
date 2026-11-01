@@ -8,9 +8,35 @@ use uefi::prelude::*;
 use uefi::boot;
 use uefi::mem::memory_map::MemoryMap;
 
-// Use UEFI allocator as global allocator
+/// Global allocator: UEFI pool memory until the kernel heap is set up after
+/// ExitBootServices, then the kernel's bump heap. (Using the UEFI allocator
+/// alone made every allocation after ExitBootServices fail, which hung the
+/// shell on the first command.)
+struct KernelAllocator;
+
+unsafe impl core::alloc::GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        if let Some(heap) = runtime::get_kernel_allocator() {
+            let align = core::cmp::max(layout.align(), 16) as u64;
+            return match heap.allocate(layout.size() as u64, align) {
+                Some(addr) => addr as *mut u8,
+                None => core::ptr::null_mut(),
+            };
+        }
+        uefi::allocator::Allocator.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        // Bump heap memory is never freed. UEFI pool memory can only be
+        // returned while boot services are still running.
+        if runtime::get_kernel_allocator().is_none() {
+            uefi::allocator::Allocator.dealloc(ptr, layout);
+        }
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
+static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 mod console;
 mod framebuffer;
@@ -25,6 +51,7 @@ mod vga_console;
 mod native_console;
 mod acpi;
 mod usb;
+mod time;
 
 /// Exit UEFI boot services with frozen zone enforcement
 ///
@@ -236,9 +263,10 @@ fn main() -> Status {
             // Found at least 1MB of conventional memory
             // Initialize the kernel allocator with this region
             unsafe {
-                // Initialize bump allocator with 1MB heap from the found region
+                // Bump heap: up to 64 MB of the region. Nothing is ever freed,
+                // so it needs room for every allocation the shell makes.
                 let heap_start = start;
-                let heap_size = 1024 * 1024; // 1MB
+                let heap_size = core::cmp::min(size, 64 * 1024 * 1024);
 
                 // Call the allocator initialization directly
                 // This is a simplified version that doesn't need the full memory map
@@ -364,9 +392,6 @@ fn main() -> Status {
         options(nomem, nostack)
     );
     }
-
-    // Jump into shell
-    framebuffer::write_str("Starting shell...\n");
 
     // POST CODE 0x47: In shell
     // POST CODE 0x48: About to run_shell()

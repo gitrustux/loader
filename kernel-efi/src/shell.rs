@@ -237,28 +237,31 @@ fn cmd_mem(_args: &[&str]) {
 fn cmd_irq(_args: &[&str]) {
     framebuffer::write_str("Keyboard IRQ Debug Info:\n");
 
+    // Number of IRQ1 interrupts taken (wraps at 256). Key presses and
+    // releases each raise one. If it stays 0 while typing works, keys are
+    // arriving through the polling fallback instead of IRQ1.
     let irq_count = keyboard::get_irq_count();
-    framebuffer::write_str("  IRQ count: ");
-    if irq_count > 0 {
-        framebuffer::write_str("(IRQs firing!)\n");
-        // Show the actual count (0-15)
-        let digit = if irq_count <= 9 {
-            (b'0' + irq_count) as char
-        } else {
-            (b'A' + irq_count - 10) as char
-        };
-        framebuffer::write_str("  Count: ");
-        framebuffer::write_str_color(
-            unsafe { core::str::from_utf8_unchecked(&[digit as u8]) },
-            framebuffer::colors::encode(framebuffer::colors::GREEN)
-        );
-        framebuffer::write_str("\n");
-    } else {
-        framebuffer::write_str_color("0 (IRQ NOT firing!)\n", framebuffer::colors::encode(framebuffer::colors::RED));
+    let mut digits = [b' '; 3];
+    let mut n = irq_count;
+    let mut i = 3;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + n % 10;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
     }
-
-    // Note: Direct hardware polling removed - honest architecture only
-    framebuffer::write_str("  Hardware: Use IRQ-driven input only\n");
+    framebuffer::write_str("  IRQ1 count: ");
+    let color = if irq_count > 0 { framebuffer::colors::GREEN } else { framebuffer::colors::RED };
+    framebuffer::write_str_color(
+        unsafe { core::str::from_utf8_unchecked(&digits[i..]) },
+        framebuffer::colors::encode(color),
+    );
+    if irq_count == 0 {
+        framebuffer::write_str(" (IRQ1 not firing; PS/2 input uses polling)");
+    }
+    framebuffer::write_str("\n");
 }
 
 /// Command: kbd - Test keyboard input (non-blocking)

@@ -11,6 +11,8 @@ The `kernel-efi/` transition kernel serves as:
 - **Hardware testing** - PS/2 keyboard, framebuffer, UEFI GOP
 - **Feature validation** - Process management, syscalls, shell interaction
 
+**Status (2026-11-01): frozen, bug fixes only.** It works on the test laptop (MSI GS75) with the built-in PS/2 keyboard and USB keyboards, including behind a hub (KVM switch) and with the KVM switching away and back. New work goes into the Rustux kernel; see "Hardware notes" below for what it must carry over.
+
 **This is NOT the canonical Rustux kernel.** The real kernel is [gitrustux/rustux](https://github.com/gitrustux/rustux) (microkernel architecture). The copy of it that used to live in `rustux/` here was merged into that repository and removed.
 
 ## Migration Plan
@@ -136,3 +138,14 @@ MIT License - See LICENSE file in root directory.
 
 **Last Updated:** January 23, 2025
 **Status:** Phase 6 COMPLETE - Transition kernel validated, awaiting microkernel migration
+
+## Hardware notes (carry these into the Rustux kernel)
+
+Learned on the MSI GS75 Stealth 10SF (Intel 400-series xHCI `8086:06ED`, SteelSeries PS/2 keyboard):
+
+- **8042:** the firmware leaves the keyboard clock disabled (configuration byte `0x75`). Set it up explicitly: self-test, config byte with IRQ1 + translation on, enable the keyboard port, enable scanning. `kernel-efi/src/keyboard/ps2.rs`.
+- **IRQ stubs:** don't read port `0x60` in the stub; send EOI before restoring registers; reserve the 32-byte shadow space (Microsoft x64 convention on the UEFI target).
+- **xHCI:** DBOFF is at capability offset `0x14`; use real time for delays and timeouts (TSC calibrated against the PIT); abort stuck commands by writing CA with the *next* command's address; match completions by TRB address; keep a large event ring.
+- **USB topology:** the KVM is a VIA VL817 hub (`2109:2817`, USB 2 side; `2109:0817` on a SuperSpeed port). Its keyboards are full-speed behind a high-speed hub, so the slot context needs the TT hub slot and port. Switching the KVM disconnects the hub from the root port; handle Port Status Change events.
+- **Root port 2** holds a high-speed device that never answers Set Address; it costs a 5 s timeout and is skipped.
+

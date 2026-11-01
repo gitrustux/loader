@@ -155,6 +155,7 @@ pub fn init() -> Result<(), &'static str> {
             Some(ControllerType::Xhci) => {
                 if let Some(controller) = xhci::controller() {
                     crate::framebuffer::write_str("xHCI: MMIO base = 0x");
+                    print_hex_dword((controller.mmio_base() >> 32) as u32);
                     print_hex_dword(controller.mmio_base() as u32);
                     crate::framebuffer::write_str("\n");
                 }
@@ -162,6 +163,7 @@ pub fn init() -> Result<(), &'static str> {
             Some(ControllerType::Ehci) => {
                 if let Some(controller) = ehci::controller() {
                     crate::framebuffer::write_str("EHCI: MMIO base = 0x");
+                    print_hex_dword((controller.mmio_base() >> 32) as u32);
                     print_hex_dword(controller.mmio_base() as u32);
                     crate::framebuffer::write_str("\n");
                 }

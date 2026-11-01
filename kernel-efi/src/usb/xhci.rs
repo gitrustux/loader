@@ -180,7 +180,9 @@ impl XhciController {
         crate::framebuffer::write_str("\n");
 
         // Read HCIVERSION (offset 0x02 in capability registers)
-        let hciversion = mmio_base.add(0x02).cast::<u16>().read_volatile();
+        // Read as part of the first dword: some controllers (QEMU) only
+        // decode 32-bit accesses to the capability registers.
+        let hciversion = (mmio_base.cast::<u32>().read_volatile() >> 16) as u16;
 
         crate::framebuffer::write_str("xHCI: HCIVERSION = 0x");
         let mut version = hciversion;
@@ -199,12 +201,13 @@ impl XhciController {
 
         // Read RTSOFF to get runtime register offset (offset 0x18 in capability registers)
         // This is a 32-bit register, so we need to cast to u32 pointer
-        let rts_offset = mmio_base.add(0x18).cast::<u32>().read_volatile() & 0xFFFF_FFFE;
+        let rts_offset = mmio_base.add(0x18).cast::<u32>().read_volatile() & !0x1F; // bits 4:0 reserved
         let runtime_offset = rts_offset as u64;
 
-        // Read DBOFF to get doorbell offset (offset 0x1C in capability registers)
-        // This is a 32-bit register, so we need to cast to u32 pointer
-        let dboff = mmio_base.add(0x1C).cast::<u32>().read_volatile() & 0xFFFF_FFFE;
+        // DBOFF (capability offset 0x14, xHCI 5.3.7); bits 1:0 are reserved.
+        // (0x1C is HCCPARAMS2: reading it here sent every doorbell write to
+        // the wrong register, so the controller never saw any command.)
+        let dboff = mmio_base.add(0x14).cast::<u32>().read_volatile() & !0x3;
         let doorbell_offset = dboff as u64;
 
         crate::framebuffer::write_str("xHCI: RTSOFF = 0x");
@@ -631,7 +634,15 @@ impl XhciController {
             Err(e) => {
                 crate::framebuffer::write_str("xHCI: ");
                 crate::framebuffer::write_str(name);
-                crate::framebuffer::write_str(" timed out\n");
+                // Controller state, to tell "never fetched the command"
+                // (HSE/HCE set, or halted) from "event not seen"
+                crate::framebuffer::write_str(" timed out (USBSTS=0x");
+                print_hex_u32(self.read_op_reg(REG_USBSTS));
+                crate::framebuffer::write_str(" CRCR=0x");
+                print_hex_u32(self.read_op_reg(REG_CRCR));
+                crate::framebuffer::write_str(" IMAN=0x");
+                print_hex_u32(self.read_runtime_reg(REG_IMAN));
+                crate::framebuffer::write_str(")\n");
                 Err(e)
             }
         }

@@ -523,6 +523,23 @@ fn draw_glyph(c: char, x: usize, y: usize, fg_color: u32) {
     }
 }
 
+/// Move the cursor back one cell and clear it (backspace echo)
+pub fn erase_prev_char() {
+    let fb = info();
+    unsafe {
+        if CURSOR_X == 0 {
+            return;
+        }
+        CURSOR_X -= 1;
+        for dy in 0..FONT_H {
+            let row = (CURSOR_Y * FONT_H + dy) * fb.stride + CURSOR_X * FONT_W;
+            for dx in 0..FONT_W {
+                write_volatile((fb.base as *mut u32).add(row + dx), 0x00000000);
+            }
+        }
+    }
+}
+
 /// Write a string to the framebuffer console
 pub fn write_str(s: &str) {
     let fg_color = encode_color(255, 255, 255); // White text

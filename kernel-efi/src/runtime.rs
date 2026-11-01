@@ -1163,11 +1163,7 @@ pub unsafe fn init_kernel_allocator_simple(start: u64, size: u64) -> Result<(), 
         return Err("Memory region too small (need at least 1MB)");
     }
 
-    // Initialize the bump allocator with 1MB heap
-    let heap_start = start;
-    let heap_size = 1024 * 1024; // 1MB
-
-    KERNEL_ALLOCATOR_STORAGE = BumpAllocator::new(heap_start, heap_size);
+    KERNEL_ALLOCATOR_STORAGE = BumpAllocator::new(start, size);
     KERNEL_ALLOCATOR_INITIALIZED = true;
 
     // Write success message to VGA (optional, for debugging)

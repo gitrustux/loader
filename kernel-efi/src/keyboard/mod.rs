@@ -166,11 +166,21 @@ fn read_line_ps2(buffer: &mut [u8]) -> usize {
     loop {
         if let Some(c) = read_char() {
             match c {
-                '\n' => break,
-                '\x08' => { if count > 0 { count -= 1; } }
-                _ if count < buffer.len() => {
+                '\n' => {
+                    crate::framebuffer::write_str("\n");
+                    break;
+                }
+                '\x08' => {
+                    if count > 0 {
+                        count -= 1;
+                        crate::framebuffer::erase_prev_char();
+                    }
+                }
+                ' '..='~' if count < buffer.len() => {
                     buffer[count] = c as u8;
                     count += 1;
+                    let b = [c as u8];
+                    crate::framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&b) });
                 }
                 _ => {}
             }
@@ -188,11 +198,21 @@ fn read_line_usb(buffer: &mut [u8]) -> usize {
     loop {
         if let Some(c) = read_char() {
             match c {
-                '\n' => break,
-                '\x08' => { if count > 0 { count -= 1; } }
-                _ if count < buffer.len() => {
+                '\n' => {
+                    crate::framebuffer::write_str("\n");
+                    break;
+                }
+                '\x08' => {
+                    if count > 0 {
+                        count -= 1;
+                        crate::framebuffer::erase_prev_char();
+                    }
+                }
+                ' '..='~' if count < buffer.len() => {
                     buffer[count] = c as u8;
                     count += 1;
+                    let b = [c as u8];
+                    crate::framebuffer::write_str(unsafe { core::str::from_utf8_unchecked(&b) });
                 }
                 _ => {}
             }
